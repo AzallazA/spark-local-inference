@@ -269,6 +269,7 @@ impl ThreadedExecutor {
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
+            && (!super::single_submission() || self.pending.is_empty())
             && protocol::can_submit_pending(&self.pending, grammar, self.local.manifest())
             && self.local.can_submit(grammar)
     }

@@ -712,6 +712,13 @@ def _release_unused_contexts(device):
             driver.cuDevicePrimaryCtxReset_v2(handle)
 
 
+def _park_on_host(host_allocator, name, tensor):
+    """Copy a loaded device tensor into device-visible host memory (TP3 expert parking)."""
+    region = host_allocator(name, tuple(tensor.shape), tensor.dtype).device_view
+    region.copy_(tensor)
+    return region
+
+
 class DirectWeightLoader:
     """Own b12x tensor views until direct transfers finish.
 
@@ -1307,8 +1314,11 @@ class DirectWeightLoader:
                          weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
                          global_scale_name="weight_scale_2", global_scale_kind="multiplier",
                          input_scale_name=None, activation_outer_scale="expert",
-                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None):
+                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None, host_allocator=None):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
+
+        With ``host_allocator`` (TP3 expert parking) the packed w13/w2 banks move to
+        device-visible host memory after loading and their device copies are freed.
 
         The first two projection names fill the first and second w13 halves in that
         order; ``w13_layout`` declares which halves hold up and gate. CSF compression
@@ -1439,6 +1449,10 @@ class DirectWeightLoader:
             self._copy(target, values)
             device_scales.append(target)
         self._session.flush()
+        if host_allocator is not None:
+            w13, w2 = (_park_on_host(host_allocator, f"{prefixes[0]}.{suffix}", tensor)
+                       for suffix, tensor in (("w13", w13), ("w2", w2)))
+            torch.cuda.empty_cache()
         if sm103:
             if swiglu_clamp_after_silu:
                 raise ValueError("SM103 FP4 experts do not support post-SiLU clamping")
@@ -1489,6 +1503,7 @@ class DirectWeightLoader:
         self, prefixes, *, hidden_size, intermediate_size, scale_scratch,
         intermediate_range=None, swiglu_limit=None, scale_compression=None,
         projection_names=("up_proj", "gate_proj", "down_proj"), scale_name="weight_scale",
+        host_allocator=None,
     ):
         """Load MXFP4 storage, optionally compressing native scales losslessly.
 
@@ -1510,9 +1525,11 @@ class DirectWeightLoader:
         geometry = dict(hidden_size=hidden_size, intermediate_size=intermediate_size,
                         intermediate_range=intermediate_range, swiglu_limit=swiglu_limit,
                         scale_name=scale_name)
+        if host_allocator is not None and any(encoded):
+            raise ValueError("host-parked experts support native-scale checkpoints only")
         if not any(encoded) and scale_compression is None:
             return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
-                                         projection_names=projection_names)
+                                         projection_names=projection_names, host_allocator=host_allocator)
         if any(encoded) and not all(encoded):
             raise ValueError("each routed expert group must use one complete MXFP4 scale encoding")
         first, last = _aligned_range(intermediate_range, intermediate_size, 32)
@@ -1524,7 +1541,7 @@ class DirectWeightLoader:
         if not any(encoded):
             return self.load_fp4_experts(prefixes, **geometry, format="mxfp4", activation_mode="a8",
                 projection_names=projection_names, scale_compression=scale_compression,
-                scale_scratch=scale_scratch[key])
+                scale_scratch=scale_scratch[key], host_allocator=host_allocator)
         up, gate, down = projection_names
         return self.load_mxfp4_csf_experts(prefixes, **geometry,
             scale_scratch=scale_scratch[key], projection_names=(gate, up, down))

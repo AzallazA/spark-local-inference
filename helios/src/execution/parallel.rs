@@ -56,7 +56,7 @@ fn completion_frame(pending: &mut VecDeque<Pending>, rank: usize, fence: Fence, 
     Ok(frame)
 }
 fn window_available(pending: &VecDeque<Pending>, grammar: bool, manifest: &ExecutionManifest) -> bool {
-    pending.len() < 2
+    pending.len() < if super::single_submission() { 1 } else { 2 }
         && pending.back().is_none_or(|frame| frame.committed)
         && (!grammar || pending.is_empty())
         && !pending.iter().any(|frame| frame.grammar || !matches!(

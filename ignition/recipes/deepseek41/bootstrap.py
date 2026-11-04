@@ -314,9 +314,19 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
-    prefill = create_dma_all_reduce_runtime(group, device,
-        max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
+    # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world
+    # size to divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between
+    # decode and prefill: graph capture enters only the main collective's capture() context, so a second
+    # runtime's reductions would be captured outside the protocol b12x requires (and could desynchronize).
+    if 5120 % len(config.devices):
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=max(config.all_reduce_tokens, config.prefill_chunk_size), hidden_size=5120, ipc=ipc)
+        prefill = collective
+    else:
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+        prefill = create_dma_all_reduce_runtime(group, device,
+            max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
@@ -344,7 +354,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    host_allocator=package_storage.host_allocate)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -610,7 +621,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    assets = {role: {"path": str(path)}
+    assets = {role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name,

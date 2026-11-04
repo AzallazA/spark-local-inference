@@ -4,6 +4,7 @@
 
 """DeepSeek V4.1 Flash checkpoint and tensor-parallel memory geometry."""
 
+import os
 from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
@@ -48,6 +49,26 @@ def usage(prepared):
     return tuple(RankUsage(rank["pages"], rank["free_device_bytes"]) for rank in prepared.memory_report["ranks"])
 
 
+def _parked_bytes(world: int) -> int:
+    """Routed-expert bytes per rank parked in host memory (FLARE_DS41_HOST_EXPERT_LAYERS / FLARE_DS41_HOT_EXPERTS)."""
+    from .weights import host_expert_layers
+    layers = host_expert_layers()
+    if not layers:
+        return 0
+    hot = int(os.environ.get("FLARE_DS41_HOT_EXPERTS", "0") or 0)
+    cold = 384 - min(max(hot, 0), 384)
+    local = -(-2304 // world)  # routed-expert intermediate width per rank
+    per_expert = 2 * local * 5120 // 2 + 5120 * local // 2           # MXFP4 w13 + w2 bytes (scales stay on GPU)
+    return len(layers) * cold * per_expert
+
+
+def _graph_bytes(world: int) -> int:
+    """Per-rank captured-graph estimate; TP3 may be overridden for 96 GB GPUs."""
+    if world == 3 and os.environ.get("FLARE_DS41_TP3_GRAPH_GIB"):
+        return int(float(os.environ["FLARE_DS41_TP3_GRAPH_GIB"]) * (1 << 30))
+    return 8 << 30
+
+
 RECIPE = Recipe(
     name="deepseek41", served_model_name="DeepSeek-V4.1-Flash", prepare=prepare, usage=usage,
     mla_compute_modes=("auto", "bf16"), mla_compute_mode="bf16", expert_scale_compression="csf",
@@ -67,6 +88,9 @@ RECIPE = Recipe(
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
-    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4)}),
-    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4)}),
+    host_offload_bytes=_parked_bytes,
+    # TP3 on 96 GB SM120: the shared 8 GiB graph estimate leaves no room for 92.5 GiB of TP3 weights;
+    # FLARE_DS41_TP3_GRAPH_GIB overrides the TP3 graph estimate (measured value goes here once known).
+    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, _graph_bytes(world)) for world in (3, 4)}),
+    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, _graph_bytes(world)) for world in (3, 4)}),
 )

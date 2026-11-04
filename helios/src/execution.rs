@@ -39,3 +39,10 @@ pub use manifest::{
     DEFAULT_COMPLETION_TOKEN_CAPACITY, COMPLETION_METADATA_FIELDS, resolve_completion_token_capacity, MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, REQUEST_LANES,
     SamplingMode,
 };
+
+/// Debug A/B (DeepSeek decode-corruption hunt, flare#193): `FLARE_SINGLE_SUBMISSION=1` keeps at most one
+/// generation submission in flight, disabling the two-frame CPU/GPU overlap introduced in bce032c.
+pub(crate) fn single_submission() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FLARE_SINGLE_SUBMISSION").is_some_and(|v| v != "0" && !v.is_empty()))
+}

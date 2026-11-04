@@ -243,6 +243,9 @@ class Recipe:
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
+    # Bytes per rank that the recipe parks in device-visible host memory instead of VRAM (e.g. DeepSeek V4.1's
+    # cold experts at TP3), subtracted from the planner's resident-weight estimate. Called with the world size.
+    host_offload_bytes: Callable[[int], int] | None = None
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes
@@ -297,8 +300,9 @@ class Recipe:
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:
             draft_bytes = method.draft_bytes
+        parked = 0 if self.host_offload_bytes is None else self.host_offload_bytes(world_size)
         return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
-                   + (draft_bytes if learned else 0)) // world_size)
+                   + (draft_bytes if learned else 0)) // world_size) - parked
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""

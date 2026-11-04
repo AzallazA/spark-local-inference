@@ -590,6 +590,7 @@ impl GraphExecutor {
         };
         self.startup_ready && self.poison.is_none()
             && resources.frames[self.next_sequence as usize % 2].pending.is_none()
+            && (!super::single_submission() || resources.frames.iter().all(|frame| frame.pending.is_none()))
             && !resources
                 .frames
                 .iter()

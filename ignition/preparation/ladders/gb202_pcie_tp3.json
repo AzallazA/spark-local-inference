@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "name": "gb202_pcie_tp3",
+  "compute_capability": [12, 0],
+  "world_size": 3,
+  "dtype": "bfloat16",
+  "inplace": false,
+  "cache_policy": "cold",
+  "min_bytes": 16,
+  "buckets": [
+    {"max_bytes": 8192, "implementation": "joint_latency", "threads": 128, "blocks": 64, "profiles": {"full": [1, 4, 16, 64]}},
+    {"max_bytes": 65536, "implementation": "joint_latency", "threads": 256, "blocks": 64, "profiles": {"full": [4, 16, 64], "pull": [8, 36]}},
+    {"max_bytes": 1048576, "implementation": "joint_bandwidth", "threads": 128, "blocks": 64, "profiles": {"pull": [8, 36], "bulk_pull": [32, 64]}},
+    {"max_bytes": 10485760, "implementation": "joint_bandwidth", "threads": 128, "blocks": 64, "profiles": {"bulk_pull": [32, 64], "bulk_push": [36, 64]}}
+  ],
+  "all_gather": null
+}
