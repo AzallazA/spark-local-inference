@@ -88,6 +88,15 @@ def _can_race_contextual_plans(config, signatures, device):
 
 
 @dataclass(frozen=True)
+
+def _sampling_defaults(config):
+    """Vocabulary-parallel sampling has no top-p filter: declare top_p fixed at 1 so requests clamp instead of failing."""
+    defaults = RECIPE.sampling_defaults.as_dict()
+    if config.vocabulary_parallel_sampling:
+        defaults["top_p"] = 1.
+        defaults.setdefault("ranges", {})["top_p"] = {"min": 1., "max": 1.}
+    return defaults
+
 class PreparationConfig:
     collective_tuning: str = "static"
     collective_ladder: dict | None = None
@@ -629,7 +638,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(metadata_path, eos_token_ids=[1], prompt_encoder=PromptEncoder.DEEPSEEK_V41,
             image_profile="deepseek_row_major" if vision_state is not None else None),
-        "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
+        "sampling_defaults": _sampling_defaults(config), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}
