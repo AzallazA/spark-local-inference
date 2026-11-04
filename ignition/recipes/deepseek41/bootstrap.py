@@ -87,8 +87,6 @@ def _can_race_contextual_plans(config, signatures, device):
     return True
 
 
-@dataclass(frozen=True)
-
 def _sampling_defaults(config):
     """Vocabulary-parallel sampling has no top-p filter: declare top_p fixed at 1 so requests clamp instead of failing."""
     defaults = RECIPE.sampling_defaults.as_dict()
@@ -97,6 +95,8 @@ def _sampling_defaults(config):
         defaults.setdefault("ranges", {})["top_p"] = {"min": 1., "max": 1.}
     return defaults
 
+
+@dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
     collective_ladder: dict | None = None
