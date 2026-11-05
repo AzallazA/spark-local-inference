@@ -190,7 +190,7 @@ class PreparedLayer:
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
             image_mask=self.image_mask)
-        self.cold_experts = None
+        self.cold_experts = self.hot_map = None
         if weights.experts.cold is not None:
             # TP3 expert promotion: hot experts on the GPU, cold experts in host memory. Each bank sees the
             # router's IDs remapped to its local slots; IDs outside a bank are inactive routes there.
@@ -198,6 +198,11 @@ class PreparedLayer:
             self.hot_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
             self.cold_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
             self.cold_routed = buffers.zeros(tuple(s.routed.shape), s.routed.dtype)
+            route_ids = self.hot_ids
+        elif weights.experts.hot_map is not None:
+            # Merged bank: one remap from global expert IDs to the bank's hot-first slots.
+            self.hot_map, self.cold_map = weights.experts.hot_map, None
+            self.hot_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
             route_ids = self.hot_ids
         else:
             route_ids = s.router.ids
@@ -255,6 +260,8 @@ class PreparedLayer:
             flat = s.router.ids.reshape(-1)
             torch.index_select(self.hot_map, 0, flat, out=self.hot_ids.view(-1))
             torch.index_select(self.cold_map, 0, flat, out=self.cold_ids.view(-1))
+        elif self.hot_map is not None:
+            torch.index_select(self.hot_map, 0, s.router.ids.reshape(-1), out=self.hot_ids.view(-1))
         self.experts()
         if self.cold_experts is not None:
             self.cold_experts()

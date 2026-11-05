@@ -679,7 +679,11 @@ impl NativeModel {
             let (mut gpu_bytes, mut host_bytes, mut payload_bytes) = (0u64, 0u64, 0u64);
             for allocation in packages.iter().flat_map(|package| &package.allocations) {
                 match allocation.memory {
-                    Memory::Device => gpu_bytes += allocation.nbytes as u64,
+                    Memory::Device => {
+                        let device = super::mixed_device_bytes(allocation).unwrap_or(allocation.nbytes);
+                        gpu_bytes += device as u64;
+                        host_bytes += (allocation.nbytes - device) as u64;
+                    }
                     Memory::MappedHost => host_bytes += allocation.nbytes as u64,
                     Memory::Peer => {}
                 }

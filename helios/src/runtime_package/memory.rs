@@ -227,7 +227,7 @@ fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
         })
         .try_fold(0u64, |total, a| {
             total
-                .checked_add(a.nbytes as u64)
+                .checked_add(super::mixed_device_bytes(a).unwrap_or(a.nbytes) as u64)
                 .ok_or_else(|| invalid("fixed model memory overflows the device budget"))
         })
 }

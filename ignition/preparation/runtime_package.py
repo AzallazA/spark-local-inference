@@ -203,6 +203,11 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
     allocations.extend(Allocation(f"host-{index}", region.address, region.extent, alignment=4096,
         preserve_address=True, memory="mapped_host") for index, region in enumerate(storage.host_regions)
         if not region.closed)
+    # TP3 merged expert banks: one allocation per bank; Helios maps its first <device bytes> as VRAM
+    # and the rest as pinned host-NUMA memory, so the bank stays one contiguous range.
+    for index, region in enumerate(r for r in getattr(storage, "mixed_regions", ()) if not r.closed):
+        allocations.append(Allocation(f"mixed-{index}-{region.device_bytes}", region.address, region.extent,
+            alignment=storage.granularity, preserve_address=True))
     allocations.extend(Allocation(region.name, region.address, region.extent, alignment=storage.granularity,
         initialize="zero", preserve_address=True, sizing=dict(capacity=region.group,
         unit_bytes=region.unit_bytes, maximum=region.maximum)) for region in dynamic)

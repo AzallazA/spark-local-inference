@@ -459,7 +459,7 @@ impl NativeResources {
                             .is_some_and(|a| a.nbytes > 0)
                 })
                 .try_fold(0usize, |total, allocation| {
-                    total.checked_add(allocation.nbytes)
+                    total.checked_add(mixed_device_bytes(allocation).unwrap_or(allocation.nbytes))
                 })
                 .ok_or_else(|| invalid("package device footprint overflows address space"))?;
             let free = self.available_memory()?;
@@ -495,29 +495,39 @@ impl NativeResources {
                 let address = if let Some(address) = allocation.address {
                     match allocation.memory {
                         Memory::Device => {
-                            let properties = AllocationProperties {
-                                kind: 1,
-                                handles: 0,
-                                location: Location {
+                            // TP3 merged expert banks (`mixed-<index>-<device bytes>`): the prefix is
+                            // device memory and the rest pinned host-NUMA memory, mapped contiguously.
+                            let device_bytes = mixed_device_bytes(allocation).unwrap_or(allocation.nbytes);
+                            let mut numa = 0;
+                            if device_bytes < allocation.nbytes {
+                                driver.check(
+                                    "cuDeviceGetAttribute",
+                                    (driver.device_attribute)(&mut numa, 134, self.device),
+                                )?;
+                            }
+                            for (offset, nbytes, location) in [
+                                (0, device_bytes, Location { kind: 1, device: self.device }),
+                                (device_bytes, allocation.nbytes - device_bytes, Location { kind: 3, device: numa.max(0) }),
+                            ] {
+                                if nbytes == 0 {
+                                    continue;
+                                }
+                                let properties = AllocationProperties {
                                     kind: 1,
-                                    device: self.device,
-                                },
-                                windows: null_mut(),
-                                flags: [0; 8],
-                            };
-                            let mut physical = 0;
-                            driver.check(
-                                "cuMemCreate",
-                                (driver.physical_create)(
-                                    &mut physical,
-                                    allocation.nbytes,
-                                    &properties,
-                                    0,
-                                ),
-                            )?;
-                            let mapped = (driver.map)(address, allocation.nbytes, 0, physical, 0);
-                            (driver.physical_release)(physical);
-                            driver.check("cuMemMap", mapped)?;
+                                    handles: 0,
+                                    location,
+                                    windows: null_mut(),
+                                    flags: [0; 8],
+                                };
+                                let mut physical = 0;
+                                driver.check(
+                                    "cuMemCreate",
+                                    (driver.physical_create)(&mut physical, nbytes, &properties, 0),
+                                )?;
+                                let mapped = (driver.map)(address + offset as u64, nbytes, 0, physical, 0);
+                                (driver.physical_release)(physical);
+                                driver.check("cuMemMap", mapped)?;
+                            }
                         }
                         Memory::MappedHost => {
                             #[cfg(unix)]
@@ -574,7 +584,13 @@ impl NativeResources {
                         mappings: if allocation.address.is_some()
                             && matches!(allocation.memory, Memory::Device)
                         {
-                            vec![(address, allocation.nbytes)]
+                            match mixed_device_bytes(allocation) {
+                                Some(device) if device < allocation.nbytes => vec![
+                                    (address, device),
+                                    (address + device as u64, allocation.nbytes - device),
+                                ],
+                                _ => vec![(address, allocation.nbytes)],
+                            }
                         } else {
                             Vec::new()
                         },
@@ -1198,4 +1214,10 @@ impl Drop for NativeResources {
             }
         }
     }
+}
+
+/// TP3 merged expert bank (`mixed-<index>-<device bytes>`): device bytes of a VRAM/host-NUMA allocation.
+pub(super) fn mixed_device_bytes(allocation: &format::Allocation) -> Option<usize> {
+    let rest = allocation.name.strip_prefix("mixed-")?;
+    rest.rsplit_once('-')?.1.parse().ok()
 }

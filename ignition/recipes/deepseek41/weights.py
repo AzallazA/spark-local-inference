@@ -131,6 +131,11 @@ def hot_expert_ids(layer: int, experts: int) -> list | None:
     return sorted(order[:hot])
 
 
+def merged_bank() -> bool:
+    """FLARE_DS41_MERGED_BANK=1: parked layers use one mixed VRAM/host bank instead of hot + cold banks."""
+    return os.environ.get("FLARE_DS41_MERGED_BANK", "0") == "1"
+
+
 def host_expert_layers() -> frozenset:
     """TP3 expert parking: FLARE_DS41_HOST_EXPERT_LAYERS="20-22" or "20,21" parks those MoE layers'
     routed-expert banks in device-visible host memory (read over PCIe when routed)."""
@@ -209,6 +214,21 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         if hot is None or len(hot) == count:
             experts = self.load_experts([f"{ffn}.experts.{i}" for i in range(count)], interval,
                                         host=parked and hot is None)
+        elif merged_bank() and getattr(self._host_allocator, "__self__", None) is not None:
+            # One bank, hot experts first: VRAM rows for hot, host rows for cold (one MoE call per layer).
+            storage = self._host_allocator.__self__
+            hot_set = set(hot)
+            order = list(hot) + [e for e in range(count) if e not in hot_set]
+            host_allocator = self._host_allocator
+            self._host_allocator = lambda name, shape, dtype: storage.mixed_allocate(
+                name, shape, dtype, device_rows=len(hot))
+            try:
+                experts = self.load_experts([f"{ffn}.experts.{i}" for i in order], interval, host=True)
+            finally:
+                self._host_allocator = host_allocator
+            hot_map = torch.empty((count,), dtype=torch.int32)
+            hot_map[order] = torch.arange(count, dtype=torch.int32)
+            hot_map = hot_map.to(self.device)
         else:
             hot_set = set(hot)
             cold_ids = [e for e in range(count) if e not in hot_set]
