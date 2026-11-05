@@ -322,6 +322,9 @@ class PreparedParallelDraftRound:
         from .vocabulary_sampling import PreparedVocabularySoftmax, PreparedVocabularyBlockVerification
 
         o, b, w = self.owner, self.batch, self.width
+        # This rank's global vocabulary IDs as a buffer: compiled forwards are shared across ranks.
+        copy_start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
+        self.copy_columns = torch.arange(self.probabilities.shape[-1], device=self.probabilities.device) + copy_start
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         options = dict(start=start, runtime=o.sampling_runtime, session=o.session,
@@ -374,15 +377,14 @@ class PreparedParallelDraftRound:
                  & (o.copy_expected[safe] == self.before))
         usable = ((positions[None, :] < o.copy_count[safe, None]) & (ids >= 0) & (ids < o.requests.vocab_size)
                   & (positions[None, :] < limits[:, None] - 1))
-        # A copied run is used only as a prefix: drafts after the first unusable position are invalid.
-        usable = usable.int().cumprod(1).bool()
-        self.drafts.copy_(torch.where(fresh[:, None], torch.where(usable, ids, 0), self.drafts))
-        self.valid.copy_(torch.where(fresh[:, None], usable, self.valid))
-        local = self.probabilities.shape[-1]
-        start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
-        columns = torch.arange(local, device=ids.device) + start
-        point = (columns[None, None, :] == ids[:, :, None]).float()
-        self.probabilities.copy_(torch.where(fresh[:, None, None], point, self.probabilities))
+        # Copied tokens replace the learned drafts over the matched prefix; later positions keep their learned
+        # drafts and proposal distributions, which stay exact proposals (verification requires every position
+        # within the verified prefix to carry a valid normalized proposal).
+        copied = fresh[:, None] & usable.int().cumprod(1).bool()
+        self.drafts.copy_(torch.where(copied, ids, self.drafts))
+        self.valid.logical_or_(copied)
+        point = (self.copy_columns[None, None, :] == ids[:, :, None]).float()
+        self.probabilities.copy_(torch.where(copied[:, :, None], point, self.probabilities))
 
     def __call__(self):
         self.propose()
