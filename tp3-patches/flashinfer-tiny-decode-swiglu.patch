@@ -1,5 +1,5 @@
---- /tmp/_impl.py.orig	2026-11-04 08:32:52.035201464 -0500
-+++ _impl.py	2026-11-04 08:32:52.047649198 -0500
+--- a/flashinfer/experimental/b12x/moe/fused_moe/_impl.py
++++ b/flashinfer/experimental/b12x/moe/fused_moe/_impl.py
 @@ -2612,6 +2612,9 @@
      activation: str,
      source_format: str,

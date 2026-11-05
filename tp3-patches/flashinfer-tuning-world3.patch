@@ -1,5 +1,5 @@
---- /tmp/_tuning.py.orig	2026-11-03 23:13:37.274681883 -0500
-+++ .venv/lib/python3.12/site-packages/flashinfer/experimental/b12x/comm/pcie/_tuning.py	2026-11-03 23:13:37.275929089 -0500
+--- a/flashinfer/experimental/b12x/comm/pcie/_tuning.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_tuning.py
 @@ -24,13 +24,13 @@
      "PCIeTwoShotBF16.all_gather": (2, 3, 4, 6, 8, 10),
      "TwoShotReduceScatter.reduce_scatter_fp8": (2, 4, 8),

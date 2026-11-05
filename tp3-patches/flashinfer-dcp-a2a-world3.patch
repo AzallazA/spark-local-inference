@@ -1,5 +1,5 @@
---- /tmp/pcie_dcp_a2a.py.orig	2026-11-03 23:11:32.230863905 -0500
-+++ .venv/lib/python3.12/site-packages/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py	2026-11-03 23:11:32.232316683 -0500
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py
 @@ -39,7 +39,7 @@
  )
  
