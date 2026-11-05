@@ -11,6 +11,15 @@
  def _validate_query(query, device):
 --- a/flashinfer/experimental/b12x/sequence/engram/_preparation.py
 +++ b/flashinfer/experimental/b12x/sequence/engram/_preparation.py
+@@ -80,7 +80,7 @@
+                 gather = (compile_gather(ordinal),)
+             return (
+                 kernels._lookup.warmup(
+-                    p["weight"],
++                    _CompilePointer(torch.uint8) if query.packed_fp4 else p["weight"],
+                     p["scales"],
+                     p["hashes"],
+                     p["num_tokens"],
 @@ -92,6 +92,7 @@
                      END=shard_end,
                      COMPACT=query.compact_rows,
