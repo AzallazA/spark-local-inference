@@ -362,6 +362,28 @@ class PreparedParallelDraftRound:
         commit.prepare()
         self.operations = target, (), verify, commit
 
+    def _apply_copied_proposals(self, safe, limits):
+        """Replace a row's learned drafts with its fresh copied history continuation (point-mass proposals)."""
+        o = self.owner
+        if not hasattr(o, "copy_ids"):
+            return
+        positions = self.draft_positions
+        ids = o.copy_ids[safe][:, :positions.numel()]
+        fresh = (self.active & (o.copy_count[safe] > 0)
+                 & (o.copy_generation[safe] == o.requests.generation[safe])
+                 & (o.copy_expected[safe] == self.before))
+        usable = ((positions[None, :] < o.copy_count[safe, None]) & (ids >= 0) & (ids < o.requests.vocab_size)
+                  & (positions[None, :] < limits[:, None] - 1))
+        # A copied run is used only as a prefix: drafts after the first unusable position are invalid.
+        usable = usable.int().cumprod(1).bool()
+        self.drafts.copy_(torch.where(fresh[:, None], torch.where(usable, ids, 0), self.drafts))
+        self.valid.copy_(torch.where(fresh[:, None], usable, self.valid))
+        local = self.probabilities.shape[-1]
+        start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
+        columns = torch.arange(local, device=ids.device) + start
+        point = (columns[None, None, :] == ids[:, :, None]).float()
+        self.probabilities.copy_(torch.where(fresh[:, None, None], point, self.probabilities))
+
     def __call__(self):
         self.propose()
         self.verify()
@@ -404,6 +426,7 @@ class PreparedParallelDraftRound:
                 self.full_proposal()
                 if self.vocabulary_parallel:
                     self.valid.logical_and_(self.active[:, None] & (self.draft_positions[None, :] < limits[:, None] - 1))
+                    self._apply_copied_proposals(safe, limits)
                     self.sampled.copy_(self.drafts[:, -1])
                     self.markov_token.copy_(self.sampled)
             for i, proposal in enumerate(proposals):

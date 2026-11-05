@@ -51,7 +51,12 @@ def usage(prepared):
 
 def _parked_bytes(world: int) -> int:
     """Routed-expert bytes per rank parked in host memory (FLARE_DS41_HOST_EXPERT_LAYERS / FLARE_DS41_HOT_EXPERTS)."""
-    from .weights import host_expert_layers
+    from .weights import global_cold_plan, host_expert_layers
+    local = -(-2304 // world)  # routed-expert intermediate width per rank
+    per_expert = 2 * local * 5120 // 2 + 5120 * local // 2           # MXFP4 w13 + w2 bytes (scales stay on GPU)
+    plan = global_cold_plan()
+    if plan is not None:
+        return sum(len(cold) for cold in plan.values()) * per_expert
     layers = host_expert_layers()
     if not layers:
         return 0

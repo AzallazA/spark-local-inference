@@ -736,8 +736,20 @@ impl NativeModel {
                 let group_budget = embedding_table_cache_bytes / engram.len() as u64;
                 let files = files.direct_files().collect::<Result<Vec<_>>>()?;
                 let mut bindings = Vec::new();
-                for ((index, ranks), tokens) in engram.into_iter().zip(engram_tokens) {
+                // TP3: FLARE_ENGRAM_RAM_TABLES="0,2" keeps those Engram tables fully in RAM while the
+                // others follow --embedding-table-storage (the first Engram layer has the least slack).
+                let ram_tables: Vec<usize> = std::env::var("FLARE_ENGRAM_RAM_TABLES")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                for (position, ((index, ranks), tokens)) in engram.into_iter().zip(engram_tokens).enumerate() {
                     let first = ranks[0];
+                    let storage = if ram_tables.contains(&position) {
+                        crate::engram::Storage::Ram
+                    } else {
+                        storage
+                    };
                     let shared = crate::engram::Shared::new(
                         index,
                         &files,

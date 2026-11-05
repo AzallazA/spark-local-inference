@@ -265,6 +265,9 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
         buffers["speculative_prefix_limits"] = prefix_limits
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
         packed_inputs += ("speculative_prefix_limits",)
+        # Copied history proposals for `flare run --history-drafts`.
+        buffers.update(speculation.copy_buffers())
+        packed_inputs += speculation.COPY_INPUTS
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):

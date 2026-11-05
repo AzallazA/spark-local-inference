@@ -116,6 +116,10 @@ class ModelWeights:
 def hot_expert_ids(layer: int, experts: int) -> list | None:
     """TP3 expert promotion: the FLARE_DS41_HOT_EXPERTS hottest experts of a parked layer, by the route counts in
     FLARE_DS41_EXPERT_COUNTS_DIR/expert-routes-rank0-layer{L}.json (vLLM route-monitor format). None = park all."""
+    plan = global_cold_plan()
+    if plan is not None:
+        cold = plan.get(layer, frozenset())
+        return [e for e in range(experts) if e not in cold] if cold else None
     hot = int(os.environ.get("FLARE_DS41_HOT_EXPERTS", "0") or 0)
     if hot <= 0:
         return None
@@ -131,6 +135,34 @@ def hot_expert_ids(layer: int, experts: int) -> list | None:
     return sorted(order[:hot])
 
 
+_GLOBAL_PLAN = {}
+
+
+def global_cold_plan() -> dict | None:
+    """FLARE_DS41_GLOBAL_COLD=N: the N least-routed (layer, expert) pairs across all MoE layers live in host
+    memory (merged banks); every other expert stays in VRAM. Route counts as for FLARE_DS41_HOT_EXPERTS.
+    Returns {layer: frozenset(cold experts)}."""
+    budget = int(os.environ.get("FLARE_DS41_GLOBAL_COLD", "0") or 0)
+    if budget <= 0:
+        return None
+    if budget not in _GLOBAL_PLAN:
+        import json
+        from pathlib import Path
+        root = Path(os.environ["FLARE_DS41_EXPERT_COUNTS_DIR"])
+        pairs = []
+        for path in sorted(root.glob("expert-routes-rank0-layer*.json")):
+            layer = int(path.stem.rsplit("layer", 1)[1])
+            counts = json.loads(path.read_text())["counts"]
+            total = sum(counts) or 1
+            pairs.extend((count / total, layer, expert) for expert, count in enumerate(counts))
+        pairs.sort()
+        plan = {}
+        for _, layer, expert in pairs[:budget]:
+            plan.setdefault(layer, set()).add(expert)
+        _GLOBAL_PLAN[budget] = {layer: frozenset(cold) for layer, cold in plan.items()}
+    return _GLOBAL_PLAN[budget]
+
+
 def merged_bank() -> bool:
     """FLARE_DS41_MERGED_BANK=1: parked layers use one mixed VRAM/host bank instead of hot + cold banks."""
     return os.environ.get("FLARE_DS41_MERGED_BANK", "0") == "1"
@@ -139,6 +171,9 @@ def merged_bank() -> bool:
 def host_expert_layers() -> frozenset:
     """TP3 expert parking: FLARE_DS41_HOST_EXPERT_LAYERS="20-22" or "20,21" parks those MoE layers'
     routed-expert banks in device-visible host memory (read over PCIe when routed)."""
+    plan = global_cold_plan()
+    if plan is not None:
+        return frozenset(plan)
     spec = os.environ.get("FLARE_DS41_HOST_EXPERT_LAYERS", "").strip()
     layers = set()
     for part in filter(None, (p.strip() for p in spec.split(","))):
