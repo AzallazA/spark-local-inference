@@ -723,6 +723,23 @@ enum Data {
 
 fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
     let data = data.bytes();
+    // Prefill gathers thousands of random rows; split large gathers across CPU threads.
+    const PARALLEL_ROWS: usize = 8192;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if ids.len() >= PARALLEL_ROWS && threads > 1 {
+        let rows_per = ids.len().div_ceil(threads);
+        let output = &mut output[..ids.len() * row_bytes];
+        std::thread::scope(|scope| {
+            for (chunk_ids, chunk_out) in ids.chunks(rows_per).zip(output.chunks_mut(rows_per * row_bytes)) {
+                scope.spawn(move || copy_rows(data, row_bytes, chunk_ids, chunk_out));
+            }
+        });
+        return;
+    }
+    copy_rows(data, row_bytes, ids, output);
+}
+
+fn copy_rows(data: &[u8], row_bytes: usize, ids: &[i64], output: &mut [u8]) {
     for (row, &id) in ids.iter().enumerate() {
         let target = &mut output[row * row_bytes..(row + 1) * row_bytes];
         if id < 0 {

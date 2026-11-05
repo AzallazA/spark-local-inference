@@ -758,9 +758,9 @@ impl NativeModel {
                         model.ranks[first].context as usize,
                         devices[first],
                         storage,
-                        group_budget,
+                        if storage == crate::engram::Storage::Ram { 0 } else { group_budget },
                         options.embedding_workers(),
-                        embedding_table_resident_scales,
+                        embedding_table_resident_scales && storage == crate::engram::Storage::Disk,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
