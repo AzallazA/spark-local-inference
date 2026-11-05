@@ -4,6 +4,7 @@
 
 """Compile prepared model forwards and capture one native executable per shape."""
 
+import os
 from contextlib import nullcontext
 from time import monotonic
 
@@ -92,6 +93,37 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         release_unused()
     elif materialize is not None:
         materialize()
+    # TP3 profiling (opt-in, FLARE_DS41_EAGER_PROFILE=<substring>): run matching forwards eagerly (compiled code,
+    # no graph capture) inside a cudaProfiler range for nsys --capture-range=cudaProfilerApi, then exit.
+    profile_match = os.getenv("FLARE_DS41_EAGER_PROFILE")
+    if profile_match and label != "Prepare and tune kernels":
+        iters = int(os.getenv("FLARE_DS41_EAGER_ITERS", "20"))
+        targets = [name for name in names if profile_match in name]
+        if progress is not None:
+            progress(f"eager-profile targets ({profile_match!r}): {targets} of {list(names)}")
+        if targets:
+            for name in targets:
+                fn = compiled.get(name, functions[name])
+                if coordinator is not None:
+                    coordinator.barrier(f"profile {name}", coordinator.ranks)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with warmup(), torch.cuda.stream(stream):
+                    for _ in range(3):
+                        fn()
+                    stream.synchronize()
+                    torch.cuda.nvtx.range_push(f"ds41_profile_{name}")
+                    torch.cuda.profiler.start()
+                    for _ in range(iters):
+                        torch.cuda.nvtx.range_push("step")
+                        fn()
+                        torch.cuda.nvtx.range_pop()
+                    stream.synchronize()
+                    torch.cuda.profiler.stop()
+                    torch.cuda.nvtx.range_pop()
+            torch.cuda.synchronize(device)
+            import sys
+            sys.stdout.flush()
+            sys.exit(0)
     with phase(progress, label, total=len(names)) as stage:
         for name in names:
             function = functions[name]
