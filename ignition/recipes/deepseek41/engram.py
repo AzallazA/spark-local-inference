@@ -32,6 +32,7 @@ class Tables:
     shard: object
     columns: torch.Tensor
     readiness_runtime: object = None
+    packed_fp4: bool = False
 
     @classmethod
     def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None, shard=None):
@@ -50,25 +51,35 @@ class Tables:
         if geometry.num_embeddings != tuple(text["engram_num_embeddings"]):
             raise ValueError("Engram hash geometry differs from checkpoint tables")
         sources, inputs, mailboxes = {}, {}, {}
+        packed_fp4 = None
         timings = ReadinessTimings.allocate(frame, len(geometry.layer_ids))
         with phase(progress, "Prepare embedding tables") as stage:
             for index, layer in enumerate(geometry.layer_ids):
                 rows = geometry.num_embeddings[index]
                 pair = []
-                for suffix, columns, dtype in (("weight", 256, "F8_E4M3"), ("scale", 8, "F8_E8M0")):
+                # FP8 E4M3 rows (stock checkpoint) or packed MXFP4 E2M1 rows (engram-nvidia checkpoint).
+                weight = manifest.tensors[f"layers.{layer}.engram.embed.weight"]
+                packed = weight.dtype == "U8" and weight.shape == (rows, 128)
+                if packed_fp4 is None:
+                    packed_fp4 = packed
+                elif packed_fp4 != packed:
+                    raise ValueError("Engram tables mix FP8 and MXFP4 rows")
+                for suffix, columns, dtype in (("weight", 128 if packed else 256, "U8" if packed else "F8_E4M3"),
+                                               ("scale", 8, "F8_E8M0")):
                     name = f"layers.{layer}.engram.embed.{suffix}"
                     metadata = manifest.tensors[name]
                     if metadata.shape != (rows, columns) or metadata.dtype != dtype:
                         raise ValueError(f"{name}: invalid Engram table geometry or dtype")
                     pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * columns))
                 sources[layer] = tuple(pair)
-                inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index)
+                inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index, packed_fp4=packed)
                 mailboxes[layer] = host_allocator(f"engram_{layer}_requests", (tokens * 24 + 1,), torch.int64)
                 mailboxes[layer].host_view.zero_()
             stage.update(f"{sum(source.nbytes for pair in sources.values() for source in pair) / (1 << 30):.1f} GiB in checkpoint spans")
         columns = torch.tensor([head * 256 + column for head in range(shard.rank, 24, shard.world_size)
                                 for column in range(256)], dtype=torch.int64, device=device)
-        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, columns)
+        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, columns,
+                   packed_fp4=bool(packed_fp4))
 
     def buffers(self):
         return {**{name: tensor for layer, inputs in self.inputs.items() for name, tensor in inputs.buffers(layer).items()},
@@ -84,7 +95,7 @@ class Tables:
             {"planes": [{"segments": [
                             {"path": str(source.path), "offset": source.offset, "nbytes": source.nbytes}],
                          "row_bytes": row_bytes}
-                        for source, row_bytes in zip(self.sources[layer], (256, 8), strict=True)],
+                        for source, row_bytes in zip(self.sources[layer], (128 if self.packed_fp4 else 256, 8), strict=True)],
              "heads": 24, "weights": f"engram_{layer}_weights", "scales": f"engram_{layer}_scales",
              "hashes": f"engram_{layer}_hashes", "event": f"engram_{layer}_ready",
              "request": f"engram_{layer}_requests"}
@@ -95,7 +106,8 @@ class Tables:
         tables = []
         for ordinal, layer in enumerate(self.geometry.layer_ids):
             table = dict(layer=layer, rows=self.geometry.num_embeddings[ordinal],
-                embedding_width=256, scale_block=32, encoding="FP8_E4M3_E8M0",
+                embedding_width=256, scale_block=32,
+                encoding="MXFP4_E2M1_E8M0" if self.packed_fp4 else "FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
                 request_buffer=f"engram_{layer}_requests")
