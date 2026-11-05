@@ -6,6 +6,7 @@
 
 import contextlib
 import hashlib
+import os
 import json
 from dataclasses import dataclass, replace
 from functools import partial
@@ -595,9 +596,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 graph_pool=package_storage.graph_pool.id, cache_root=config.kernel_cache,
                 compile_decoder=config.compile_decoder, warmup_storage=package_storage,
                 progress=progress)
-        with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
-            tuning = session.tune(show_progress=progress is not None and rank == 0,
-                                  console=stage.console, contextual=contextual)
+        # TP3: --joint-tuning compiles race forwards before scratch is released for compilation;
+        # FLARE_DS41_JOINT_HEADROOM_MIB lowers the compile headroom for that phase only.
+        headroom = session.headroom_bytes
+        if contextual is not None and os.environ.get("FLARE_DS41_JOINT_HEADROOM_MIB"):
+            session.headroom_bytes = int(os.environ["FLARE_DS41_JOINT_HEADROOM_MIB"]) << 20
+        try:
+            with phase(progress, "Prepare and tune kernels") as stage, package_storage.transient():
+                tuning = session.tune(show_progress=progress is not None and rank == 0,
+                                      console=stage.console, contextual=contextual)
+        finally:
+            session.headroom_bytes = headroom
         if contextual is not None and progress is not None:
             from .contextual_selection import contextual_summary
 
