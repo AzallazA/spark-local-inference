@@ -87,6 +87,12 @@ class ModelWeights:
                                  expert_scale_compression=expert_scale_compression,
                                  host_allocator=host_allocator) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
+            if os.environ.get("FLARE_DS41_EMBED_HOST") == "1" and host_allocator is not None:
+                # TP3: the 1.23 GiB token embedding is replicated on every rank but each step gathers only its tokens'
+                # rows (<= 48 in decode, one prefill chunk otherwise); read it from device-visible host memory and give
+                # the VRAM to hot experts / KV.
+                from ignition.components.weights import _park_on_host
+                embedding = _park_on_host(host_allocator, "embed.weight", embedding)
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
@@ -109,6 +115,11 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
+            if vision and os.environ.get("FLARE_DS41_VISION_HOST") == "1" and host_allocator is not None:
+                # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections consume these
+                # tensors as-is, so read them from device-visible host memory and give the VRAM to KV.
+                from ignition.components.weights import _park_on_host
+                vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
         return cls(config, shard, embedding, norm, head, layers, draft,
                    torch.cuda.memory_allocated(device) - before, vision)
 
