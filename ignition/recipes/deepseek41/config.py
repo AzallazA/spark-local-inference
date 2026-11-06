@@ -5,6 +5,7 @@
 """Checkpoint geometry and source ownership for DeepSeek V4.1 Flash."""
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +76,8 @@ class ModelConfig:
             "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
             "engram_head_dim": 256,
         }.items():
+            if name == "num_hidden_layers" and os.environ.get("FLARE_DS41_MINI") == "1" and 6 <= text.get(name, 0) <= 40:
+                continue  # TP3 test tooling: truncated real-weight views (make_mini.py) keep full-width layers
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
         if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]

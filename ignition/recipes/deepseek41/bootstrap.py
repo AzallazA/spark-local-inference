@@ -55,7 +55,8 @@ from ignition.components.paged_resume import PreparedResume
 from .weights import ModelWeights
 
 
-_CONTEXT = partial(PreparedContext, compact_prefill=True)
+# TP3 test tooling: truncated mini views (FLARE_DS41_MINI=1) have no ratio-1 decoder suffix to compact prefill feedback.
+_CONTEXT = partial(PreparedContext, compact_prefill=os.environ.get("FLARE_DS41_MINI") != "1")
 
 
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
@@ -327,6 +328,8 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = package_storage.peer_storage
+    from ignition.recipes.deepseek41.brrr import create_engine
+    create_engine(group, device, ipc)  # TP3 BRRR experiment: no-op unless FLARE_DS41_BRRR_LAYERS is set
     # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world
     # size to divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between
     # decode and prefill: graph capture enters only the main collective's capture() context, so a second

@@ -227,6 +227,22 @@ class PreparedLayer:
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
+        self.brrr = None
+        from ignition.recipes.deepseek41.brrr import brrr_layers
+        # FLARE_DS41_BRRR_PARKED_MAX_ROWS=N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
+        # verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300, BRRR-26 level).
+        from ignition.recipes.deepseek41.weights import host_expert_layers
+        parked_rows = int(os.environ.get("FLARE_DS41_BRRR_PARKED_MAX_ROWS", "0"))
+        rows = metadata.positions.numel()
+        gated = bool(parked_rows) and index in host_expert_layers() and rows > parked_rows
+        if index in brrr_layers() and mode in ("decode", "verify") and not gated:
+            # TP3 BRRR experiment: one fused kernel from the attention output to the MLP all-reduce.
+            if self.cold_experts is not None or self.image_mask is not None:
+                raise ValueError(f"BRRR layer {index} needs one expert bank (resident or merged hot/cold)")
+            from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
+            self.attention.external_tail = True
+            self.brrr = PreparedBRRRTail(index, weights, s, self.attention.window_metadata.position,
+                                         rotary.frequencies[bool(self.attention.ratio)])
 
     def __call__(self):
         s = self.scratch
@@ -246,6 +262,11 @@ class PreparedLayer:
             self.attention_hc(*incoming)
         else:
             self.boundary(self.attention.selectors[0])
+        if self.brrr is not None:
+            self.brrr(self.attention(s.attention_hc.normalized))
+            if self.post is not None:
+                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
+            return
         self.attention_reduce(self.attention(s.attention_hc.normalized))
         _probe.record(s.attention_output, self.probe_index, 1, self.probe_mode)
         self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)

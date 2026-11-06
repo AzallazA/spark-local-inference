@@ -1,0 +1,298 @@
+# SPDX-License-Identifier: Apache-2.0
+"""TP3 experiment: BRRR's fused DS41 layer kernel (o-projection through MLP all-reduce) inside Flare forwards.
+
+FLARE_DS41_BRRR_LAYERS selects layers (same syntax as FLARE_DS41_HOST_EXPERT_LAYERS). For those layers the decode and
+verify forwards replace inverse RoPE, the grouped o-projection, the attention all-reduce, the FFN mHC, the router,
+routed and shared experts and the MLP all-reduce with one kernel launch. Prefill keeps Flare's path.
+
+The kernel (brrr/kernels/decoder.cu, Apache-2.0, fraserprice/DeepSeek-4.1-Flash-1017-BRRR, TP3 port) reads:
+- routed experts from b12x's prepared W4A8 planes, scales decoded in-kernel from b12x's CSF payload
+  (FLARE_DS41_BRRR_NATIVE_SCALES=1 loads these layers without CSF instead),
+- dense weights as its own staged copies read from the checkpoint (FLARE_DS41_BRRR_CKPT),
+- peer flags/inboxes in Flare PeerStorage, so export resets them (and the epoch kept in the flag page) to zero.
+"""
+
+import ctypes as C
+import json
+import os
+import sys
+from functools import cache
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+_ROOT = Path(__file__).resolve().parents[3]
+
+
+def brrr_layers() -> frozenset:
+    spec = os.environ.get("FLARE_DS41_BRRR_LAYERS", "").strip()
+    layers = set()
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        a, _, b = part.partition("-")
+        layers.update(range(int(a), int(b or a) + 1))
+    return frozenset(layers)
+
+
+@cache
+def extension():
+    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(_ROOT / ".brrr-ext"))
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from brrr import cuext
+
+    return cuext.extension("decoder")
+
+
+def _stages(w):
+    w = w.contiguous().view(torch.uint8)
+    w = torch.nn.functional.pad(w, (0, -w.shape[1] % 128))
+    return w.reshape(w.shape[0] // 64, 4, 2, 8, -1, 4, 4, 8).permute(0, 4, 5, 1, 3, 6, 2, 7).contiguous().view(-1)
+
+
+def _interleave(w, block):
+    return w.reshape(2, -1, block, *w.shape[1:]).transpose(0, 1).reshape(w.shape).contiguous()
+
+
+def _rows2d(weight):
+    """Flare's row-major E4M3 values ([L*M, K]) from an MXFP8LinearWeight or MXFP8Rows, without copying."""
+    rows = getattr(weight, "weight", weight)
+    v = rows.values
+    if v.ndim == 3:  # logical [M, K, L] view over physical [L, M, K]
+        v = v.permute(2, 0, 1).reshape(-1, v.shape[1])
+    if not v.is_contiguous() or v.data_ptr() != rows.values.data_ptr():
+        raise RuntimeError("BRRR dense-native needs contiguous row-major values")
+    return v
+
+
+def _shard(rank, size):
+    return slice(rank * size, (rank + 1) * size)
+
+
+class Checkpoint:
+    def __init__(self, root):
+        from safetensors import safe_open
+
+        self.root = Path(root)
+        self.index = json.loads((self.root / "model.safetensors.index.json").read_text())["weight_map"]
+        self._open = cache(lambda name: safe_open(self.root / name, framework="pt"))
+
+    def shape(self, name):
+        return self._open(self.index[name]).get_slice(name).get_shape()
+
+    def get(self, name, rows=slice(None), cols=slice(None)):
+        tensor = self._open(self.index[name]).get_slice(name)
+        picked = tensor[rows, cols] if len(tensor.get_shape()) == 2 else tensor[rows]
+        return picked.contiguous()
+
+
+class Engine:
+    """One per rank: the kernel's peer buffers, scratch and registered layers."""
+
+    def __init__(self, group, device, ipc):
+        self.ext = ext = extension()
+        self.group, self.device, self.ipc = group, device, ipc
+        self.rank, world = dist.get_rank(group=group), dist.get_world_size(group=group)
+        if world != ext.RANKS:
+            raise ValueError(f"BRRR kernel is built for {ext.RANKS} ranks, group has {world}")
+        nbytes = ext.flag_bytes() + ext.inbox_bytes()
+        own = ipc.cudaMalloc(nbytes)
+        ipc.storage.cuda.call("cuMemsetD8_v2", C.c_uint64(own), C.c_ubyte(0), C.c_size_t(nbytes))
+        torch.cuda.synchronize(device)
+        handles = [None] * world
+        dist.all_gather_object(handles, ipc.cudaIpcGetMemHandleBytes(own), group=group)
+        buffers = [own if r == self.rank else ipc.cudaIpcOpenMemHandleBytes(handles[r]) for r in range(world)]
+        # The epoch counter sits in the unused tail of this rank's flag page (flags use 2*2*RANKS*CHUNKS words).
+        self.handle = ext.create(buffers, self.rank, epoch_addr=own + ext.flag_bytes() - 64)
+        dist.barrier(group=group)
+        self.checkpoint = Checkpoint(os.environ["FLARE_DS41_BRRR_CKPT"])
+        self.frequencies = None
+        self.slots = {}
+        self.keep = []
+
+    def raw(self, name, rows=slice(None), cols=slice(None)):
+        return self.checkpoint.get(name, rows, cols).to(self.device)
+
+    def raw_u8(self, name, rows=slice(None), cols=slice(None)):
+        return self.raw(name, rows, cols).view(torch.uint8)
+
+    def raw_padded(self, name, rows=slice(None), cols=slice(None)):
+        """Rank shards may run past the 8 real o-groups (TP3 pads to 9); zero-fill like Flare's padded loader."""
+        shape = self.checkpoint.shape(name)
+        r0, r1 = rows.start or 0, rows.stop if rows.stop is not None else shape[0]
+        if len(shape) == 2:
+            c0, c1 = cols.start or 0, cols.stop if cols.stop is not None else shape[1]
+            got = self.raw_u8(name, slice(r0, max(min(r1, shape[0]), r0)), slice(c0, max(min(c1, shape[1]), c0)))
+            out = torch.zeros((r1 - r0, c1 - c0), dtype=torch.uint8, device=self.device)
+            out[: got.shape[0], : got.shape[1]] = got
+        else:
+            got = self.raw_u8(name, slice(r0, max(min(r1, shape[0]), r0)))
+            out = torch.zeros((r1 - r0,), dtype=torch.uint8, device=self.device)
+            out[: got.shape[0]] = got
+        return out
+
+    def register(self, index, weights):
+        if index in self.slots:
+            return self.slots[index]
+        ext, r, p = self.ext, self.rank, f"layers.{index}"
+        inter, oa = ext.INTER, ext.OA
+        experts = weights.experts.experts
+        impl = experts._impl
+        rep = impl.representation_for("w4a8_mx")
+        if rep is None or rep.n64_repack or rep.intermediate_size != inter or rep.num_experts != ext.EXPERTS:
+            raise RuntimeError(f"BRRR layer {index}: unexpected expert representation {rep}")
+        u8 = lambda t: t.contiguous().view(torch.uint8)
+        rows = _shard(r, inter)
+        gate_up = None
+        if os.environ.get("FLARE_DS41_BRRR_DENSE_NATIVE", "1") != "1" or os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+            gate_up = torch.cat((self.raw(f"{p}.ffn.shared_experts.w1.weight", rows),
+                                 self.raw(f"{p}.ffn.shared_experts.w3.weight", rows)))
+        blocks = _shard(r, inter // 32)
+        scales = (self.raw_u8(f"{p}.ffn.shared_experts.w1.scale", blocks), self.raw_u8(f"{p}.ffn.shared_experts.w3.scale", blocks))
+        kwargs = dict(
+            woa_s=u8(self.raw_padded(f"{p}.attn.wo_a.scale", _shard(r, oa // 32))),
+            wob_s=u8(self.raw_padded(f"{p}.attn.wo_b.scale", cols=_shard(r, oa // 32))),
+            gate_b=self.raw(f"{p}.ffn.gate.bias").float().contiguous(),
+            bias_vl=None,
+            sh13_s=_interleave(torch.cat(scales), 1),
+            sh2_s=torch.nn.functional.pad(self.raw_u8(f"{p}.ffn.shared_experts.w2.scale", cols=blocks),
+                                          (0, ext.SH2_LD - inter // 32)).contiguous(),
+            w13=rep.w13_rp.contiguous(), s13=rep.w13_sfb.contiguous(),
+            w2=rep.w2_rp.contiguous(), s2=rep.w2_sfb.contiguous(),
+            fn=self.raw(f"{p}.hc_ffn_fn").float().contiguous(),
+            hc_scale=self.raw(f"{p}.hc_ffn_scale").float().contiguous(),
+            hc_base=self.raw(f"{p}.hc_ffn_base").float().contiguous(),
+            norm=self.raw(f"{p}.ffn_norm.weight").contiguous(),
+            image_lo=0, dense_native=False,
+            # Merged hot/cold bank: experts are stored hot-first; the kernel routes by global ID and reads the slot.
+            hot_map=None if weights.experts.hot_map is None else weights.experts.hot_map.to(torch.int32).contiguous())
+        if os.environ.get("FLARE_DS41_BRRR_DENSE_NATIVE", "1") == "1":
+            # Read Flare's own row-major E4M3 dense values (same bytes as the checkpoint shards; block scales stay as
+            # small checkpoint copies) instead of staged copies: ~35-40 MB per layer back to the KV pool.
+            out, shared = weights.attention["output"], weights.experts.shared
+            native = dict(woa=_rows2d(out.wo_a), wob=_rows2d(out.wo_b), gate=weights.experts.router,
+                          sh13=_rows2d(shared.gate_up), sh2=_rows2d(shared.down))
+            if os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+                ref = dict(woa=self.raw_padded(f"{p}.attn.wo_a.weight", _shard(r, oa)),
+                           wob=self.raw_padded(f"{p}.attn.wo_b.weight", cols=_shard(r, oa)),
+                           gate=self.raw_u8(f"{p}.ffn.gate.weight"), sh13=u8(gate_up),
+                           sh2=self.raw_u8(f"{p}.ffn.shared_experts.w2.weight", cols=rows))
+                for name, t in native.items():
+                    a, b = t.contiguous().view(torch.uint8), ref[name]
+                    same = a.shape == b.shape and bool(torch.equal(a, b))
+                    print(f"[brrr] rank {r} layer {index} native {name} {tuple(t.shape)} {t.dtype} "
+                          f"stride {tuple(t.stride())}: {'identical' if same else f'MISMATCH vs {tuple(b.shape)}'}", flush=True)
+                    if not same:
+                        raise RuntimeError(f"BRRR layer {index}: Flare's {name} differs from the checkpoint bytes")
+            kwargs.update(native, dense_native=True)
+        else:
+            kwargs.update(woa=_stages(self.raw_padded(f"{p}.attn.wo_a.weight", _shard(r, oa))),
+                          wob=_stages(self.raw_padded(f"{p}.attn.wo_b.weight", cols=_shard(r, oa))),
+                          gate=_stages(self.raw(f"{p}.ffn.gate.weight")), sh13=_stages(_interleave(gate_up, 32)),
+                          sh2=_stages(self.raw(f"{p}.ffn.shared_experts.w2.weight", cols=rows)))
+        decoder = impl.nvfp4_csf
+        if decoder is not None:
+            # Same b12x CSF payload as the vLLM build BRRR's in-kernel reader was qualified on.
+            for tag, plane in (("csf13", decoder.first), ("csf2", decoder.second)):
+                a = _csf_args(plane.scales)
+                kwargs[f"{tag}_storage"], kwargs[f"{tag}_gdesc"], kwargs[f"{tag}_meta"] = a["storage"], a["gdesc"], a["meta"]
+            if os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+                decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
+                for tag, ref in (("csf13", rep.w13_sfb), ("csf2", rep.w2_sfb)):
+                    want = ref.contiguous().view(torch.int32).reshape(-1)
+                    got = torch.empty_like(want)
+                    ext.csf_expand_all(kwargs[f"{tag}_storage"], kwargs[f"{tag}_gdesc"], kwargs[f"{tag}_meta"], got)
+                    torch.cuda.synchronize(self.device)
+                    print(f"[brrr] rank {r} layer {index} {tag} CSF self-check: {int((got != want).sum())} of "
+                          f"{want.numel()} words differ", flush=True)
+        for name in ("w13", "s13", "w2", "s2"):
+            if kwargs[name].data_ptr() != getattr(rep, {"w13": "w13_rp", "s13": "w13_sfb", "w2": "w2_rp", "s2": "w2_sfb"}[name]).data_ptr():
+                raise RuntimeError(f"BRRR layer {index}: {name} is not b12x's resident plane")
+        self.keep.append(kwargs)  # the kernel holds raw pointers to these tensors
+        self.slots[index] = ext.add_layer(self.handle, **kwargs)
+        if os.environ.get("FLARE_DS41_BRRR_LOG") == "1":
+            print(f"[brrr] rank {r} layer {index} -> slot {self.slots[index]} (w13 {tuple(rep.w13_rp.shape)}, "
+                  f"sfb {tuple(rep.w13_sfb.shape)}, layout {rep.w13_layout})", flush=True)
+        return self.slots[index]
+
+
+def _csf_args(scales):
+    """Describe a b12x CsfBlockPayload (destination 2, mxfp4, 3-byte group records) for the fused kernel: per-(payload
+    expert, group) record descriptors first | count << 22, mirroring BlockStorageLayout (from BRRR's TP3 decoder.py)."""
+    st = scales.storage
+    R, C, Es = int(scales.rows), int(scales.columns), int(scales.num_experts)
+    if not (scales.destination == 2 and scales.native_codes and scales.group_record_bytes == 3 and scales.quantization == "mxfp4"):
+        raise RuntimeError(f"BRRR kernel needs CSF destination 2 / mxfp4 / 3-byte records; got {scales}")
+    a16 = lambda v: (v + 15) // 16 * 16
+    cg, groups = (C + 3) // 4, (R + 127) // 128 * ((C + 3) // 4)
+    pages = (groups + 31) // 32
+    prefixes, code_bytes = groups + pages, R * C // 8
+    bases = 1024
+    codes = a16(bases + Es * R)
+    page_bases = a16(codes + Es * code_bytes)
+    offsets = a16(page_bases + Es * pages * 4)
+    recpos = a16(offsets + Es * prefixes * 2)
+    value_off = int(st[:8].view(torch.int64).item())
+    pb = st[page_bases:page_bases + Es * pages * 4].view(torch.int32).view(Es, pages)
+    off = st[offsets:offsets + Es * prefixes * 2].view(torch.int16).view(Es, prefixes).to(torch.int32) & 0xFFFF
+    sg = torch.arange(groups, device=st.device)
+    page = sg // 32
+    first = pb[:, page] + off[:, sg + page]
+    count = pb[:, page] + off[:, sg + page + 1] - first
+    if int(first.max()) >= 1 << 22 or int(count.max()) >= 1 << 10 or int(count.min()) < 0:
+        raise RuntimeError(f"CSF record descriptor out of range: first<{int(first.max())} count<{int(count.max())}")
+    gdesc = (first | (count << 22)).to(torch.int32).contiguous()
+    return dict(storage=st, gdesc=gdesc, meta=[bases, codes, code_bytes, value_off, recpos, R, cg, groups, int(scales.sections)])
+
+
+_ENGINE = []
+
+
+def create_engine(group, device, ipc):
+    if not brrr_layers():
+        return None
+    if not _ENGINE:
+        _ENGINE.append(Engine(group, device, ipc))
+    return _ENGINE[0]
+
+
+def engine():
+    return _ENGINE[0] if _ENGINE else None
+
+
+@torch.library.custom_op("flare::brrr_layer_tail",
+                         mutates_args=("attn_post", "attn_comb", "attn_pre", "y", "resid1", "post1", "comb1", "pre1"))
+def brrr_layer_tail(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
+                    resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
+                    y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,
+                    pre1: torch.Tensor) -> None:
+    extension().run(handle, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre,
+                    None, None, y, resid1, post1, comb1, pre1)
+
+
+@brrr_layer_tail.register_fake
+def _fake_brrr_layer_tail(handle, slot, o, positions, frequencies, resid0, attn_post, attn_comb, attn_pre,
+                          y, resid1, post1, comb1, pre1):
+    pass
+
+
+class PreparedBRRRTail:
+    """Layer tail through the BRRR kernel. Reads s.attended (pre-inverse-RoPE attention output)."""
+
+    def __init__(self, index, weights, scratch, positions, frequencies):
+        e = engine()
+        if e is None:
+            raise RuntimeError("BRRR engine was not created")
+        self.handle, self.slot = int(e.handle), int(e.register(index, weights))
+        self.scratch, self.positions, self.frequencies = scratch, positions, frequencies
+        if os.environ.get("FLARE_DS41_BRRR_BREAK") == "rope":
+            # Negative control for test tooling: reversed RoPE frequencies (wrong inverse rotation of the attention output).
+            self.frequencies = frequencies.flip(0).contiguous()
+        if positions.dtype != torch.int64:
+            raise ValueError("BRRR tail expects int64 positions")
+
+    def __call__(self, attended):
+        s = self.scratch
+        brrr_layer_tail(self.handle, self.slot, attended, self.positions, self.frequencies,
+                        s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb, s.attn_mix,
+                        s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix)

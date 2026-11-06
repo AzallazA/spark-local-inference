@@ -198,10 +198,15 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
 
     def load_experts(self, prefixes, interval, *, host=False):
         text = self.config.text
+        # TP3 BRRR experiment: the fused layer kernel reads native E8M0 expert scales, so its layers skip CSF.
+        from ignition.recipes.deepseek41.brrr import brrr_layers
+        native = (os.environ.get("FLARE_DS41_BRRR_NATIVE_SCALES") == "1" and prefixes and prefixes[0].startswith("layers.")
+                  and int(prefixes[0].split(".")[1]) in brrr_layers())
         return self.load_mxfp4_experts(prefixes, hidden_size=text["hidden_size"],
             intermediate_size=text["moe_intermediate_size"], intermediate_range=interval,
             swiglu_limit=text["swiglu_limit"], scale_name="scale", projection_names=("w3", "w1", "w2"),
-            scale_compression=self.expert_scale_compression, scale_scratch=self._expert_scale_scratch,
+            scale_compression=None if native else self.expert_scale_compression,
+            scale_scratch=None if native else self._expert_scale_scratch,
             host_allocator=self._host_allocator if host else None)
 
     def _selected_names(self):

@@ -436,6 +436,9 @@ class PreparedAttention:
             self.concurrent_query.finish(s.query_low, dependency)
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))
         self.attention()
+        if getattr(self, "external_tail", False):
+            # TP3 BRRR experiment: the fused layer kernel applies inverse RoPE and the o-projection itself.
+            return s.attended
         self.rotary.apply(s.attended, position, compressed=bool(self.ratio), inverse=True)
         self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
         if self.mode == "prefill":
