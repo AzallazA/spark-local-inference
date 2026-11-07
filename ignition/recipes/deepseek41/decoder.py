@@ -10,7 +10,7 @@ import os
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
 from . import probe as _probe
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
@@ -178,7 +178,8 @@ class PreparedLayer:
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode, buffers=buffers,
             window_metadata=window_metadata)
-        self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
+        # Chunked: a decode-sized runtime (FLARE_DS41_AR_ROWS) still reduces prefill rows; one part in decode.
+        self.attention_reduce = PreparedChunkedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
             _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
@@ -223,11 +224,12 @@ class PreparedLayer:
                                 *(() if self.cold_experts is None else (self.cold_experts.plan,))),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
+        self.mlp_reduce = PreparedChunkedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
         self.brrr = None
+        self.brrr_prologue = None
         from ignition.recipes.deepseek41.brrr import brrr_layers
         # FLARE_DS41_BRRR_PARKED_MAX_ROWS=N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
         # verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300, BRRR-26 level).
@@ -243,6 +245,17 @@ class PreparedLayer:
             self.attention.external_tail = True
             self.brrr = PreparedBRRRTail(index, weights, s, self.attention.window_metadata.position,
                                          rotary.frequencies[bool(self.attention.ratio)])
+            # FLARE_DS41_BRRR_PROLOGUE=1: fused attention prologue too, on plain layers of graphs with <= 8 rows (BRRR's
+            # PROLOGUE_MAXM). Excluded: no carried state (post materialized), Engram, indexer/KV sources (they reuse
+            # Flare-format quantized q-low / normalized input), the layer that owns window metadata.
+            att = self.attention
+            if (os.environ.get("FLARE_DS41_BRRR_PROLOGUE") == "1" and carry and boundary is None and self.engram is None
+                    and s.residual.shape[0] <= 8 and not att.owns_window_metadata and att.global_kv is None and not att.selectors
+                    and att.concurrent_query is None):
+                from ignition.recipes.deepseek41.brrr import PreparedBRRRPrologue
+                self.brrr_prologue = PreparedBRRRPrologue(index, weights, s, att.window_metadata.position,
+                                                          rotary.frequencies[bool(att.ratio)], text["rms_norm_eps"], buffers)
+                att.external_prologue = True
 
     def __call__(self):
         s = self.scratch
@@ -258,6 +271,13 @@ class PreparedLayer:
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
         _probe.record(source, self.probe_index, 0, self.probe_mode)
+        if self.brrr_prologue is not None:
+            # The fused prologue replaces the attention mHC (post_pre + attn_norm) and the q/kv projections.
+            self.brrr_prologue()
+            self.brrr(self.attention(s.attention_hc.normalized), mix=self.brrr_prologue.mix)
+            if self.post is not None:
+                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
+            return
         if self.boundary is None:
             self.attention_hc(*incoming)
         else:

@@ -335,8 +335,11 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
     # decode and prefill: graph capture enters only the main collective's capture() context, so a second
     # runtime's reductions would be captured outside the protocol b12x requires (and could desynchronize).
     if 5120 % len(config.devices):
+        # FLARE_DS41_AR_ROWS=N sizes the shared runtime for N rows instead of a whole prefill chunk; the decoder's
+        # chunked reductions split prefill rows to fit (786 MiB/GPU at 4096 rows vs 190 MiB at 1024).
+        ar_rows = int(os.environ.get("FLARE_DS41_AR_ROWS", "0")) or config.prefill_chunk_size
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
-            max_tokens=max(config.all_reduce_tokens, config.prefill_chunk_size), hidden_size=5120, ipc=ipc)
+            max_tokens=max(config.all_reduce_tokens, min(config.prefill_chunk_size, ar_rows)), hidden_size=5120, ipc=ipc)
         prefill = collective
     else:
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,

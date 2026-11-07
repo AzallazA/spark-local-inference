@@ -798,6 +798,13 @@ __device__ __forceinline__ float2 rope_cs(const float* row, int pair) { return m
 
 __device__ __forceinline__ float rot_add(float a, float b, float2 cs) { return a * cs.x + b * cs.y; }
 
+// Flare port: (cos, sin) for one rotary pair from Flare's 32 frequencies (angle = float(pos) * freq[pair]).
+__device__ __forceinline__ float2 rope_cs_freq(const float* freq, long pos, int pair) {
+  float sn, cs;
+  sincosf(float(pos) * __ldg(freq + pair), &sn, &cs);
+  return make_float2(cs, sn);
+}
+
 __device__ __forceinline__ float rot_sub(float a, float b, float2 cs) { return a * cs.x - b * cs.y; }
 
 __device__ __forceinline__ uint4 rope(uint4 v, const float* cs, int d) {
@@ -1824,7 +1831,7 @@ __device__ __forceinline__ void write_swa(const Prologue& a, int tok, int col, f
   float r = y;
   if (col >= KVW - ROPE) {
     const int local = col - (KVW - ROPE);
-    const float2 cs = rope_cs(a.cos_sin + pos * ROPE, local / 2);
+    const float2 cs = rope_cs_freq(a.cos_sin, pos, local / 2);
     r = local % 2 ? rot_add(r, partner, cs) : rot_sub(r, partner, cs);
   }
   if (pos < 0) r = 0.0f;
@@ -1940,7 +1947,7 @@ __device__ __forceinline__ void store_q(const Prologue& a, int tile, int tok, fl
   const long pos = __ldg(a.positions + tok);
   v0 = bf(v0), v1 = bf(v1);
   if (d >= HDIM - ROPE) {
-    const float2 cs = rope_cs(a.cos_sin + pos * ROPE, (d - (HDIM - ROPE)) / 2);
+    const float2 cs = rope_cs_freq(a.cos_sin, pos, (d - (HDIM - ROPE)) / 2);
     const float e = rot_sub(v0, v1, cs), o = rot_add(v1, v0, cs);
     v0 = e, v1 = o;
   }
@@ -2410,7 +2417,8 @@ void prologue(int64_t handle, torch::Tensor y, torch::Tensor resid, torch::Tenso
   TORCH_CHECK(m >= 1 && m <= MAXM && resid.dim() == 3 && resid.size(1) == HC && resid.size(2) == HID && y.size(0) == m && y.size(-1) == HID);
   TORCH_CHECK(fn.size(0) == MIX && fn.size(1) == HCD && resid_out.sizes() == resid.sizes() && input_out.size(0) == m && input_out.size(1) == HID);
   TORCH_CHECK(wqa.size(0) == QKV && wqa.size(1) == HID && wqb.size(0) == WQB_ROWS && wqb.size(1) == QR && positions.scalar_type() == at::kLong);
-  TORCH_CHECK(cos_sin.scalar_type() == at::kFloat && cos_sin.size(-1) == ROPE && qr.size(1) == QR && kv.size(1) == KVW && q.numel() == long(m) * WQB_ROWS);
+  // Flare port: cos_sin carries Flare's 32 rotary frequencies, not a [positions, 64] table.
+  TORCH_CHECK(cos_sin.scalar_type() == at::kFloat && cos_sin.numel() == ROPE / 2 && qr.size(1) == QR && kv.size(1) == KVW && q.numel() == long(m) * WQB_ROWS);
   TORCH_CHECK(qr_s.numel() >= long(act_scale(QR / 32 - 1, m - 1, m)) + 1);
   const c10::cuda::CUDAGuard guard(resid.device());
   Prologue a{};

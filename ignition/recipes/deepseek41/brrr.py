@@ -265,15 +265,39 @@ def engine():
 def brrr_layer_tail(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
                     resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
                     y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,
-                    pre1: torch.Tensor) -> None:
+                    pre1: torch.Tensor, attn_scale: torch.Tensor | None = None,
+                    attn_base: torch.Tensor | None = None) -> None:
+    # attn_scale/attn_base: the layer's prologue ran in BRRR, so the tail finishes the attention mHC mix.
     extension().run(handle, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre,
-                    None, None, y, resid1, post1, comb1, pre1)
+                    attn_scale, attn_base, y, resid1, post1, comb1, pre1)
 
 
 @brrr_layer_tail.register_fake
 def _fake_brrr_layer_tail(handle, slot, o, positions, frequencies, resid0, attn_post, attn_comb, attn_pre,
-                          y, resid1, post1, comb1, pre1):
+                          y, resid1, post1, comb1, pre1, attn_scale=None, attn_base=None):
     pass
+
+
+@torch.library.custom_op("flare::brrr_prologue", mutates_args=("resid_out", "input_out", "qr", "kv", "qr_q", "qr_s", "q"))
+def brrr_prologue(handle: int, y: torch.Tensor, resid: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+                  pre: torch.Tensor, fn: torch.Tensor, norm: torch.Tensor, wqa: torch.Tensor, wqa_s: torch.Tensor,
+                  q_norm: torch.Tensor, kv_norm: torch.Tensor, eps: float, wqb: torch.Tensor, wqb_s: torch.Tensor,
+                  positions: torch.Tensor, frequencies: torch.Tensor, resid_out: torch.Tensor, input_out: torch.Tensor,
+                  qr: torch.Tensor, kv: torch.Tensor, qr_q: torch.Tensor, qr_s: torch.Tensor, q: torch.Tensor) -> None:
+    extension().prologue(handle, y, resid, post, comb, pre, fn, norm, wqa, wqa_s, q_norm, kv_norm, eps, wqb, wqb_s,
+                         positions, frequencies, resid_out, input_out, qr, kv, qr_q, qr_s, q, None, 0, None)
+
+
+@brrr_prologue.register_fake
+def _fake_brrr_prologue(handle, y, resid, post, comb, pre, fn, norm, wqa, wqa_s, q_norm, kv_norm, eps, wqb, wqb_s,
+                        positions, frequencies, resid_out, input_out, qr, kv, qr_q, qr_s, q):
+    pass
+
+
+def _skinny_scales(scales_u8, rows, cols):
+    """BRRR skinny GEMM scale layout from 32x32-block UE8M0 scales [rows/32, cols/32] (brrr/skinny.py prepare())."""
+    s = scales_u8.repeat_interleave(32, dim=0)[:rows]
+    return s.reshape(rows // 8, 4, 2, cols // 64, 2).permute(0, 3, 1, 4, 2).contiguous()
 
 
 class PreparedBRRRTail:
@@ -291,8 +315,46 @@ class PreparedBRRRTail:
         if positions.dtype != torch.int64:
             raise ValueError("BRRR tail expects int64 positions")
 
-    def __call__(self, attended):
+    def __call__(self, attended, mix=None):
         s = self.scratch
         brrr_layer_tail(self.handle, self.slot, attended, self.positions, self.frequencies,
                         s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb, s.attn_mix,
-                        s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix)
+                        s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix,
+                        *(mix if mix is not None else (None, None)))
+
+
+class PreparedBRRRPrologue:
+    """Attention prologue through BRRR's kernel (decode/verify graphs of <= 8 rows): mHC pre from the carried
+    state, attn_norm, fused q/kv down-projection, q/kv norms, q up-projection with RoPE. Writes Flare's
+    s.attention_hc.residual/.normalized, s.query and s.window_values (kv before RoPE; Flare rotates and caches it).
+    The tail then finishes the attention mix (hc_attn_scale/base)."""
+
+    def __init__(self, index, weights, scratch, positions, frequencies, eps, buffers):
+        e = engine()
+        ext = e.ext
+        self.handle, self.scratch, self.positions, self.frequencies, self.eps = int(e.handle), scratch, positions, frequencies, float(eps)
+        r, p, a, res = e.rank, f"layers.{index}", weights.attention, weights.residual
+        self.wqa = _rows2d(a["qkv_a"])
+        self.wqb = _rows2d(a["q_b"])
+        qa = torch.cat((e.raw_u8(f"{p}.attn.wq_a.scale"), e.raw_u8(f"{p}.attn.wkv.scale")))
+        self.wqa_s = _skinny_scales(qa, self.wqa.shape[0], self.wqa.shape[1])
+        rows = self.wqb.shape[0]
+        self.wqb_s = _skinny_scales(e.raw_padded(f"{p}.attn.wq_b.scale", _shard(r, rows // 32)), rows, self.wqb.shape[1])
+        self.q_norm, self.kv_norm = a["q_norm"].contiguous(), a["kv_norm"].contiguous()
+        self.fn = res["hc_attn_fn"].float().contiguous()
+        self.norm = res["attn_norm.weight"].contiguous()
+        self.mix = (res["hc_attn_scale"].float().contiguous(), res["hc_attn_base"].float().contiguous())
+        m = scratch.residual.shape[0]
+        self.qr = buffers.zeros((m, 1280), torch.bfloat16)
+        self.qr_q = buffers.zeros((m, 1280), torch.uint8)
+        self.qr_s = buffers.zeros((int(ext.act_scale_bytes(m)),), torch.uint8)
+        e.keep.append((self.wqa_s, self.wqb_s, self.fn, self.mix))
+        if os.environ.get("FLARE_DS41_BRRR_LOG") == "1":
+            print(f"[brrr] rank {r} layer {index} prologue: wqa {tuple(self.wqa.shape)} wqb {tuple(self.wqb.shape)} rows {m}", flush=True)
+
+    def __call__(self):
+        s = self.scratch
+        brrr_prologue(self.handle, s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix,
+                      self.fn, self.norm, self.wqa, self.wqa_s, self.q_norm, self.kv_norm, self.eps, self.wqb, self.wqb_s,
+                      self.positions, self.frequencies, s.attention_hc.residual, s.attention_hc.normalized,
+                      self.qr, s.attention.window_values, self.qr_q, self.qr_s, s.attention.query.view(s.residual.shape[0], -1))

@@ -403,6 +403,13 @@ class PreparedAttention:
         if self.owns_window_metadata:
             self.window_metadata()
         position = self.window_metadata.position
+        if getattr(self, "external_prologue", False):
+            # TP3 BRRR experiment: the fused prologue already wrote s.query (with RoPE) and s.window_values (normalized,
+            # before RoPE); rotate and cache the window values, then attend.
+            self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
+            self.window_writer(s.window_values)
+            self.attention()
+            return s.attended
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         self.projections["qkv_a"](source)
