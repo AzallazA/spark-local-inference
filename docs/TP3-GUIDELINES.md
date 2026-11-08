@@ -331,7 +331,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
 4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
    three times. Use `ps -eo pid,args | awk '$2=="./flare/target/release/flare" && $3=="run"'`, or kill by PID.
-5. **`chmod +x` new scripts**; run chains as tracked background jobs. **Always `/usr/bin/env`, never bare `env`:** uv
+5. **`chmod +x` new scripts, including ones generated with `sed ... > new.sh` or a heredoc**, and check the exit code of a
+   detached launch (a `Permission denied` exit 126 leaves no log and no process). Run chains as tracked background jobs. **Always `/usr/bin/env`, never bare `env`:** uv
    puts its own `env` shim first on PATH and a command run through it exits 0 having done nothing (the release
    scripts already say so; the 11-08 bisect chain lost a run to it anyway). *Incident:* a confirmation chain "ran" three
    times with an empty log (exit 126) and the launch method was misdiagnosed first.
