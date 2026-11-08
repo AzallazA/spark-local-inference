@@ -202,9 +202,11 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 1. Validate the state (B.1/B.2), commit on `ds41-tp3-v3`, push to Gitea.
 2. Tag it `flare-tp3-YYYYMMDD` (annotated: settings and measurements in the message), push branch and tag to `public`,
    and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
-3. Regenerate the recipes folder's `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify it on a
-   clean upstream worktree (tree-identical), update the folder docs to cite the tag, run the hygiene grep, commit, push
-   `origin` (GitHub) and `gitea`. The folder and the tag must always agree.
+3. The recipes folder is dated by the day the change was made (user rule, 2026-11-08): a new
+   `DeepSeek-V4.1-Flash Flare-tp3-YYYYMMDD` folder per release day, copied from the previous one and edited; earlier
+   folders stay as published. Regenerate its `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify
+   on a clean upstream worktree (tree-identical), cite the tag in the folder docs, add the row to the top-level
+   README, run the hygiene grep, commit, push `origin` (GitHub) and `gitea`. The folder and the tag must always agree.
 
 ### B.6 Sync from upstream (deliberate, never automatic)
 
