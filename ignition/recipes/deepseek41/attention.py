@@ -7,7 +7,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-import os
 import torch
 from b12x.quantization import mla_norm_mxfp8, mxfp8
 import triton
@@ -32,6 +31,7 @@ from ignition.components.rotary import CompressedRotary as Rotary
 from ignition.components.parallel import TensorParallelShard
 
 from .pool import PAGE_TOKENS
+from .tp3_config import TP3Config
 
 
 # Bound indexer workspace while amortizing prefill selection launches.
@@ -251,7 +251,8 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", buffers=None, window_metadata=None):
+                 mla_compute_mode="auto", buffers=None, window_metadata=None, tp3=None):
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches (fused_qkv_norm, brrr_sparse, brrr_log)
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -318,15 +319,12 @@ class PreparedAttention:
                                 else None),
                 encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
                 rhs_prefetch_ready=packed_mxfp8,
-                # FLARE_DS41_QB_ATOMIC=1 (speed probe only): q_b split-K partials reduced with BF16 atomics instead
-                # of a separate FP32 reduce kernel; upstream keeps MXFP8 projections FP32-reduced for precision.
-                allow_bf16_atomic_reduction=(not packed_mxfp8) or (key == "q_b" and os.environ.get("FLARE_DS41_QB_ATOMIC") == "1"),
+                allow_bf16_atomic_reduction=not packed_mxfp8,
                 buffers=buffers)
         self.fused_qkv_norm = None
-        from ignition.recipes.deepseek41.fused_qkv_norm import fused_qkv_norm_enabled
-        if self.norm_quant is not None and fused_qkv_norm_enabled():
+        if self.norm_quant is not None and tp3.fused_qkv_norm:
             from ignition.recipes.deepseek41.fused_qkv_norm import PreparedFusedQKVNorm
-            self.fused_qkv_norm = PreparedFusedQKVNorm(self.norm_quant, self.eps)
+            self.fused_qkv_norm = PreparedFusedQKVNorm(self.norm_quant, self.eps, log=tp3.brrr_log)
         self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
             eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
         self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
@@ -387,10 +385,9 @@ class PreparedAttention:
             decode_row_capacity=tokens if mode in ("decode", "verify", "draft") else None,
             session=session, name=f"{name}.attention",
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
-        # TP3 BRRR: one-launch sparse decode for main-layer decode/verify graphs (FLARE_DS41_BRRR_SPARSE=1).
+        # TP3 BRRR: one-launch sparse decode for main-layer decode/verify graphs (tp3.brrr_sparse).
         self.brrr_sparse = None
-        from ignition.recipes.deepseek41.brrr import brrr_sparse_enabled
-        if mode in ("decode", "verify") and brrr_sparse_enabled():
+        if mode in ("decode", "verify") and tp3.brrr_sparse:
             from ignition.recipes.deepseek41.brrr import PreparedBRRRSparse, sparse_supported
             idx_width = scratch.selected.shape[1] if self.ratio else 0
             if sparse_supported(tokens, self.window_indices.shape[1], idx_width, scratch.query.shape[1],
@@ -424,13 +421,6 @@ class PreparedAttention:
         if self.owns_window_metadata:
             self.window_metadata()
         position = self.window_metadata.position
-        if getattr(self, "external_prologue", False):
-            # TP3 BRRR experiment: the fused prologue already wrote s.query (with RoPE) and s.window_values (normalized,
-            # before RoPE); rotate and cache the window values, then attend.
-            self.rotary.apply(s.window_values, position, compressed=bool(self.ratio))
-            self.window_writer(s.window_values)
-            self.attention()
-            return s.attended
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
         if self.fused_qkv_norm is not None:

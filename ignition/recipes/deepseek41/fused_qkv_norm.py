@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP3: qkv_a's 4-way split-K reduction fused into the MLA norm + MXFP8 encode (FLARE_DS41_FUSED_QKV_NORM=1).
+"""TP3: qkv_a's 4-way split-K reduction fused into the MLA norm + MXFP8 encode (TP3Config.fused_qkv_norm).
 
 MEASURED 2026-11-07: bit-identical output, no speed gain (alternating A/B level with the stock kernels) -> NOT adopted;
 kept opt-in for reference. Not part of any published build.
@@ -11,16 +11,10 @@ bit-identical outputs, one launch and one round trip fewer per layer. Graph widt
 split-K keep the stock norm kernel.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 from b12x.gemm.blockscaled._quantize import _scale_offset
-
-
-def fused_qkv_norm_enabled() -> bool:
-    return os.environ.get("FLARE_DS41_FUSED_QKV_NORM", "0") == "1"
 
 
 @triton.jit
@@ -77,7 +71,7 @@ _SEEN = set()
 
 
 def _log(kind, rows):
-    if os.environ.get("FLARE_DS41_BRRR_LOG") == "1" and (kind, rows) not in _SEEN:
+    if (kind, rows) not in _SEEN:
         _SEEN.add((kind, rows))
         print(f"[fused_qkv_norm] {kind} norm at {rows} rows", flush=True)
 
@@ -100,7 +94,7 @@ def _fake_fused_qkv_norm_arm(projected):
                          mutates_args=("query", "kv", "values_base", "scale_rows_base", "scale_mma_base"))
 def fused_qkv_norm(projected: torch.Tensor, qw: torch.Tensor, kw: torch.Tensor, query: torch.Tensor, kv: torch.Tensor,
                    values_base: torch.Tensor, scale_rows_base: torch.Tensor, scale_mma_base: torch.Tensor,
-                   norm_handle: int, eps: float) -> None:
+                   norm_handle: int, eps: float, log: bool) -> None:
     from b12x._lib.dense_gemm.preparation import DEFERRED_SPLIT_K
 
     deferred = DEFERRED_SPLIT_K.pop(projected.data_ptr(), None)  # disarm: the key dies with this consumer
@@ -109,15 +103,17 @@ def fused_qkv_norm(projected: torch.Tensor, qw: torch.Tensor, kw: torch.Tensor, 
         if m != projected.shape[0] or n != projected.shape[1]:
             raise ValueError("deferred qkv_a partials do not match the projected rows")
         launch_split4(partials, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base, eps=eps)
-        _log("fused", m)
+        if log:
+            _log("fused", m)
     else:
-        _log("stock", projected.shape[0])
+        if log:
+            _log("stock", projected.shape[0])
         torch.ops.b12x.mla_norm_mxfp8_prepared(projected, qw, kw, query, kv, values_base, scale_rows_base,
                                                scale_mma_base, norm_handle)
 
 
 @fused_qkv_norm.register_fake
-def _fake_fused_qkv_norm(projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base, norm_handle, eps):
+def _fake_fused_qkv_norm(projected, qw, kw, query, kv, values_base, scale_rows_base, scale_mma_base, norm_handle, eps, log):
     pass
 
 
@@ -125,13 +121,14 @@ class PreparedFusedQKVNorm:
     """Replaces norm_quant(s.projected) after qkv_a: `arm()` goes right before the qkv_a projection, `__call__` right
     where the stock norm ran. Both are custom ops, so the arm/consume window is baked into each graph."""
 
-    def __init__(self, norm_quant, eps):
-        self.norm_quant, self.eps = norm_quant, eps
+    def __init__(self, norm_quant, eps, *, log=False):
+        """``log`` (TP3Config.brrr_log) prints which norm each graph width selected."""
+        self.norm_quant, self.eps, self.log = norm_quant, eps, bool(log)
 
     def arm(self, projected):
         fused_qkv_norm_arm(projected)
 
     def __call__(self, projected):
         nq = self.norm_quant
-        fused_qkv_norm(projected, *nq.weights, nq.query, nq.kv, *nq.encoded_bases, nq.plan.handle, self.eps)
+        fused_qkv_norm(projected, *nq.weights, nq.query, nq.kv, *nq.encoded_bases, nq.plan.handle, self.eps, self.log)
         return nq.query, nq.kv

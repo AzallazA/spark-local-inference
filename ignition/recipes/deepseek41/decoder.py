@@ -6,12 +6,11 @@
 
 from dataclasses import dataclass, fields, is_dataclass, replace
 
-import os
-
 import torch
 
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
-from . import probe as _probe
+from .probe import Probe
+from .tp3_config import TP3Config
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.ring_commit import PreparedRingCommit
@@ -28,21 +27,18 @@ from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 
 
-# Debug A/B (flare#193): FLARE_DS41_NO_ENGRAM=1 skips the Engram contribution in every captured forward.
-_NO_ENGRAM = os.environ.get("FLARE_DS41_NO_ENGRAM", "") not in ("", "0")
-
-# TP3 BRRR: each rank decides per layer and graph whether the fused tail (and prologue) runs, from its own environment
-# (FLARE_DS41_BRRR_LAYERS, FLARE_DS41_BRRR_PARKED_MAX_ROWS, FLARE_DS41_HOST_EXPERT_LAYERS, FLARE_DS41_HOT_EXPERTS, ...)
-# and the graph's row count. The kernel's in-kernel all-reduce needs every rank to make the same decision: a rank that
-# runs Flare's path while a peer waits in the kernel deadlocks. PreparedLayer records its decisions here and the bootstrap
-# compares them across ranks (check_brrr_decisions) in plain construction code, before any capture.
+# TP3 BRRR: each rank decides per layer and graph whether the fused tail runs, from its own TP3Config (brrr_layers,
+# brrr_parked_max_rows, host_expert_layers, hot_experts, ...) and the graph's row count. The kernel's in-kernel
+# all-reduce needs every rank to make the same decision: a rank that runs Flare's path while a peer waits in the kernel
+# deadlocks. PreparedLayer records its decisions here and the bootstrap compares them across ranks
+# (check_brrr_decisions) in plain construction code, before any capture.
 _BRRR_DECISIONS = []
 _BRRR_CHECKED = 0
-_BRRR_DECISION_FIELDS = ("graph", "layer", "mode", "rows", "brrr", "prologue", "gated")
+_BRRR_DECISION_FIELDS = ("graph", "layer", "mode", "rows", "brrr", "gated")
 
 
-def record_brrr_decision(name, index, mode, rows, uses_brrr, uses_prologue=False, gated=False):
-    _BRRR_DECISIONS.append((str(name), int(index), str(mode), int(rows), bool(uses_brrr), bool(uses_prologue), bool(gated)))
+def record_brrr_decision(name, index, mode, rows, uses_brrr, gated=False):
+    _BRRR_DECISIONS.append((str(name), int(index), str(mode), int(rows), bool(uses_brrr), bool(gated)))
 
 
 def check_brrr_decisions(group):
@@ -75,8 +71,8 @@ def check_brrr_decisions(group):
             detail = (f"rank 0 decided {dict(zip(_BRRR_DECISION_FIELDS, root[at]))}, "
                       f"rank {rank} decided {dict(zip(_BRRR_DECISION_FIELDS, other[at]))}")
         raise RuntimeError("BRRR layer decisions differ between ranks (the fused kernel's all-reduce would deadlock): "
-                           f"{detail}. Every rank must see the same FLARE_DS41_BRRR_* and FLARE_DS41_HOST_EXPERT_LAYERS/"
-                           "FLARE_DS41_HOT_EXPERTS/FLARE_DS41_GLOBAL_COLD environment and graph catalog.")
+                           f"{detail}. Every rank must receive the same TP3Config (brrr_*, host_expert_layers, "
+                           "hot_experts, global_cold) and graph catalog.")
     return len(pending)
 
 @dataclass(frozen=True)
@@ -197,12 +193,15 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto", buffers=None,
-                 window_metadata=None):
+                 window_metadata=None, tp3=None, probe=None):
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches; the decoder shares one instance per graph
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
+        self.probe = Probe(tp3.probe) if probe is None else probe
         self.probe_index, self.probe_mode = index, mode
-        if _probe.ENABLED:
-            _probe._state(scratch.residual.device)  # allocate eagerly, outside traced forwards
+        self.probe.allocate(scratch.residual.device)  # allocate eagerly, outside traced forwards (no-op unless enabled)
+        # Debug A/B (flare#193): tp3.no_engram keeps the Engram handshake but discards its contribution.
+        self.no_engram = tp3.no_engram
         self.metadata = metadata
         buffers = scratch.buffers if buffers is None else buffers
         self.image_mask = (buffers.zeros(metadata.token_ids.shape, torch.bool)
@@ -225,8 +224,8 @@ class PreparedLayer:
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode, buffers=buffers,
-            window_metadata=window_metadata)
-        # Chunked: a decode-sized runtime (FLARE_DS41_AR_ROWS) still reduces prefill rows; one part in decode.
+            window_metadata=window_metadata, tp3=tp3)
+        # Chunked: a decode-sized runtime (tp3.ar_rows) still reduces prefill rows; one part in decode.
         self.attention_reduce = PreparedChunkedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
@@ -277,41 +276,28 @@ class PreparedLayer:
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
         self.brrr = None
-        self.brrr_prologue = None
-        from ignition.recipes.deepseek41.brrr import brrr_layers
-        # FLARE_DS41_BRRR_PARKED_MAX_ROWS=N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
+        # tp3.brrr_parked_max_rows = N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
         # verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300, BRRR-26 level).
         from ignition.recipes.deepseek41.weights import host_expert_layers
-        parked_rows = int(os.environ.get("FLARE_DS41_BRRR_PARKED_MAX_ROWS", "0") or 0)
+        parked_rows = tp3.brrr_parked_max_rows
         rows = metadata.positions.numel()
         # A layer counts as parked only if it actually has a host tail (HOT >= 384 loads it fully resident, no hot_map).
-        parked = index in host_expert_layers() and self.hot_map is not None
+        parked = index in host_expert_layers(tp3) and self.hot_map is not None
         gated = bool(parked_rows) and parked and rows > parked_rows
-        if index in brrr_layers() and mode in ("decode", "verify") and not gated:
+        if index in tp3.brrr_layers and mode in ("decode", "verify") and not gated:
             # TP3 BRRR experiment: one fused kernel from the attention output to the MLP all-reduce.
             if self.cold_experts is not None or self.image_mask is not None:
                 raise ValueError(f"BRRR layer {index} needs one expert bank (resident or merged hot/cold)")
             from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
             self.attention.external_tail = True
             self.brrr = PreparedBRRRTail(index, weights, s, self.attention.window_metadata.position,
-                                         rotary.frequencies[bool(self.attention.ratio)], config=pool.config)
-            # FLARE_DS41_BRRR_PROLOGUE=1: fused attention prologue too, on plain layers of graphs with <= 8 rows (BRRR's
-            # PROLOGUE_MAXM). Excluded: no carried state (post materialized), Engram, indexer/KV sources (they reuse
-            # Flare-format quantized q-low / normalized input), the layer that owns window metadata.
-            att = self.attention
-            if (os.environ.get("FLARE_DS41_BRRR_PROLOGUE") == "1" and carry and boundary is None and self.engram is None
-                    and s.residual.shape[0] <= 8 and not att.owns_window_metadata and att.global_kv is None and not att.selectors
-                    and att.concurrent_query is None):
-                from ignition.recipes.deepseek41.brrr import PreparedBRRRPrologue
-                self.brrr_prologue = PreparedBRRRPrologue(index, weights, s, att.window_metadata.position,
-                                                          rotary.frequencies[bool(att.ratio)], text["rms_norm_eps"], buffers)
-                att.external_prologue = True
-        if brrr_layers():
-            record_brrr_decision(name, index, mode, rows, self.brrr is not None, self.brrr_prologue is not None, gated)
+                                         rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
+        if tp3.brrr_layers:
+            record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
 
     def __call__(self):
-        s = self.scratch
-        if self.engram is not None and _NO_ENGRAM:
+        s, probe = self.scratch, self.probe
+        if self.engram is not None and self.no_engram:
             # Debug A/B (flare#193): keep the Engram handshake (readiness wait, lookup, timestamps) but
             # discard its contribution, so only Engram's effect on the residual is removed.
             source = self.engram(s.residual)
@@ -322,14 +308,7 @@ class PreparedLayer:
             source = s.residual
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
-        _probe.record(source, self.probe_index, 0, self.probe_mode)
-        if self.brrr_prologue is not None:
-            # The fused prologue replaces the attention mHC (post_pre + attn_norm) and the q/kv projections.
-            self.brrr_prologue()
-            self.brrr(self.attention(s.attention_hc.normalized), mix=self.brrr_prologue.mix)
-            if self.post is not None:
-                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
-            return
+        probe.record(source, self.probe_index, 0, self.probe_mode)
         if self.boundary is None:
             self.attention_hc(*incoming)
         else:
@@ -340,15 +319,15 @@ class PreparedLayer:
                 self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
             return
         self.attention_reduce(self.attention(s.attention_hc.normalized))
-        _probe.record(s.attention_output, self.probe_index, 1, self.probe_mode)
+        probe.record(s.attention_output, self.probe_index, 1, self.probe_mode)
         self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(s.ffn_hc.normalized)
         if self.image_mask is not None:
             self.image_mask.copy_(self.metadata.token_ids >= 129280)
         self.router(self.router_projection(s.ffn_hc.normalized))
-        _probe.router(s.router.ids, s.router.weights, self.probe_index, self.probe_mode)
-        _probe.full(s.ffn_hc.normalized, self.probe_index, "in", self.probe_mode)
+        probe.router(s.router.ids, s.router.weights, self.probe_index, self.probe_mode)
+        probe.full(s.ffn_hc.normalized, self.probe_index, "in", self.probe_mode)
         if self.cold_experts is not None:
             flat = s.router.ids.reshape(-1)
             torch.index_select(self.hot_map, 0, flat, out=self.hot_ids.view(-1))
@@ -359,17 +338,17 @@ class PreparedLayer:
         if self.cold_experts is not None:
             self.cold_experts()
             s.routed.add_(self.cold_routed)
-        _probe.full(s.routed, self.probe_index, "out", self.probe_mode)
+        probe.full(s.routed, self.probe_index, "out", self.probe_mode)
         if self.concurrent_shared is None:
             self.shared(s.ffn_hc.normalized)
         else:
             self.concurrent_shared.finish(s.ffn_hc.normalized, s.routed)
-        _probe.record(s.routed, self.probe_index, 3, self.probe_mode)
-        _probe.record(s.shared.output, self.probe_index, 4, self.probe_mode)
+        probe.record(s.routed, self.probe_index, 3, self.probe_mode)
+        probe.record(s.shared.output, self.probe_index, 4, self.probe_mode)
         torch.add(s.routed, s.shared.output, out=s.mlp_partial)
-        _probe.record(s.mlp_partial, self.probe_index, 5, self.probe_mode)
+        probe.record(s.mlp_partial, self.probe_index, 5, self.probe_mode)
         self.mlp_reduce(s.mlp_partial)
-        _probe.record(s.mlp_output, self.probe_index, 2, self.probe_mode)
+        probe.record(s.mlp_output, self.probe_index, 2, self.probe_mode)
         if self.post is not None:
             self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
 
@@ -377,9 +356,12 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False):
+                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False,
+                 tp3=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
+        self.probe = Probe(tp3.probe)
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
@@ -450,7 +432,8 @@ class PreparedDecoder:
                 carry=carry, defer_post=defer, boundary=boundary, replay_start=replay_start,
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode, buffers=layer_buffers,
-                window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata)))
+                window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
+                tp3=tp3, probe=self.probe))
             carry = defer
         buffers.join(*layer_cursors)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
@@ -479,8 +462,8 @@ class PreparedDecoder:
 
     def __call__(self):
         s, m = self.scratch, self.metadata
-        _probe.step(s.residual.device, self.mode)
-        _probe.positions(m.positions, self.mode)
+        self.probe.step(s.residual.device, self.mode)
+        self.probe.positions(m.positions, self.mode)
         self.table_requests()
         if self.vision is not None:
             self.safe_tokens.copy_(m.token_ids.clamp(0, self.weights.embedding.shape[0] - 1))

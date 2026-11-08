@@ -4,7 +4,7 @@
 
 """Stage host-parked weight sets through VRAM slots inside captured graphs.
 
-A vision tower parked in device-visible host memory (``FLARE_DS41_VISION_HOST``) is correct but
+A vision tower parked in device-visible host memory (``TP3Config.vision_host``) is correct but
 slow: every GEMM re-reads its weight tile per row block over PCIe. Copying each block's weights
 into a VRAM slot once per image restores resident speed while only the slots stay in VRAM. The
 copies run on the arena's auxiliary stream, forked after the main stream's enqueued work (the

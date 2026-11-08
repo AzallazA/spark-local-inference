@@ -13,6 +13,7 @@ from b12x.sequence._shared.disk_table import _tensor_from_pointer
 from ignition.components.moe import PreparedRoutedExperts
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.recipes.deepseek41.tp3_config import TP3Config
 from ignition.recipes.deepseek41.weights import DeepSeekWeightLoader
 
 snap, L = sys.argv[1], int(sys.argv[2])
@@ -20,7 +21,7 @@ H = int(sys.argv[3]) if len(sys.argv) > 3 else 326
 dev = torch.device("cuda", 0); torch.cuda.set_device(dev)
 shard = TensorParallelShard(0, 3)
 ffn = f"layers.{L}.ffn"
-counts_dir = "~/ds41-tp3/release/ds41-kraken-tp3-20261019/expert-order-blend"
+counts_dir = os.path.expanduser("~/ds41-tp3/release/ds41-kraken-tp3-20261019/expert-order-blend")  # site-specific
 raw = json.load(open(f"{counts_dir}/expert-routes-rank0-layer{L}.json"))
 counts = raw.get("counts", raw) if isinstance(raw, dict) else raw
 if isinstance(counts, dict):
@@ -49,14 +50,15 @@ def host_alloc(name, shape, dtype):
 
 
 with torch.no_grad(), DeepSeekWeightLoader(inspect_indexed_checkpoint(snap), dev, shard=shard,
-                                           expert_scale_compression="csf", prefixes=(f"{ffn}.experts.",)) as loader:
+                                           expert_scale_compression="csf", prefixes=(f"{ffn}.experts.",),
+                                           tp3=TP3Config.from_environment()) as loader:
     text = loader.config.text
     E = text["n_routed_experts"]
     interval = shard.partition(text["moe_intermediate_size"], alignment=32)
     hot_bank = loader.load_experts([f"{ffn}.experts.{i}" for i in hot], interval)
     loader._host_allocator = host_alloc
     cold_bank = loader.load_experts([f"{ffn}.experts.{i}" for i in cold], interval, host=True)
-    sys.path.insert(0, "~/flare-tp3-tools")
+    sys.path.insert(0, os.path.expanduser("~/flare-tp3-tools"))
     import mixed_bank
     loader._host_allocator = mixed_bank.allocator(H, dev)
     merged_bank = loader.load_experts([f"{ffn}.experts.{i}" for i in hot + cold], interval, host=True)

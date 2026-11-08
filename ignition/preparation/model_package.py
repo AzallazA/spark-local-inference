@@ -70,9 +70,33 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
                 region.close()
         result = combine(None if cache_only else path, roots, peers,
                          publisher=publisher, form=form, cache_only=cache_only)
+        _write_sidecars(model, result, progress)
         print_inventory(inventories, console=console or getattr(progress, "console", None))
     finally:
         _OPTIONS.reset(token)
         with phase(progress, "Clear export staging"):
             native_stage.close()
     return result
+
+
+def _write_sidecars(model, result, progress):
+    """Write recipe-declared JSON documents (``model.package_sidecars``: name -> JSON value) into the package's cache
+    entry directory, next to its model.safetensors. The package index has no free-form field, so recipe records
+    such as the TP3 fork configuration travel as sidecars; Helios ignores them (the entry's primary is
+    model.safetensors). They must not land one level up: the model directory's entries are version names."""
+    import json
+
+    sidecars = getattr(model, "package_sidecars", None)
+    if not sidecars:
+        return
+    entry = getattr(result, "entry_path", None)  # the cache entry directory (export_combine); None without a cache
+    if not entry:
+        if progress is not None:
+            progress(f"no cache entry for this export; sidecars not written: {', '.join(sidecars)}")
+        return
+    directory = Path(entry)
+    for name, document in sidecars.items():
+        target = directory / name
+        target.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+        if progress is not None:
+            progress(f"wrote {target}")

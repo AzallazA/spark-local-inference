@@ -53,10 +53,10 @@ class Gpu:
 
 
 def _tp3_vocabulary_parallel() -> bool:
-    """ds41-tp3-v2: FLARE_DS41_TP3_VOCAB_PARALLEL=1 admits vocabulary-parallel sampling at TP3 (b12x gathers
-    enabled for world 3); experimental until validated end to end."""
-    import os
-    return os.environ.get("FLARE_DS41_TP3_VOCAB_PARALLEL", "") not in ("", "0")
+    """ds41-tp3-v2: TP3Config.tp3_vocab_parallel (FLARE_DS41_TP3_VOCAB_PARALLEL=1) admits vocabulary-parallel sampling
+    at TP3 (b12x gathers enabled for world 3); experimental until validated end to end."""
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
+    return TP3Config.vocab_parallel_from_environment()  # one variable, no validation: generic planner code
 
 
 def discover_gpus() -> tuple[Gpu, ...]:

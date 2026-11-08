@@ -19,8 +19,9 @@ routed experts, shared expert, all-reduce) and (b) the BRRR tail (one flare::brr
 s.mlp_output, s.ffn_hc.residual/post/comb and s.pre_mix (cosine > 0.999, stats printed). Rows sweep 1..48 across the
 kernel's WOA_SMALL=16 / XNORM_MIN=16 / TWO_SHOT_MIN=17 regimes; the "uniform" profile routes every row to the same
 six experts so one expert takes > 16 routes (two or three 16-route chunks). Each configuration runs in its own
-3-process world because DS41_FUSED_ATTN_PER_CHUNK is read once per process by the kernel. The rope negative control
-(FLARE_DS41_BRRR_BREAK=rope) must fail the comparison.
+3-process world because FLARE_DS41_FUSED_ATTN_PER_CHUNK is an engine-creation setting of the kernel. Each rank
+builds one TP3Config from its environment (TP3Config.from_environment) and passes it to the loader, the engine and
+the tails. The rope negative control (FLARE_DS41_BRRR_BREAK=rope) must fail the comparison.
 
 The stock path's two all-reduces are replaced by an exact FP32 Gloo all-reduce (rounded to BF16) so the reference is
 independent of b12x's PCIe runtime.
@@ -49,7 +50,6 @@ input runs through a freshly constructed PreparedBRRRTail (new scratch, position
 The rope negative control fails on the ffn_residual bound.
 """
 
-import inspect
 import json
 import os
 from datetime import timedelta
@@ -278,12 +278,14 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.deepseek41.attention import Rotary
-    from ignition.recipes.deepseek41.brrr import PreparedBRRRTail, brrr_layers, create_engine, extension
+    from ignition.recipes.deepseek41.brrr import PreparedBRRRTail, create_engine, extension
     from ignition.recipes.deepseek41.decoder import Scratch
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
     from ignition.recipes.deepseek41.weights import DeepSeekWeightLoader, host_expert_layers
 
-    assert layer in brrr_layers(), (layer, os.environ.get("FLARE_DS41_BRRR_LAYERS"))
-    parked = layer in host_expert_layers()
+    tp3 = TP3Config.from_environment()
+    assert layer in tp3.brrr_layers, (layer, os.environ.get("FLARE_DS41_BRRR_LAYERS"))
+    parked = layer in host_expert_layers(tp3)
     rows_sweep = _rows()
     capacity = max(rows_sweep)
     failures, reports = [], []
@@ -292,7 +294,7 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
             manifest = inspect_indexed_checkpoint(Path(snapshot))
             with DeepSeekWeightLoader(manifest, device, shard=TensorParallelShard(rank, WORLD), prefixes=(f"layers.{layer}.",),
                                       expert_scale_compression="csf",
-                                      host_allocator=storage.host_allocate if parked else None) as loader:
+                                      host_allocator=storage.host_allocate if parked else None, tp3=tp3) as loader:
                 weights, config = loader.load_layer(layer), loader.config
             torch.cuda.synchronize(device)
             if parked:
@@ -300,7 +302,7 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                 assert weights.experts.cold is None, "BRRR needs the merged bank (FLARE_DS41_MERGED_BANK=1), not hot+cold banks"
             else:
                 assert weights.experts.hot_map is None, "resident layer unexpectedly remapped"
-            engine = create_engine(group, device, storage.peer_storage)
+            engine = create_engine(group, device, storage.peer_storage, tp3)
             assert engine is not None
             ext = extension()
             assert ext.RANKS == WORLD and capacity <= ext.MAXM
@@ -311,7 +313,7 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                 ext.add_layer = lambda handle, **kwargs: add_layer(handle, route_counts=route_counts, **kwargs)
             else:
                 route_counts = None
-            tail_kwargs = {"config": config} if "config" in inspect.signature(PreparedBRRRTail.__init__).parameters else {}
+            tail_kwargs = {"config": config, "tp3": tp3}
             compressed = bool(config.text["compress_ratios"][layer])
             rotary = Rotary(config, device)
             frequencies = rotary.frequencies[compressed]
@@ -450,7 +452,6 @@ def _base_env(snapshot, layer):
         "FLARE_DS41_MINI": "1" if text["num_hidden_layers"] != 40 else None,
         "FLARE_DS41_BRRR_LAYERS": str(layer),
         "FLARE_DS41_BRRR_CKPT": snapshot,
-        "FLARE_DS41_BRRR_PROLOGUE": None,
         "FLARE_DS41_BRRR_BREAK": None,
         "FLARE_DS41_GLOBAL_COLD": None,
         "FLARE_DS41_HOST_EXPERT_LAYERS": None,
@@ -489,7 +490,7 @@ def test_brrr_tail_matches_flare_layer_path(tmp_path, case):
     layer = int(os.environ.get("FLARE_DS41_BRRR_TEST_PARKED_LAYER" if options["parked"] else "FLARE_DS41_BRRR_TEST_LAYER",
                                "3" if options["parked"] else "2"))
     env = _base_env(snapshot, layer)
-    env["DS41_FUSED_ATTN_PER_CHUNK"] = options["per_chunk"]
+    env["FLARE_DS41_FUSED_ATTN_PER_CHUNK"] = options["per_chunk"]
     if options["parked"]:
         env.update(_parked_env(tmp_path, layer))
     if options["broken"]:

@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """TP3 experiment: BRRR's fused DS41 layer kernel (o-projection through MLP all-reduce) inside Flare forwards.
 
-FLARE_DS41_BRRR_LAYERS selects layers (same syntax as FLARE_DS41_HOST_EXPERT_LAYERS). For those layers the decode and
-verify forwards replace inverse RoPE, the grouped o-projection, the attention all-reduce, the FFN mHC, the router,
-routed and shared experts and the MLP all-reduce with one kernel launch. Prefill keeps Flare's path.
+``TP3Config.brrr_layers`` selects layers. For those layers the decode and verify forwards replace inverse RoPE, the
+grouped o-projection, the attention all-reduce, the FFN mHC, the router, routed and shared experts and the MLP
+all-reduce with one kernel launch. Prefill keeps Flare's path.
 
 The kernel (brrr/kernels/decoder.cu, Apache-2.0, fraserprice/DeepSeek-4.1-Flash-1017-BRRR, TP3 port) reads:
 - routed experts from b12x's prepared W4A8 planes, scales decoded in-kernel from b12x's CSF payload
-  (FLARE_DS41_BRRR_NATIVE_SCALES=1 loads these layers without CSF instead),
-- dense weights as its own staged copies read from the checkpoint (FLARE_DS41_BRRR_CKPT),
+  (``brrr_native_scales`` loads these layers without CSF instead),
+- dense weights as Flare's own row-major values (``brrr_dense_native``, default) or as its own staged copies read
+  from the checkpoint view ``brrr_ckpt``; block scales always come from that view,
 - peer flags/inboxes in Flare PeerStorage, so export resets them (and the epoch kept in the flag page) to zero.
+
+Every switch arrives through the ``TP3Config`` the engine and the prepared tails hold; nothing here reads the
+environment (``TORCH_EXTENSIONS_DIR`` is set for the extension build only).
 """
 
 import ctypes as C
@@ -22,16 +26,9 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from .tp3_config import TP3Config
+
 _ROOT = Path(__file__).resolve().parents[3]
-
-
-def brrr_layers() -> frozenset:
-    spec = os.environ.get("FLARE_DS41_BRRR_LAYERS", "").strip()
-    layers = set()
-    for part in filter(None, (p.strip() for p in spec.split(","))):
-        a, _, b = part.partition("-")
-        layers.update(range(int(a), int(b or a) + 1))
-    return frozenset(layers)
 
 
 @cache
@@ -110,11 +107,13 @@ class Checkpoint:
 
 
 class Engine:
-    """One per rank: the kernel's peer buffers, scratch and registered layers."""
+    """One per rank: the kernel's peer buffers, scratch and registered layers, configured by one TP3Config."""
 
-    def __init__(self, group, device, ipc):
+    def __init__(self, group, device, ipc, tp3: TP3Config):
+        if tp3.brrr_ckpt is None:
+            raise ValueError("TP3 config: BRRR needs brrr_ckpt (the checkpoint view it reads dense copies from)")
         self.ext = ext = extension()
-        self.group, self.device, self.ipc = group, device, ipc
+        self.group, self.device, self.ipc, self.tp3 = group, device, ipc, tp3
         self.rank, world = dist.get_rank(group=group), dist.get_world_size(group=group)
         if world != ext.RANKS:
             raise ValueError(f"BRRR kernel is built for {ext.RANKS} ranks, group has {world}")
@@ -126,9 +125,11 @@ class Engine:
         dist.all_gather_object(handles, ipc.cudaIpcGetMemHandleBytes(own), group=group)
         buffers = [own if r == self.rank else ipc.cudaIpcOpenMemHandleBytes(handles[r]) for r in range(world)]
         # The epoch counter sits in the unused tail of this rank's flag page (flags use 2*2*RANKS*CHUNKS words).
-        self.handle = ext.create(buffers, self.rank, epoch_addr=own + ext.flag_bytes() - 64)
+        # fused_attn_per_chunk is a per-engine kernel setting (every rank must agree: it shapes the flag protocol).
+        self.handle = ext.create(buffers, self.rank, epoch_addr=own + ext.flag_bytes() - 64,
+                                 attn_per_chunk_flags=int(tp3.fused_attn_per_chunk))
         dist.barrier(group=group)
-        self.checkpoint = Checkpoint(os.environ["FLARE_DS41_BRRR_CKPT"])
+        self.checkpoint = Checkpoint(tp3.brrr_ckpt)
         self.frequencies = None
         self.slots = {}
         self.keep = []
@@ -157,7 +158,7 @@ class Engine:
     def register(self, index, weights, config=None):
         if index in self.slots:
             return self.slots[index]
-        ext, r, p = self.ext, self.rank, f"layers.{index}"
+        ext, r, p, tp3 = self.ext, self.rank, f"layers.{index}", self.tp3
         if config is not None:
             check_constants(ext, config, weights)
         inter, oa = ext.INTER, ext.OA
@@ -169,7 +170,7 @@ class Engine:
         u8 = lambda t: t.contiguous().view(torch.uint8)
         rows = _shard(r, inter)
         gate_up = None
-        if os.environ.get("FLARE_DS41_BRRR_DENSE_NATIVE", "1") != "1" or os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+        if not tp3.brrr_dense_native or tp3.brrr_csf_check:
             gate_up = torch.cat((self.raw(f"{p}.ffn.shared_experts.w1.weight", rows),
                                  self.raw(f"{p}.ffn.shared_experts.w3.weight", rows)))
         blocks = _shard(r, inter // 32)
@@ -195,13 +196,13 @@ class Engine:
             # the arrival order; a merged bank without a known hot count also stays unordered (safe).
             hot_rows=ext.EXPERTS if weights.experts.hot_map is None or weights.experts.hot_rows is None
                      else int(weights.experts.hot_rows))
-        if os.environ.get("FLARE_DS41_BRRR_DENSE_NATIVE", "1") == "1":
+        if tp3.brrr_dense_native:
             # Read Flare's own row-major E4M3 dense values (same bytes as the checkpoint shards; block scales stay as
             # small checkpoint copies) instead of staged copies: ~35-40 MB per layer back to the KV pool.
             out, shared = weights.attention["output"], weights.experts.shared
             native = dict(woa=_rows2d(out.wo_a), wob=_rows2d(out.wo_b), gate=weights.experts.router,
                           sh13=_rows2d(shared.gate_up), sh2=_rows2d(shared.down))
-            if os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+            if tp3.brrr_csf_check:
                 ref = dict(woa=self.raw_padded(f"{p}.attn.wo_a.weight", _shard(r, oa)),
                            wob=self.raw_padded(f"{p}.attn.wo_b.weight", cols=_shard(r, oa)),
                            gate=self.raw_u8(f"{p}.ffn.gate.weight"), sh13=u8(gate_up),
@@ -225,7 +226,7 @@ class Engine:
             for tag, plane in (("csf13", decoder.first), ("csf2", decoder.second)):
                 a = _csf_args(plane.scales)
                 kwargs[f"{tag}_storage"], kwargs[f"{tag}_gdesc"], kwargs[f"{tag}_meta"] = a["storage"], a["gdesc"], a["meta"]
-            if os.environ.get("FLARE_DS41_BRRR_CSF_CHECK") == "1":
+            if tp3.brrr_csf_check:
                 decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
                 for tag, ref in (("csf13", rep.w13_sfb), ("csf2", rep.w2_sfb)):
                     want = ref.contiguous().view(torch.int32).reshape(-1)
@@ -239,7 +240,7 @@ class Engine:
                 raise RuntimeError(f"BRRR layer {index}: {name} is not b12x's resident plane")
         self.keep.append(kwargs)  # the kernel holds raw pointers to these tensors
         self.slots[index] = ext.add_layer(self.handle, **kwargs)
-        if os.environ.get("FLARE_DS41_BRRR_LOG") == "1":
+        if tp3.brrr_log:
             print(f"[brrr] rank {r} layer {index} -> slot {self.slots[index]} (w13 {tuple(rep.w13_rp.shape)}, "
                   f"sfb {tuple(rep.w13_sfb.shape)}, layout {rep.w13_layout})", flush=True)
         return self.slots[index]
@@ -277,11 +278,12 @@ def _csf_args(scales):
 _ENGINE = []
 
 
-def create_engine(group, device, ipc):
-    if not brrr_layers():
+def create_engine(group, device, ipc, tp3: TP3Config):
+    """Create the rank's engine once; None (no-op) unless ``tp3.brrr_layers`` selects layers."""
+    if not tp3.brrr_layers:
         return None
     if not _ENGINE:
-        _ENGINE.append(Engine(group, device, ipc))
+        _ENGINE.append(Engine(group, device, ipc, tp3))
     return _ENGINE[0]
 
 
@@ -294,32 +296,14 @@ def engine():
 def brrr_layer_tail(handle: int, slot: int, o: torch.Tensor, positions: torch.Tensor, frequencies: torch.Tensor,
                     resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
                     y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,
-                    pre1: torch.Tensor, attn_scale: torch.Tensor | None = None,
-                    attn_base: torch.Tensor | None = None) -> None:
-    # attn_scale/attn_base: the layer's prologue ran in BRRR, so the tail finishes the attention mHC mix.
+                    pre1: torch.Tensor) -> None:
     extension().run(handle, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre,
-                    attn_scale, attn_base, y, resid1, post1, comb1, pre1)
+                    y, resid1, post1, comb1, pre1)
 
 
 @brrr_layer_tail.register_fake
 def _fake_brrr_layer_tail(handle, slot, o, positions, frequencies, resid0, attn_post, attn_comb, attn_pre,
-                          y, resid1, post1, comb1, pre1, attn_scale=None, attn_base=None):
-    pass
-
-
-@torch.library.custom_op("flare::brrr_prologue", mutates_args=("resid_out", "input_out", "qr", "kv", "qr_q", "qr_s", "q"))
-def brrr_prologue(handle: int, y: torch.Tensor, resid: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
-                  pre: torch.Tensor, fn: torch.Tensor, norm: torch.Tensor, wqa: torch.Tensor, wqa_s: torch.Tensor,
-                  q_norm: torch.Tensor, kv_norm: torch.Tensor, eps: float, wqb: torch.Tensor, wqb_s: torch.Tensor,
-                  positions: torch.Tensor, frequencies: torch.Tensor, resid_out: torch.Tensor, input_out: torch.Tensor,
-                  qr: torch.Tensor, kv: torch.Tensor, qr_q: torch.Tensor, qr_s: torch.Tensor, q: torch.Tensor) -> None:
-    extension().prologue(handle, y, resid, post, comb, pre, fn, norm, wqa, wqa_s, q_norm, kv_norm, eps, wqb, wqb_s,
-                         positions, frequencies, resid_out, input_out, qr, kv, qr_q, qr_s, q, None, 0, None)
-
-
-@brrr_prologue.register_fake
-def _fake_brrr_prologue(handle, y, resid, post, comb, pre, fn, norm, wqa, wqa_s, q_norm, kv_norm, eps, wqb, wqb_s,
-                        positions, frequencies, resid_out, input_out, qr, kv, qr_q, qr_s, q):
+                          y, resid1, post1, comb1, pre1):
     pass
 
 
@@ -329,11 +313,6 @@ def sparse_extension():
     from brrr import cuext
 
     return cuext.extension("flare_sparse_decode")
-
-
-def brrr_sparse_enabled() -> bool:
-    """FLARE_DS41_BRRR_SPARSE=1: decode/verify attention of the main layers through BRRR's sparse decode kernel."""
-    return os.environ.get("FLARE_DS41_BRRR_SPARSE", "0") == "1"
 
 
 @torch.library.custom_op("flare::brrr_sparse_decode", mutates_args=("out", "partial", "stats", "counters"))
@@ -364,7 +343,10 @@ def sparse_supported(rows, swa_width, idx_width, heads, dim) -> bool:
 
 class PreparedBRRRSparse:
     """Sparse MLA decode (window + indexed keys, attention sink) in one BRRR launch per layer: per-CTA key splits
-    with the softmax merge done by the last CTA, instead of b12x's decode + merge kernels."""
+    with the softmax merge done by the last CTA, instead of b12x's decode + merge kernels (TP3Config.brrr_sparse).
+
+    MEASURED 2026-11: level with the stock kernels at c1/c8 -> not adopted; kept opt-in with its kernel test
+    (tp3-tools/test_flare_sparse_decode.py)."""
 
     def __init__(self, query, window, window_page_size, window_indices, window_lengths, sink, output, *,
                  indexed=None, indexed_page_size=0, indexed_indices=None, indexed_lengths=None, page_table=None):
@@ -393,67 +375,24 @@ class PreparedBRRRSparse:
         return self.output
 
 
-def _skinny_scales(scales_u8, rows, cols):
-    """BRRR skinny GEMM scale layout from 32x32-block UE8M0 scales [rows/32, cols/32] (brrr/skinny.py prepare())."""
-    s = scales_u8.repeat_interleave(32, dim=0)[:rows]
-    return s.reshape(rows // 8, 4, 2, cols // 64, 2).permute(0, 3, 1, 4, 2).contiguous()
-
-
 class PreparedBRRRTail:
     """Layer tail through the BRRR kernel. Reads s.attended (pre-inverse-RoPE attention output)."""
 
-    def __init__(self, index, weights, scratch, positions, frequencies, config=None):
+    def __init__(self, index, weights, scratch, positions, frequencies, config=None, tp3=None):
         e = engine()
         if e is None:
             raise RuntimeError("BRRR engine was not created")
+        tp3 = e.tp3 if tp3 is None else tp3
         self.handle, self.slot = int(e.handle), int(e.register(index, weights, config))
         self.scratch, self.positions, self.frequencies = scratch, positions, frequencies
-        if os.environ.get("FLARE_DS41_BRRR_BREAK") == "rope":
+        if tp3.brrr_break == "rope":
             # Negative control for test tooling: reversed RoPE frequencies (wrong inverse rotation of the attention output).
             self.frequencies = frequencies.flip(0).contiguous()
         if positions.dtype != torch.int64:
             raise ValueError("BRRR tail expects int64 positions")
 
-    def __call__(self, attended, mix=None):
+    def __call__(self, attended):
         s = self.scratch
         brrr_layer_tail(self.handle, self.slot, attended, self.positions, self.frequencies,
                         s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb, s.attn_mix,
-                        s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix,
-                        *(mix if mix is not None else (None, None)))
-
-
-class PreparedBRRRPrologue:
-    """Attention prologue through BRRR's kernel (decode/verify graphs of <= 8 rows): mHC pre from the carried
-    state, attn_norm, fused q/kv down-projection, q/kv norms, q up-projection with RoPE. Writes Flare's
-    s.attention_hc.residual/.normalized, s.query and s.window_values (kv before RoPE; Flare rotates and caches it).
-    The tail then finishes the attention mix (hc_attn_scale/base)."""
-
-    def __init__(self, index, weights, scratch, positions, frequencies, eps, buffers):
-        e = engine()
-        ext = e.ext
-        self.handle, self.scratch, self.positions, self.frequencies, self.eps = int(e.handle), scratch, positions, frequencies, float(eps)
-        r, p, a, res = e.rank, f"layers.{index}", weights.attention, weights.residual
-        self.wqa = _rows2d(a["qkv_a"])
-        self.wqb = _rows2d(a["q_b"])
-        qa = torch.cat((e.raw_u8(f"{p}.attn.wq_a.scale"), e.raw_u8(f"{p}.attn.wkv.scale")))
-        self.wqa_s = _skinny_scales(qa, self.wqa.shape[0], self.wqa.shape[1])
-        rows = self.wqb.shape[0]
-        self.wqb_s = _skinny_scales(e.raw_padded(f"{p}.attn.wq_b.scale", _shard(r, rows // 32)), rows, self.wqb.shape[1])
-        self.q_norm, self.kv_norm = a["q_norm"].contiguous(), a["kv_norm"].contiguous()
-        self.fn = res["hc_attn_fn"].float().contiguous()
-        self.norm = res["attn_norm.weight"].contiguous()
-        self.mix = (res["hc_attn_scale"].float().contiguous(), res["hc_attn_base"].float().contiguous())
-        m = scratch.residual.shape[0]
-        self.qr = buffers.zeros((m, 1280), torch.bfloat16)
-        self.qr_q = buffers.zeros((m, 1280), torch.uint8)
-        self.qr_s = buffers.zeros((int(ext.act_scale_bytes(m)),), torch.uint8)
-        e.keep.append((self.wqa_s, self.wqb_s, self.fn, self.mix))
-        if os.environ.get("FLARE_DS41_BRRR_LOG") == "1":
-            print(f"[brrr] rank {r} layer {index} prologue: wqa {tuple(self.wqa.shape)} wqb {tuple(self.wqb.shape)} rows {m}", flush=True)
-
-    def __call__(self):
-        s = self.scratch
-        brrr_prologue(self.handle, s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix,
-                      self.fn, self.norm, self.wqa, self.wqa_s, self.q_norm, self.kv_norm, self.eps, self.wqb, self.wqb_s,
-                      self.positions, self.frequencies, s.attention_hc.residual, s.attention_hc.normalized,
-                      self.qr, s.attention.window_values, self.qr_q, self.qr_s, s.attention.query.view(s.residual.shape[0], -1))
+                        s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb, s.pre_mix)

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Debug-only per-layer residual probes for the DeepSeek decode-corruption hunt (flare#193).
 
-Enabled by FLARE_DS41_PROBE=1 (debug-serve only; never export with it). Each captured forward records
+Enabled by TP3Config.probe (FLARE_DS41_PROBE=1; debug-serve only, never export with it); the decoder owns a
+``Probe`` and every layer records through it. Each captured forward records
 four statistics (sum, sum of squares, max |x|, first element) per probed tensor:
 
   * decode graphs: row 0, into a ring buffer indexed by a device-side decode step counter;
@@ -16,7 +17,6 @@ import time
 
 import torch
 
-ENABLED = os.environ.get("FLARE_DS41_PROBE", "") not in ("", "0")
 RING, LAYERS, STAGES, PREFILL_ROWS = 512, 40, 6, 4096
 FULL_LAYERS = (37, 38, 39)  # full-row captures of the MoE input and routed output (bf16)
 _STATE = {}
@@ -103,10 +103,6 @@ def _probe_positions_fake(positions, ring_pos, prefill_pos, counter, decode):
     pass
 
 
-def positions(value, mode):
-    if ENABLED and mode in ("decode", "prefill"):
-        state = _state(value.device)
-        _probe_positions(value.reshape(-1), state["ring_pos"], state["prefill_pos"], state["counter"], mode == "decode")
 
 
 @torch.library.custom_op("flare_debug::probe_router",
@@ -129,11 +125,6 @@ def _probe_router_fake(ids, weights, ring_ids, ring_w, prefill_ids, prefill_w, c
     pass
 
 
-def router(ids, weights, layer, mode):
-    if ENABLED and mode in ("decode", "prefill") and ids.shape[-1] == 6:
-        state = _state(ids.device)
-        _probe_router(ids, weights, state["ring_ids"], state["ring_w"], state["prefill_ids"], state["prefill_w"],
-                      state["counter"], layer, mode == "decode")
 
 
 @torch.library.custom_op("flare_debug::probe_full", mutates_args=("ring", "prefill"))
@@ -152,20 +143,41 @@ def _probe_full_fake(value, ring, prefill, counter, index, decode):
     pass
 
 
-def full(value, layer, kind, mode):
-    if ENABLED and mode in ("decode", "prefill") and layer in FULL_LAYERS and value.reshape(value.shape[0], -1).shape[1] == 5120:
-        state = _state(value.device)
-        _probe_full(value, state["ring_" + kind], state["prefill_" + kind], state["counter"],
-                    FULL_LAYERS.index(layer), mode == "decode")
+class Probe:
+    """Recording entry points; every method is a no-op unless ``enabled`` (one instance per prepared decoder)."""
 
+    def __init__(self, enabled=False):
+        self.enabled = bool(enabled)
 
-def step(device, mode):
-    if ENABLED and mode == "decode":
-        _probe_step(_state(device)["counter"])
+    def allocate(self, device):
+        """Allocate the device state eagerly, outside traced forwards."""
+        if self.enabled:
+            _state(device)
 
+    def positions(self, value, mode):
+        if self.enabled and mode in ("decode", "prefill"):
+            state = _state(value.device)
+            _probe_positions(value.reshape(-1), state["ring_pos"], state["prefill_pos"], state["counter"], mode == "decode")
 
-def record(value, layer, stage, mode):
-    if ENABLED and mode in ("decode", "prefill"):
-        state = _state(value.device)
-        _probe_record(value, state["ring"], state["prefill"], state["prefill_rows"], state["counter"],
-                      layer, stage, mode == "decode")
+    def router(self, ids, weights, layer, mode):
+        if self.enabled and mode in ("decode", "prefill") and ids.shape[-1] == 6:
+            state = _state(ids.device)
+            _probe_router(ids, weights, state["ring_ids"], state["ring_w"], state["prefill_ids"], state["prefill_w"],
+                          state["counter"], layer, mode == "decode")
+
+    def full(self, value, layer, kind, mode):
+        if (self.enabled and mode in ("decode", "prefill") and layer in FULL_LAYERS
+                and value.reshape(value.shape[0], -1).shape[1] == 5120):
+            state = _state(value.device)
+            _probe_full(value, state["ring_" + kind], state["prefill_" + kind], state["counter"],
+                        FULL_LAYERS.index(layer), mode == "decode")
+
+    def step(self, device, mode):
+        if self.enabled and mode == "decode":
+            _probe_step(_state(device)["counter"])
+
+    def record(self, value, layer, stage, mode):
+        if self.enabled and mode in ("decode", "prefill"):
+            state = _state(value.device)
+            _probe_record(value, state["ring"], state["prefill"], state["prefill_rows"], state["counter"],
+                          layer, stage, mode == "decode")

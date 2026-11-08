@@ -6,7 +6,6 @@
 
 from dataclasses import dataclass, replace
 
-import os
 import torch
 
 from ignition.components.weights import MLPWeights
@@ -15,6 +14,7 @@ from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from ignition.components.markov_sampling import fp8_markov_head
 
 from .config import ModelConfig
+from .tp3_config import TP3Config
 
 
 @dataclass(frozen=True)
@@ -82,14 +82,15 @@ class ModelWeights:
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, host_allocator=None):
-        config = ModelConfig.load(manifest.metadata_path)
+             vocabulary_parallel_sampling=False, host_allocator=None, tp3=None):
+        tp3 = TP3Config() if tp3 is None else tp3
+        config = ModelConfig.load(manifest.metadata_path, mini=tp3.mini)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression,
-                                 host_allocator=host_allocator) as loader:
+                                 host_allocator=host_allocator, tp3=tp3) as loader:
             embedding, norm = loader.load_tensors(("embed.weight", "norm.weight"))
-            if os.environ.get("FLARE_DS41_EMBED_HOST") == "1" and host_allocator is not None:
+            if tp3.embed_host and host_allocator is not None:
                 # TP3: the 1.23 GiB token embedding is replicated on every rank but each step gathers only its tokens'
                 # rows (<= 48 in decode, one prefill chunk otherwise); read it from device-visible host memory and give
                 # the VRAM to hot experts / KV.
@@ -117,11 +118,10 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
-            if vision and host_allocator is not None and (os.environ.get("FLARE_DS41_VISION_HOST") == "1"
-                                                          or os.environ.get("FLARE_DS41_VISION_STAGE") == "1"):
+            if vision and host_allocator is not None and tp3.vision_host:
                 # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections consume these
                 # tensors as-is, so read them from device-visible host memory and give the VRAM to KV.
-                # FLARE_DS41_VISION_STAGE=1 keeps the tower parked and additionally stages each block's weights through
+                # tp3.vision_stage keeps the tower parked and additionally stages each block's weights through
                 # double-buffered VRAM slots inside the vision graphs (ignition/components/vision_staging.py). Without a
                 # host allocator nothing is parked, and bootstrap (`vision_host_parked`) then skips staging as well.
                 from ignition.components.weights import _park_on_host
@@ -137,21 +137,22 @@ def vision_host_parked(vision: dict, host_regions) -> bool:
     return bool(tensors) and all(any(start <= tensor.data_ptr() < end for start, end in spans) for tensor in tensors)
 
 
-def hot_expert_ids(layer: int, experts: int) -> list | None:
-    """TP3 expert promotion: the FLARE_DS41_HOT_EXPERTS hottest experts of a parked layer, by the route counts in
-    FLARE_DS41_EXPERT_COUNTS_DIR/expert-routes-rank0-layer{L}.json (vLLM route-monitor format). None = park all."""
-    plan = global_cold_plan()
+def hot_expert_ids(layer: int, experts: int, tp3: TP3Config) -> list | None:
+    """TP3 expert promotion: the ``tp3.hot_experts`` hottest experts of a parked layer, by the route counts in
+    ``tp3.expert_counts_dir``/expert-routes-rank0-layer{L}.json (vLLM route-monitor format). None = park all."""
+    plan = global_cold_plan(tp3)
     if plan is not None:
         cold = plan.get(layer, frozenset())
         return [e for e in range(experts) if e not in cold] if cold else None
-    hot = int(os.environ.get("FLARE_DS41_HOT_EXPERTS", "0") or 0)
+    hot = tp3.hot_experts
     if hot <= 0:
         return None
     if hot >= experts:
         return list(range(experts))
     import json
-    from pathlib import Path
-    path = Path(os.environ["FLARE_DS41_EXPERT_COUNTS_DIR"]) / f"expert-routes-rank0-layer{layer}.json"
+    if tp3.expert_counts_dir is None:
+        raise ValueError(f"TP3 config: hot_experts={hot} for layer {layer} needs expert_counts_dir")
+    path = tp3.expert_counts_dir / f"expert-routes-rank0-layer{layer}.json"
     counts = json.loads(path.read_text())["counts"]
     if len(counts) != experts:
         raise ValueError(f"{path}: expected {experts} expert counts, got {len(counts)}")
@@ -162,17 +163,17 @@ def hot_expert_ids(layer: int, experts: int) -> list | None:
 _GLOBAL_PLAN = {}
 
 
-def global_cold_plan() -> dict | None:
-    """FLARE_DS41_GLOBAL_COLD=N: the N least-routed (layer, expert) pairs across all MoE layers live in host
-    memory (merged banks); every other expert stays in VRAM. Route counts as for FLARE_DS41_HOT_EXPERTS.
-    Returns {layer: frozenset(cold experts)}."""
-    budget = int(os.environ.get("FLARE_DS41_GLOBAL_COLD", "0") or 0)
+def global_cold_plan(tp3: TP3Config) -> dict | None:
+    """``tp3.global_cold`` = N: the N least-routed (layer, expert) pairs across all MoE layers live in host
+    memory (merged banks); every other expert stays in VRAM. Route counts as for ``hot_experts``.
+    Returns {layer: frozenset(cold experts)}. DROPPED 2026-11 (N1 global placement: c8 -2..-7%); kept opt-in."""
+    budget = tp3.global_cold
     if budget <= 0:
         return None
-    if budget not in _GLOBAL_PLAN:
+    key = (budget, tp3.expert_counts_dir)
+    if key not in _GLOBAL_PLAN:
         import json
-        from pathlib import Path
-        root = Path(os.environ["FLARE_DS41_EXPERT_COUNTS_DIR"])
+        root = tp3.expert_counts_dir
         pairs = []
         for path in sorted(root.glob("expert-routes-rank0-layer*.json")):
             layer = int(path.stem.rsplit("layer", 1)[1])
@@ -183,49 +184,39 @@ def global_cold_plan() -> dict | None:
         plan = {}
         for _, layer, expert in pairs[:budget]:
             plan.setdefault(layer, set()).add(expert)
-        _GLOBAL_PLAN[budget] = {layer: frozenset(cold) for layer, cold in plan.items()}
-    return _GLOBAL_PLAN[budget]
+        _GLOBAL_PLAN[key] = {layer: frozenset(cold) for layer, cold in plan.items()}
+    return _GLOBAL_PLAN[key]
 
 
-def merged_bank() -> bool:
-    """FLARE_DS41_MERGED_BANK=1: parked layers use one mixed VRAM/host bank instead of hot + cold banks."""
-    return os.environ.get("FLARE_DS41_MERGED_BANK", "0") == "1"
-
-
-def host_expert_layers() -> frozenset:
-    """TP3 expert parking: FLARE_DS41_HOST_EXPERT_LAYERS="20-22" or "20,21" parks those MoE layers'
-    routed-expert banks in device-visible host memory (read over PCIe when routed)."""
-    plan = global_cold_plan()
+def host_expert_layers(tp3: TP3Config) -> frozenset:
+    """TP3 expert parking: the MoE layers whose routed-expert banks live in device-visible host memory (read over
+    PCIe when routed): ``tp3.host_expert_layers``, or the layers of the global-cold plan when that is active."""
+    plan = global_cold_plan(tp3)
     if plan is not None:
         return frozenset(plan)
-    spec = os.environ.get("FLARE_DS41_HOST_EXPERT_LAYERS", "").strip()
-    layers = set()
-    for part in filter(None, (p.strip() for p in spec.split(","))):
-        a, _, b = part.partition("-")
-        layers.update(range(int(a), int(b or a) + 1))
-    return frozenset(layers)
+    return tp3.host_expert_layers
 
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
     def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, dspark=False,
-                 expert_scale_compression=None, host_allocator=None):
+                 expert_scale_compression=None, host_allocator=None, tp3=None):
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         self.dspark = dspark
         self.expert_scale_compression = expert_scale_compression
+        self.tp3 = TP3Config() if tp3 is None else tp3
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
-        self.config = ModelConfig.load(manifest.metadata_path)
+        self.config = ModelConfig.load(manifest.metadata_path, mini=self.tp3.mini)
         self.shard = shard
         self._expert_scale_scratch = {}
         self._host_allocator = host_allocator
-        self._host_layers = host_expert_layers() if host_allocator is not None else frozenset()
+        self._host_layers = host_expert_layers(self.tp3) if host_allocator is not None else frozenset()
 
     def load_experts(self, prefixes, interval, *, host=False):
         text = self.config.text
         # TP3 BRRR experiment: the fused layer kernel reads native E8M0 expert scales, so its layers skip CSF.
-        from ignition.recipes.deepseek41.brrr import brrr_layers
-        native = (os.environ.get("FLARE_DS41_BRRR_NATIVE_SCALES") == "1" and prefixes and prefixes[0].startswith("layers.")
-                  and int(prefixes[0].split(".")[1]) in brrr_layers())
+        native = (self.tp3.brrr_native_scales and prefixes and prefixes[0].startswith("layers.")
+                  and int(prefixes[0].split(".")[1]) in self.tp3.brrr_layers)
         return self.load_mxfp4_experts(prefixes, hidden_size=text["hidden_size"],
             intermediate_size=text["moe_intermediate_size"], intermediate_range=interval,
             swiglu_limit=text["swiglu_limit"], scale_name="scale", projection_names=("w3", "w1", "w2"),
@@ -273,12 +264,12 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         interval = shard.partition(text["moe_intermediate_size"], alignment=32)
         count = self.config.draft.experts if draft else text["n_routed_experts"]
         parked = not draft and layer in self._host_layers
-        hot = hot_expert_ids(layer, count) if parked else None
+        hot = hot_expert_ids(layer, count, self.tp3) if parked else None
         cold = hot_map = cold_map = hot_rows = None
         if hot is None or len(hot) == count:
             experts = self.load_experts([f"{ffn}.experts.{i}" for i in range(count)], interval,
                                         host=parked and hot is None)
-        elif merged_bank() and getattr(self._host_allocator, "__self__", None) is not None:
+        elif self.tp3.merged_bank and getattr(self._host_allocator, "__self__", None) is not None:
             # One bank, hot experts first: VRAM rows for hot, host rows for cold (one MoE call per layer).
             storage = self._host_allocator.__self__
             hot_set = set(hot)

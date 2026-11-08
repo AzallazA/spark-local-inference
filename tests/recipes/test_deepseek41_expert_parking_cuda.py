@@ -13,7 +13,7 @@ Optional: FLARE_DS41_PARKING_TEST_LAYER (default 3), FLARE_DS41_PARKING_TEST_HOT
 FLARE_DS41_PARKING_TEST_ROWS (default "1,24,48").
 
 One MoE layer's 384 routed experts are loaded three times through weights.py `load_layer`, in one PackageStorage,
-each with its own weight loader and environment:
+each with its own weight loader and environment (parsed into a TP3Config per configuration):
   resident  no FLARE_DS41_HOST_EXPERT_LAYERS: one VRAM bank, router ids used as-is;
   split     FLARE_DS41_HOST_EXPERT_LAYERS + FLARE_DS41_HOT_EXPERTS: hot bank (VRAM) + cold bank (host_allocate regions),
             hot_map / cold_map with -1 for ids outside a bank (b12x skips negative routes);
@@ -245,6 +245,7 @@ def test_parked_expert_layouts_match_resident_and_parked_bytes(tmp_path, monkeyp
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.deepseek41.recipe import _parked_bytes
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
     from ignition.recipes.deepseek41.weights import DeepSeekWeightLoader, hot_expert_ids
 
     torch.cuda.set_device(0)
@@ -256,13 +257,14 @@ def test_parked_expert_layouts_match_resident_and_parked_bytes(tmp_path, monkeyp
         loaded, config = {}, None
         for name, env in _configs(layer, hot, counts_dir).items():
             _apply(monkeypatch, {**base, **env})
+            tp3 = TP3Config.from_environment()
             if env:
-                assert hot_expert_ids(layer, EXPERTS) == hot_ids, "synthetic route counts must select the intended hot set"
+                assert hot_expert_ids(layer, EXPERTS, tp3) == hot_ids, "synthetic route counts must select the intended hot set"
             host_before, mixed_before = len(storage.host_regions), len(storage.mixed_regions)
-            # Production passes the storage's host allocator to every layer; the environment decides parking.
+            # Production passes the storage's host allocator to every layer; the TP3Config decides parking.
             with DeepSeekWeightLoader(manifest, device, shard=TensorParallelShard(0, WORLD),
                                       prefixes=(f"layers.{layer}.",), expert_scale_compression="csf",
-                                      host_allocator=storage.host_allocate) as loader:
+                                      host_allocator=storage.host_allocate, tp3=tp3) as loader:
                 weights, config = loader.load_layer(layer), loader.config
             torch.cuda.synchronize(device)
             assert config.text["moe_intermediate_size"] == 2304 and config.text["n_routed_experts"] == EXPERTS
@@ -271,7 +273,7 @@ def test_parked_expert_layouts_match_resident_and_parked_bytes(tmp_path, monkeyp
             _check_maps(name, weights, hot_ids, cold_ids)
 
             # Planner bookkeeping vs. what PackageStorage actually mapped in host memory for this configuration.
-            expected = _parked_bytes(WORLD)
+            expected = _parked_bytes(WORLD, tp3)
             actual = sum(region.extent for region in host) + sum(region.host_bytes for region in mixed)
             slack = len(host) * mmap.PAGESIZE + sum(region.granularity for region in mixed)
             print(f"[parking] layer {layer} {name}: _parked_bytes({WORLD})={expected} host_bytes={actual} "

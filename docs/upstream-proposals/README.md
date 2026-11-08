@@ -80,13 +80,16 @@ reviewers or CI must cover them.
   `decoder.py`. Development instrumentation; AGENTS.md: "Do not create development
   audit reports, receipts, provenance bundles, or hash inventories."
 - BRRR kernels and wiring (`brrr.py`, `attention.py` `brrr_sparse`, `decoder.py`
-  tail/prologue, `fused_qkv_norm.py`): environment-gated, fused GPU execution
-  changes; the prologue has no measured gain (commit 953859e); authorship rule.
+  tail, `fused_qkv_norm.py`): fused GPU execution changes selected through
+  `TP3Config`; the prologue (no measured gain, commit 953859e) was removed
+  2026-11-08; authorship rule.
 - Debug toggles: `FLARE_SINGLE_SUBMISSION` (`helios/src/execution.rs:43-48`),
   `FLARE_DS41_NO_ENGRAM`, `FLARE_DS41_EAGER_PROFILE`, `FLARE_DS41_MINI`,
-  `FLARE_DS41_QB_ATOMIC`, `FLARE_DS41_JOINT_HEADROOM_MIB`, `FLARE_DS41_TP3_GRAPH_GIB`,
+  `FLARE_DS41_JOINT_HEADROOM_MIB`, `FLARE_DS41_TP3_GRAPH_GIB`,
   `FLARE_DS41_EMBED_HOST`, `FLARE_DS41_VISION_HOST`, `FLARE_ENGRAM_RAM_TABLES`,
-  `FLARE_ENGRAM_RAM_LAYERS`. Each is an environment switch.
+  `FLARE_ENGRAM_RAM_LAYERS`. Each is an environment switch (the `FLARE_DS41_*`
+  ones are read only by `TP3Config.from_environment()` in the fork;
+  `FLARE_DS41_QB_ATOMIC` was removed 2026-11-08).
 - FlashInfer `flashinfer-dense-splitk-deferral.patch` and
   `flashinfer-tuning-route-reuse.patch`: experiments; route reuse measured no gain
   at 450 W.

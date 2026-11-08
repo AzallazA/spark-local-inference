@@ -91,8 +91,14 @@ cd ~/flare-up-v3 && CKPT=/m2-2/flare-ckpt/ds41-1017-engram-mxfp4 HOT=342 tp3-too
 ```
 
 Full export ≈ 25-40 min with a warm tuning cache; writes a new `gb202-tp3-<timestamp>` package. Knobs are env vars
-(`HOT`, `PREFILL`, `DRAFTS`, `FLARE_DS41_VISION_HOST`, plus the `FLARE_DS41_*` set in `export.sh`). Export and serving
-cannot overlap (VRAM). Mini export for kernel/wiring checks: `./mini-exp.sh "<brrr layers>" <label>` (6-layer model,
+(`HOT`, `PREFILL`, `DRAFTS`, `FLARE_DS41_VISION_HOST`, plus the `FLARE_DS41_*` set in `export.sh`). The recipe reads
+them once, in `TP3Config.from_environment()` (`ignition/recipes/deepseek41/tp3_config.py`), validates them, prints
+the non-default switches in the export progress and records every switch in `tp3-config.json` beside the package's
+`model.safetensors` (and in each rank's memory report as `tp3_config`; paths appear as basename + fingerprint,
+never absolute). Everything downstream receives the `TP3Config` instance; new switches are fields there, not new
+`os.environ` reads. `FLARE_DS41_VISION_STAGE=1` implies `FLARE_DS41_VISION_HOST=1` (staging reads from the parked
+copy; `VISION_HOST=0` alone keeps the tower in VRAM only when staging is off too). Export and serving cannot overlap
+(VRAM). Mini export for kernel/wiring checks: `./mini-exp.sh "<brrr layers>" <label>` (6-layer model,
 ~10 min, then `tp3-tools/consistency.py`).
 
 ### A.6 GPU tests and traces
@@ -137,10 +143,11 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | `ALPHA` 0.6/0.8/1.0, scheduler balanced/throughput | within noise; defaults 0.8 / balanced |
 | Power 350/450/600 W, core offset | 450 W ≈ +10-12% over 350 W; 600 W no gain; +100/+150 core no gain |
 | `FLARE_DS41_BRRR_PARKED_MAX_ROWS=12` | gate for BRRR in parked layers; ungated = c8 +1%, c1 level (tabled) |
-| `FLARE_DS41_BRRR_SPARSE`, `FLARE_DS41_FUSED_QKV_NORM`, BRRR prologue | opt-in experiments, all measured level; default off |
+| `FLARE_DS41_BRRR_SPARSE`, `FLARE_DS41_FUSED_QKV_NORM` | opt-in experiments, measured level; default off, kept with their kernel tests (`TP3Config.brrr_sparse` / `fused_qkv_norm`) |
+| BRRR prologue, `FLARE_DS41_QB_ATOMIC` | measured level; REMOVED 2026-11-08 (`TP3Config.from_environment` rejects the variables) |
 | BRRR stage 2 (OTOK/SPAN 48 wide rows, worktree `~/flare-up-stage2`) | REGRESSION: c4 -5%, c1 -3% (11-08, real export); closed |
 | Extra PDL trigger at the end of `layer_kernel` | cost ~2% at c8 (11-08 bisect); removed. Only the original trigger remains |
-| `FLARE_DS41_VISION_STAGE=1` (vision tower weights staged through VRAM slots) | cold image 0.11 s vs 1.70 s (11-08); 190 MiB of activation-pool slots, KV unchanged |
+| `FLARE_DS41_VISION_STAGE=1` (vision tower weights staged through VRAM slots; implies `VISION_HOST=1`) | cold image 0.11 s vs 1.70 s (11-08); 190 MiB of activation-pool slots, KV unchanged |
 | Engram: `FLARE_ENGRAM_RAM_TABLES=0` vs `--embedding-table-storage disk` | disk = -90 GiB RAM, -3-4% decode; MXFP4 vs FP8 tables: wiki ppl +2.6%, benchmarks within noise |
 | `FLARE_DS41_EMBED_HOST=1`, `FLARE_DS41_VISION_HOST=1` | embeddings/vision in host RAM; images ~3 s slower each |
 | `FLARE_DS41_AR_ROWS=1024` | chunked all-reduce sizing for prefill |
@@ -207,7 +214,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
 3. The recipes folder is dated by the day the change was made (user rule, 2026-11-08): a new
    `DeepSeek-V4.1-Flash Flare-tp3-YYYYMMDD` folder per release day, copied from the previous one and edited; earlier
-   folders stay as published. Regenerate its `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify
+   folders stay as published. Its README describes the changes **since the previous folder** (not since the first
+   one): intro list, "Coming from <previous>" migration notes, headline table labelled with the builds it holds; the
+   cumulative feature description stays as "What this build contains". *Incident:* the 20261108 folder shipped for an
+   hour with the 20261107 intro ("supersedes 20261105, +6-8%"). Regenerate its `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify
    on a clean upstream worktree (tree-identical), cite the tag in the folder docs, add the row to the top-level
    README, run the hygiene grep, commit, push `origin` (GitHub) and `gitea`. The folder and the tag must always agree.
 
@@ -294,14 +304,18 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    builds were credited with "+58K / +73K / +87K KV" that was entirely the serve flags; the first explanation ("the
    32G prefix cache") was itself wrong and only the KV dry run (`flare run ... --dry-run`) settled it. Run the dry
    run before attributing any KV change to a build.
-5. **Bisect a regression before dropping a whole change set.** Stage 1 measured -2% at c8; one of its six parts (an
+5. **Know the two background variances before calling a delta real.** Export-to-export (identical code, tuning
+   races): 0.5-1% at c8 (11-08: 080909 vs its re-export 081134, 983 vs 988 tok/s over 4 rounds). Session-to-session
+   for the same package: ~2% (080909 ran 986-1003 one session, 979-991 the next). A delta inside these bands needs a
+   re-export or another session before it means anything; one re-export of the baseline is the cheapest check.
+6. **Bisect a regression before dropping a whole change set.** Stage 1 measured -2% at c8; one of its six parts (an
    added PDL trigger) was the entire cost, found with one extra export. The other five were kept.
-6. **Trace estimates are upper bounds.** Attention-side kernels overlap on side streams; a kernel that looks like 6%
+7. **Trace estimates are upper bounds.** Attention-side kernels overlap on side streams; a kernel that looks like 6%
    of the step may be hidden. Measure per-stream overlap before building a fusion. *Incidents:* BRRR prologue
    (estimated -5%, measured 0), sparse decode (estimated 2-3%, level), fused qkv_a norm (2.6% on paper, level).
-7. **`verify_fix` "natural-uncertainty flags" are noise.** One build gave 4, 8, 4, 27, 16, 17 across runs. Only
+8. **`verify_fix` "natural-uncertainty flags" are noise.** One build gave 4, 8, 4, 27, 16, 17 across runs. Only
    `TRUE corruptions` counts; natural-EOS benches and the qualification suite decide quality.
-8. **Ignore-EOS bench loops are a bench artifact**, not corruption. Re-check with `--respect-eos` (always 0 loops).
+9. **Ignore-EOS bench loops are a bench artifact**, not corruption. Re-check with `--respect-eos` (always 0 loops).
 
 ### D.2 Exporting and serving
 
@@ -349,8 +363,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    first pass, one legacy branch in the second).
 7. **No `data_ptr()` or registry work inside Dynamo-traced code**; use a custom op or a binding finalizer.
 8. **Every "identical" claim needs a bit-exact test; every equivalence test needs a negative control** shown to fail
-   (`FLARE_DS41_BRRR_BREAK=rope`).
-9. **Env-var-driven behaviour stays in the recipe and the CLI shim** (upstream rule, D/C.11).
+   (`FLARE_DS41_BRRR_BREAK=rope`, `TP3Config.brrr_break`).
+9. **Env-var-driven behaviour stays in the recipe and the CLI shim** (upstream rule, D/C.11). In the fork the only
+   reader is `TP3Config.from_environment()`; components take the config object (`tp3=`), tests build it from their
+   own environment.
 10. **Save every site-packages edit as a patch in `tp3-patches/` immediately.** *Incident:* the b12x split-K deferral
     existed only in the venv for a day.
 11. **A per-row mismatch in a kernel-vs-reference test is a routing or quantizer effect until proven otherwise.**

@@ -257,7 +257,6 @@ struct Scratch {
   float* yacc;
   __nv_bfloat16* yattn;
   float* mixp;
-  float* mixq;
   __nv_bfloat16* xc;
   float* xsq;
   __nv_bfloat16* xbf;
@@ -273,13 +272,6 @@ struct Scratch {
   uint8_t* hq;
   uint8_t* hqe;
   float* yracc;
-  uint8_t* aq;
-  uint8_t* as;
-  float* qkp;
-  float* qkv;
-  float* qsq;
-  unsigned* tiles;
-  unsigned* pc;
 };
 
 // TP3 CSF: b12x CsfBlockPayload (destination 2, mxfp4 1-bit codes, 3-byte group records) read in-kernel.
@@ -347,9 +339,6 @@ struct Params {
   float* attn_post;
   float* attn_comb;
   float* attn_pre;
-  const float* attn_scale;
-  const float* attn_base;
-  int attn_mix;
   __nv_bfloat16* y_ffn;
   __nv_bfloat16* resid1;
   float* ffn_post;
@@ -806,13 +795,6 @@ __device__ __forceinline__ void dense_q(Ctx& c, const Span& sp, int ks, int kw, 
 
 __device__ __forceinline__ float rot_add(float a, float b, float2 cs) { return a * cs.x + b * cs.y; }
 
-// Flare port: (cos, sin) for one rotary pair from Flare's 32 frequencies (angle = float(pos) * freq[pair]).
-__device__ __forceinline__ float2 rope_cs_freq(const float* freq, long pos, int pair) {
-  float sn, cs;
-  sincosf(float(pos) * __ldg(freq + pair), &sn, &cs);
-  return make_float2(cs, sn);
-}
-
 __device__ __forceinline__ float rot_sub(float a, float b, float2 cs) { return a * cs.x - b * cs.y; }
 
 // Flare port: RoPE angles from the 32 frequencies Flare uses (angle = float(pos) * freq[pair]) instead of a
@@ -1054,14 +1036,10 @@ __device__ void job_xa(Ctx& c, int k) {
   c.signal(C_YR + k);
 }
 
-__device__ void job_amix(Ctx& c, int q) {
-  const Params& p = c.p;
+__device__ void job_amix(Ctx& c, int) {
+  // The attention mHC mix stays in Flare (the opt-in BRRR prologue that produced it was removed, 2026-11-08);
+  // the job only keeps its place in the counter protocol.
   c.release();
-  const int tok = q * GW + c.warp;
-  if (p.attn_mix && tok < p.m) {
-    const float mine = c.lane <= MIX ? __ldcg(p.s.mixq + tok * (MIX + 1) + c.lane) : 0.0f;
-    mix_finish(c.lane, tok, mine, p.attn_scale, p.attn_base, p.attn_pre, p.attn_post, p.attn_comb);
-  }
   c.signal(C_AMIX);
 }
 
@@ -1457,9 +1435,7 @@ __device__ void deps(Ctx& c, const Job& job) {
   switch (job.type) {
     case J_WOB: return c.wait(C_Z + job.b * GROUPS + job.c, KS_WOB / 2);
     case J_XA: return c.wait(C_YC + job.a, 2 * c.L.tg);
-    case J_OWNA:
-      if (p.attn_mix) c.wait(C_AMIX, quads(p.m));
-      return c.wait(C_YR + job.a / (CHUNK_COLS / 32), 1);
+    case J_OWNA: return c.wait(C_YR + job.a / (CHUNK_COLS / 32), 1);
     case J_XNORM: return c.wait(C_A + job.b, SLICES);
     case J_GATE:
       if (!split_norm(p.m))
@@ -1744,7 +1720,7 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   }
   __syncthreads();
   // No pdl_launch_dependents() here: an early trigger at this point measured ~2% slower at c4/c8 (2026-11-08 bisect,
-  // 3 alternating rounds). The only trigger in this file is the one in the opt-in prologue_kernel.
+  // 3 alternating rounds). No kernel in this file triggers dependents early.
   if (threadIdx.x == 0) {
     __threadfence();
     sm.last = atomicAdd(p.s.counters + C_FIN, 1u) == gridDim.x - 1;
@@ -1761,356 +1737,6 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   }
 }
 
-struct AttnIn {
-  const __nv_bfloat16* y;
-  const __nv_bfloat16* resid;
-  const float* post;
-  const float* comb;
-  const float* pre;
-  const float* fn;
-  const __nv_bfloat16* norm;
-  __nv_bfloat16* resid_out;
-  __nv_bfloat16* input_out;
-  int m;
-};
-
-constexpr int QR = 1280, KVW = 512, QKV = QR + KVW, QKV_TILES = QKV / 8, Q_TILES = QR / 8;
-constexpr int NQH = 24;  // TP3: 72 padded q heads / 3 ranks (TP4: 16)
-constexpr int KSPLIT = 5, KPART = HID / KSPLIT, WQB_ROWS = NQH * HDIM, WQB_TILES = WQB_ROWS / 8;
-constexpr int NORM_COLS = GT, Q_CHUNKS = QR / NORM_COLS, KV_CHUNKS = KVW / NORM_COLS;
-constexpr int QKV_CTAS = KSPLIT * cdiv(QKV_TILES, GW), WQB_CTAS = WQB_TILES / GW;
-constexpr int P1 = 0, P3 = 1, P3Q = 2, P3K = 3, P4 = 4, PFIN = 5, PCOUNTERS = 8;
-constexpr int PT = 16, PRO_FN = MIX * HC * 32 * 4, PRO_XQ = PT * (QR + 16), PRO_XS = PT * (QR / 32);
-constexpr int PRO_SMEM = (PRO_FN > PRO_XQ ? PRO_FN : PRO_XQ) + PRO_XS;
-
-__host__ __device__ __forceinline__ int act_stride(int m) { return m <= 32 ? 512 : 16 * MAXM; }
-__host__ __device__ __forceinline__ unsigned act_scale(int grp, int tok, int m) { return (grp >> 2) * act_stride(m) + tok * 16 + (grp & 3); }
-__host__ __device__ __forceinline__ int slice_tokens(int m) { return m <= TILE ? GW : 4 * GW; }
-__host__ __device__ __forceinline__ int input_tokens(int m) { return m <= TILE ? 2 * GW : 8 * GW; }
-__host__ __device__ __forceinline__ int norm_span(int m) { return m < 32 ? 1 : m / 16; }
-
-struct Prologue {
-  AttnIn in;
-  const uint8_t* wqa;
-  const uint8_t* wqa_s;
-  const __nv_bfloat16* q_norm;
-  const __nv_bfloat16* kv_norm;
-  float eps;
-  __nv_bfloat16* qr;
-  __nv_bfloat16* kv;
-  uint8_t* qr_q;
-  uint8_t* qr_s;
-  const uint8_t* wqb;
-  const uint8_t* wqb_s;
-  const long* positions;
-  const float* cos_sin;
-  __nv_bfloat16* q;
-  uint8_t* swa;
-  long swa_stride;
-  long swa_capacity;
-  const long* swa_slots;
-  int swa_page;
-  Scratch s;
-};
-
-constexpr int SWA_RECORD = 528;
-
-__device__ __forceinline__ void write_swa(const Prologue& a, int tok, int col, float y, int lane) {
-  const long pos = __ldg(a.positions + tok);
-  const float partner = __shfl_xor_sync(0xffffffffu, y, 1);
-  float r = y;
-  if (col >= KVW - ROPE) {
-    const int local = col - (KVW - ROPE);
-    const float2 cs = rope_cs_freq(a.cos_sin, pos, local / 2);
-    r = local % 2 ? rot_add(r, partner, cs) : rot_sub(r, partner, cs);
-  }
-  if (pos < 0) r = 0.0f;
-  r = bf(r);
-  const int e = quant_exp(warp_max(fabsf(r)), AMAX_FLOOR);
-  float inv;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(pow2(e)));
-  const long slot = __ldg(a.swa_slots + tok);
-  if (slot < 0 || slot >= a.swa_capacity) return;
-  uint8_t* rec = a.swa + (slot / a.swa_page) * a.swa_stride + (slot % a.swa_page) * SWA_RECORD;
-  rec[col] = uint8_t(e4m3x2(r * inv, 0.0f) & 0xffu);
-  if (lane == 0) rec[KVW + col / 32] = uint8_t(e + 127);
-}
-
-template <int PERW>
-__device__ __forceinline__ void attn_slice(const AttnIn& a, const Scratch& sc, float* fn, int s, int tid, int tok0, int tok_end) {
-  const int warp = tid >> 5, lane = tid & 31, col = s * 32 + lane, end = min(a.m, tok_end);
-  __syncthreads();
-  for (int i = tid; i < MIX * HC * 32; i += GT) fn[i] = __ldg(a.fn + long(i / 32) * HID + s * 32 + i % 32);
-  __syncthreads();
-  float y[PERW], rk[PERW][HC];
-#pragma unroll
-  for (int u = 0; u < PERW; ++u) {
-    const int tok = min(tok0 + warp + u * GW, a.m - 1);
-    y[u] = __bfloat162float(__ldg(a.y + long(tok) * HID + col));
-#pragma unroll
-    for (int k = 0; k < HC; ++k) rk[u][k] = __bfloat162float(__ldg(a.resid + (long(tok) * HC + k) * HID + col));
-  }
-#pragma unroll
-  for (int u = 0; u < PERW; ++u) {
-    const int tok = tok0 + warp + u * GW;
-    if (tok >= end) break;
-    float r[HC], x = 0.0f, v[32] = {};
-#pragma unroll
-    for (int j = 0; j < HC; ++j) {
-      float t = __ldg(a.post + tok * HC + j) * y[u];
-#pragma unroll
-      for (int k = 0; k < HC; ++k) t += __ldg(a.comb + tok * HC * HC + k * HC + j) * rk[u][k];
-      r[j] = bf(t);
-      a.resid_out[(long(tok) * HC + j) * HID + col] = __float2bfloat16(r[j]);
-      x += __ldg(a.pre + tok * HC + j) * r[j];
-      v[MIX] += r[j] * r[j];
-    }
-    x = bf(x);
-    sc.xc[long(tok) * HID + col] = __float2bfloat16(x);
-#pragma unroll
-    for (int q = 0; q < MIX; ++q)
-#pragma unroll
-      for (int j = 0; j < HC; ++j) v[q] += fn[(q * HC + j) * 32 + lane] * r[j];
-    v[MIX + 1] = x * x;
-    const float total = lane_sums(v, lane);
-    sc.mixp[(long(tok) * SLICES + s) * MIXW + lane] = total;
-    if (lane == MIX + 1) sc.xsq[tok * SLICES + s] = total;
-  }
-}
-
-__device__ __forceinline__ void attn_reduce(const AttnIn& a, const Scratch& sc, int tok, int lane) {
-  const float mine = mix_reduce(sc.mixp, tok, lane);
-  if (tok >= a.m) return;
-  if (lane <= MIX) sc.mixq[tok * (MIX + 1) + lane] = mine;
-}
-
-__device__ __forceinline__ float token_rs(const float* xsq, int tok, int lane) {
-  constexpr int V = SLICES / 4;
-  const float4* x = reinterpret_cast<const float4*>(xsq + tok * SLICES);
-  float v = 0.0f;
-#pragma unroll
-  for (int i = 0; i < cdiv(V, 32); ++i)
-    if (lane + i * 32 < V) {
-      const float4 f = __ldcg(x + lane + i * 32);
-      v += (f.x + f.y) + (f.z + f.w);
-    }
-  return rsqrtf(warp_sum(v) / HID + NORM_EPS);
-}
-
-template <int PERW>
-__device__ __forceinline__ void attn_input(const AttnIn& a, const Scratch& sc, int s, int tok0, int tid) {
-  const int warp = tid >> 5, lane = tid & 31, col = s * 32 + lane;
-  const float nw = __bfloat162float(__ldg(a.norm + col));
-  float xv[PERW], rs[PERW];
-#pragma unroll
-  for (int u = 0; u < PERW; ++u) {
-    const int tok = min(tok0 + warp + u * GW, a.m - 1);
-    xv[u] = __bfloat162float(__ldcg(sc.xc + long(tok) * HID + col));
-    rs[u] = token_rs(sc.xsq, tok, lane);
-  }
-#pragma unroll
-  for (int u = 0; u < PERW; ++u) {
-    const int tok = tok0 + warp + u * GW;
-    if (tok >= a.m) break;
-    const float v = bf(nw * (xv[u] * rs[u]));
-    a.input_out[long(tok) * HID + col] = __float2bfloat16(v);
-    const int e = quant_exp(warp_max(fabsf(v)), MX_AMAX_FLOOR);
-    sc.aq[long(tok) * HID + col] = quant_byte(v, e);
-    if (lane == 0) sc.as[act_scale(s, tok, a.m)] = uint8_t(e + 127);
-  }
-}
-
-__device__ __forceinline__ void stage_mx(uint8_t* xq, int pitch, uint8_t* xs, const uint8_t* q, int q_ld, const uint8_t* scales, int k0, int width, int t0, int m, int tid) {
-  for (int v = tid; v < PT * width / 16; v += GT) {
-    const int r = v / (width / 16), c = (v % (width / 16)) * 16, tok = t0 + r;
-    *reinterpret_cast<uint4*>(xq + r * pitch + c) = tok < m ? __ldcg(reinterpret_cast<const uint4*>(q + long(tok) * q_ld + k0 + c)) : make_uint4(0, 0, 0, 0);
-  }
-  for (int i = tid; i < PT * (width / 32); i += GT) {
-    const int r = i / (width / 32), grp = i % (width / 32), tok = t0 + r;
-    xs[i] = tok < m ? scales[act_scale(k0 / 32 + grp, tok, m)] : uint8_t(127);
-  }
-}
-
-__device__ __forceinline__ void store_q(const Prologue& a, int tile, int tok, float v0, float v1, int t) {
-  if (tok >= a.in.m) return;
-  const int r = tile * 8 + 2 * t, d = r % HDIM;
-  const long pos = __ldg(a.positions + tok);
-  v0 = bf(v0), v1 = bf(v1);
-  if (d >= HDIM - ROPE) {
-    const float2 cs = rope_cs_freq(a.cos_sin, pos, (d - (HDIM - ROPE)) / 2);
-    const float e = rot_sub(v0, v1, cs), o = rot_add(v1, v0, cs);
-    v0 = e, v1 = o;
-  }
-  if (pos < 0) v0 = v1 = 0.0f;
-  *reinterpret_cast<__nv_bfloat162*>(a.q + long(tok) * WQB_ROWS + r) = __floats2bfloat162_rn(v0, v1);
-}
-
-template <bool KV, int B>
-__device__ __forceinline__ void norm_batch(const Prologue& a, int col, float nw, int t0, int end, int lane) {
-  constexpr int N = KV ? KVW : QR, FIRST = KV ? Q_TILES : 0, TILES = KV ? QKV_TILES - Q_TILES : Q_TILES, PER = cdiv(TILES, 32);
-  const int m = a.in.m;
-  float part[B][PER], v[B];
-#pragma unroll
-  for (int u = 0; u < B; ++u) {
-    const int tok = min(t0 + u, end - 1);
-#pragma unroll
-    for (int i = 0; i < PER; ++i) part[u][i] = lane + i * 32 < TILES ? __ldcg(a.s.qsq + (FIRST + lane + i * 32) * MAXM + tok) : 0.0f;
-    v[u] = __ldcg(a.s.qkv + tok * QKV + (KV ? QR : 0) + col);
-  }
-#pragma unroll
-  for (int u = 0; u < B; ++u) {
-    const int tok = t0 + u;
-    if (tok >= end) break;
-    float total = 0.0f;
-#pragma unroll
-    for (int i = 0; i < PER; ++i) total += part[u][i];
-    const float scale = rsqrtf(warp_sum(total) / N + a.eps);
-    const __nv_bfloat16 y = __float2bfloat16(v[u] * scale * nw);
-    (KV ? a.kv : a.qr)[long(tok) * N + col] = y;
-    if (KV && a.swa) write_swa(a, tok, col, __bfloat162float(y), lane);
-    if (!KV) {
-      const float f = __bfloat162float(y);
-      const int e = quant_exp(warp_max(fabsf(f)), MX_AMAX_FLOOR);
-      a.qr_q[long(tok) * QR + col] = quant_byte(f, e);
-      if (lane == 0) a.qr_s[act_scale(col / 32, tok, m)] = uint8_t(e + 127);
-    }
-  }
-}
-
-template <bool KV>
-__device__ __forceinline__ void norm_tokens(const Prologue& a, int chunk, int t0, int n, int tid) {
-  const int lane = tid & 31, col = chunk * NORM_COLS + tid, end = min(a.in.m, t0 + n);
-  const float nw = __bfloat162float((KV ? a.kv_norm : a.q_norm)[col]);
-  if (n == 1) return norm_batch<KV, 1>(a, col, nw, t0, end, lane);
-#pragma unroll 1
-  for (int b = t0; b < end; b += 4) norm_batch<KV, 4>(a, col, nw, b, end, lane);
-}
-
-#ifndef PRO_MINB
-#define PRO_MINB 1
-#endif
-__global__ void __launch_bounds__(GT, PRO_MINB) prologue_kernel(Prologue a) {
-  extern __shared__ __align__(16) uint8_t raw[];
-  float* fn = reinterpret_cast<float*>(raw);
-  uint8_t* xq = raw;
-  uint8_t* xs = raw + (PRO_FN > PRO_XQ ? PRO_FN : PRO_XQ);
-  __shared__ int last;
-  pdl_launch_dependents();
-  pdl_wait();
-  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3, m = a.in.m;
-  unsigned* pc = a.s.pc;
-  auto wait = [&](int index, unsigned target) {
-    if (tid == 0)
-      while (ld_acquire_gpu(pc + index) < target) {
-      }
-    __syncthreads();
-  };
-  auto signal = [&](int index) {
-    __syncthreads();
-    if (tid == 0) {
-      red_release(pc + index, 1u);
-    }
-  };
-
-  const int slice_jobs = SLICES * cdiv(m, slice_tokens(m)), reduce_jobs = cdiv(m, GW), input_jobs = SLICES * cdiv(m, input_tokens(m)), span = norm_span(m), spans = cdiv(m, span);
-  for (int job = blockIdx.x; job < slice_jobs; job += gridDim.x) {
-    const int s = job % SLICES, tok0 = job / SLICES * slice_tokens(m);
-    if (m <= TILE) attn_slice<1>(a.in, a.s, fn, s, tid, tok0, tok0 + slice_tokens(m));
-    else attn_slice<4>(a.in, a.s, fn, s, tid, tok0, tok0 + slice_tokens(m));
-    signal(P1);
-  }
-  for (int job = blockIdx.x; job < input_jobs; job += gridDim.x) {
-    wait(P1, slice_jobs);
-    const int s = job % SLICES, tok0 = job / SLICES * input_tokens(m);
-    if (m <= TILE) attn_input<2>(a.in, a.s, s, tok0, tid);
-    else attn_input<8>(a.in, a.s, s, tok0, tid);
-    signal(P3);
-  }
-  for (int job = gridDim.x - 1 - blockIdx.x; job < reduce_jobs; job += gridDim.x) {
-    wait(P1, slice_jobs);
-    attn_reduce(a.in, a.s, job * GW + warp, lane);
-  }
-  if (blockIdx.x < QKV_CTAS) {
-    const int ks = blockIdx.x % KSPLIT, tile = (blockIdx.x / KSPLIT) * GW + warp;
-    Rows<HID, KPART / 64, 1> rows;
-    if (tile < QKV_TILES) rows.load(a.wqa, a.wqa_s, tile, ks * (KPART / 64), lane);
-    wait(P3, input_jobs);
-    if (tile < QKV_TILES) rows.ready(lane);
-    for (int t0 = 0; t0 < m; t0 += PT) {
-      stage_mx(xq, KPART + 16, xs, a.s.aq, HID, a.s.as, ks * KPART, KPART, t0, m, tid);
-      __syncthreads();
-      if (tile < QKV_TILES) {
-        float acc[4] = {};
-        rows.accumulate<PT>(xq, KPART + 16, xs, KPART / 32, ks * (KPART / 64), ks * (KPART / 32), lane, acc);
-        float* part = a.s.qkp + (long(ks) * MAXM + t0 + g) * QKV + tile * 8 + 2 * t;
-        *reinterpret_cast<float2*>(part) = make_float2(acc[0], acc[1]);
-        *reinterpret_cast<float2*>(part + 8 * QKV) = make_float2(acc[2], acc[3]);
-      }
-      __syncthreads();
-    }
-    if (tile < QKV_TILES) {
-      __syncwarp();
-      unsigned arrived = 0;
-      if (lane == 0) {
-        __threadfence();
-        arrived = atomicAdd(a.s.tiles + tile, 1u);
-      }
-      if (__shfl_sync(0xffffffffu, arrived, 0) == KSPLIT - 1) {
-        __threadfence();
-        for (int base = 0; base < m; base += TILE) {
-          const int tok = base + g;
-          float v[2] = {};
-#pragma unroll
-          for (int k = 0; k < KSPLIT; ++k) {
-            const float2 p = __ldcg(reinterpret_cast<const float2*>(a.s.qkp + (long(k) * MAXM + tok) * QKV + tile * 8 + 2 * t));
-            v[0] += p.x, v[1] += p.y;
-          }
-          v[0] = bf(v[0]), v[1] = bf(v[1]);
-          if (tok < m) *reinterpret_cast<float2*>(a.s.qkv + tok * QKV + tile * 8 + 2 * t) = make_float2(v[0], v[1]);
-          const float sq = quad_sum(v[0] * v[0] + v[1] * v[1]);
-          if (t == 0 && tok < m) a.s.qsq[tile * MAXM + tok] = sq;
-        }
-        __syncwarp();
-        if (lane == 0) {
-          a.s.tiles[tile] = 0;
-          red_release(pc + (tile < Q_TILES ? P3Q : P3K), 1u);
-        }
-      }
-    }
-  }
-  for (int job = blockIdx.x; job < (Q_CHUNKS + KV_CHUNKS) * spans; job += gridDim.x) {
-    const int chunk = job / spans, t0 = job % spans * span, kv = chunk >= Q_CHUNKS;
-    wait(kv ? P3K : P3Q, kv ? QKV_TILES - Q_TILES : Q_TILES);
-    if (kv) norm_tokens<true>(a, chunk - Q_CHUNKS, t0, span, tid);
-    else norm_tokens<false>(a, chunk, t0, span, tid);
-    if (!kv) signal(P4);
-  }
-  // TP3 port: WQB_CTAS (384 at 24 heads) can exceed the resident grid, so stride over CTA blocks.
-  for (int cb = blockIdx.x; cb < WQB_CTAS; cb += gridDim.x) {
-    const int tile = cb * GW + warp;
-    Rows<QR, QR / 64, 1> rows;
-    rows.load(a.wqb, a.wqb_s, tile, 0, lane);
-    wait(P4, Q_CHUNKS * spans);
-    rows.ready(lane);
-    for (int t0 = 0; t0 < m; t0 += PT) {
-      stage_mx(xq, QR + 16, xs, a.qr_q, QR, a.qr_s, 0, QR, t0, m, tid);
-      __syncthreads();
-      float acc[4] = {};
-      rows.accumulate<PT>(xq, QR + 16, xs, QR / 32, 0, 0, lane, acc);
-      store_q(a, tile, t0 + g, acc[0], acc[1], t);
-      store_q(a, tile, t0 + g + 8, acc[2], acc[3], t);
-      __syncthreads();
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-    __threadfence();
-    last = atomicAdd(pc + PFIN, 1u) == gridDim.x - 1;
-  }
-  __syncthreads();
-  if (last && tid < PCOUNTERS) pc[tid] = 0;
-}
-
 struct Layer {
   Weights w;
   long image_lo;
@@ -2122,6 +1748,7 @@ struct Engine {
   Scratch s;
   int rank;
   int ctas;
+  int attn_per_chunk_flags;  // TP3: one-shot attention exchange posts a flag per chunk (TP3Config.fused_attn_per_chunk)
   std::vector<Layer> layers;
 };
 
@@ -2189,11 +1816,10 @@ int64_t flag_bytes() { return FLAG_BYTES; }
 
 int64_t inbox_bytes() { return 2L * 2 * 2 * PUB_SLOT * sizeof(__nv_bfloat16); }
 
-int64_t act_scale_bytes(int64_t m) { return QR / 128 * act_stride(int(m)); }
-
-int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr) {
+int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, int64_t attn_per_chunk_flags) {
   TORCH_CHECK(buffers.size() == RANKS);
   Engine e{};
+  e.attn_per_chunk_flags = int(attn_per_chunk_flags);
   for (int r = 0; r < RANKS; ++r) {
     e.peers.flags[r] = reinterpret_cast<unsigned*>(buffers[r]);
     e.peers.pub[r] = reinterpret_cast<__nv_bfloat16*>(buffers[r] + FLAG_BYTES);
@@ -2209,7 +1835,6 @@ int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr) {
   e.s.yacc = zeroed<float>(long(MAXM) * HID);
   e.s.yattn = zeroed<__nv_bfloat16>(long(MAXM) * HID);
   e.s.mixp = zeroed<float>(long(SLICES) * MAXM * MIXW);
-  e.s.mixq = zeroed<float>(long(MAXM) * (MIX + 1));
   e.s.xc = zeroed<__nv_bfloat16>(long(MAXM) * HID);
   e.s.xsq = zeroed<float>(long(SLICES) * MAXM);
   e.s.xbf = zeroed<__nv_bfloat16>(long(MAXM) * HID);
@@ -2225,13 +1850,6 @@ int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr) {
   e.s.hq = zeroed<uint8_t>(long(ROUTES) * INTER);
   e.s.hqe = zeroed<uint8_t>(long(ROUTES) * HQ_LD);
   e.s.yracc = zeroed<float>(long(MAXM) * HID);
-  e.s.aq = zeroed<uint8_t>(long(MAXM) * HID);
-  e.s.as = zeroed<uint8_t>(long(SLICES / 4) * 16 * MAXM);
-  e.s.qkp = zeroed<float>(long(KSPLIT) * MAXM * QKV);
-  e.s.qkv = zeroed<float>(long(MAXM) * QKV);
-  e.s.qsq = zeroed<float>(long(QKV_TILES) * MAXM);
-  e.s.tiles = zeroed<unsigned>(QKV_TILES);
-  e.s.pc = zeroed<unsigned>(PCOUNTERS);
   int sms = 0, per = 0;
   TORCH_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, c10::cuda::current_device()) == cudaSuccess);
   opt_in_smem<layer_kernel>(sizeof(Smem));
@@ -2345,8 +1963,7 @@ int64_t add_layer(int64_t handle, torch::Tensor woa, torch::Tensor woa_s, torch:
 }
 
 void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions, std::optional<torch::Tensor> input_ids, torch::Tensor cos_sin, torch::Tensor resid0,
-         torch::Tensor attn_post, torch::Tensor attn_comb, torch::Tensor attn_pre, std::optional<torch::Tensor> attn_scale, std::optional<torch::Tensor> attn_base,
-         torch::Tensor y_ffn, torch::Tensor resid1, torch::Tensor ffn_post, torch::Tensor ffn_comb, torch::Tensor ffn_pre) {
+         torch::Tensor attn_post, torch::Tensor attn_comb, torch::Tensor attn_pre, torch::Tensor y_ffn, torch::Tensor resid1, torch::Tensor ffn_post, torch::Tensor ffn_comb, torch::Tensor ffn_pre) {
   const auto& e = engines.at(handle);
   const auto& l = e.layers.at(layer);
   const int m = int(resid0.size(0));
@@ -2355,7 +1972,6 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   TORCH_CHECK(cos_sin.scalar_type() == at::kFloat && cos_sin.numel() == ROPE / 2, "BRRR tail expects ", ROPE / 2, " fp32 RoPE frequencies");
   const bool ids = l.w.bias_vl && input_ids && input_ids->numel() && input_ids->is_contiguous();
   TORCH_CHECK(!ids || input_ids->scalar_type() == at::kLong || input_ids->scalar_type() == at::kInt);
-  TORCH_CHECK(attn_scale.has_value() == attn_base.has_value());
   // Scratch contract (Flare MHCScratch / decoder Scratch layout, indexed by the kernel as tok * HC, tok * HC * HC,
   // (tok * HC + k) * HID and tok * HID with unit inner strides): residual [m, HC, HID] bf16, post [m, HC] f32,
   // comb [m, HC, HC] f32, pre/attn mix [m, HC] f32, y [m, HID] bf16; capacities may exceed m, the leading rows are used.
@@ -2383,11 +1999,6 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   dense(ffn_pre, "pre1", at::kFloat, {HC});
   TORCH_CHECK(positions.is_contiguous() && positions.numel() >= m, "BRRR tail: positions must hold ", m, " contiguous int64 rows");
   TORCH_CHECK(o.size(0) >= m, "BRRR tail: attention output has ", o.size(0), " rows, needs ", m);
-  if (attn_scale.has_value()) {
-    // mix_finish reads scale[0..3) and base[0..MIX) (hc_attn_scale [3], hc_attn_base [24]).
-    TORCH_CHECK(attn_scale->scalar_type() == at::kFloat && attn_scale->is_contiguous() && attn_scale->numel() == 3, "BRRR tail: attn_scale must be 3 fp32");
-    TORCH_CHECK(attn_base->scalar_type() == at::kFloat && attn_base->is_contiguous() && attn_base->numel() == MIX, "BRRR tail: attn_base must be ", MIX, " fp32");
-  }
   const c10::cuda::CUDAGuard guard(resid0.device());
   Params p{};
   static const bool prof_on = getenv("DS41_FUSED_PROF") && atoi(getenv("DS41_FUSED_PROF"));
@@ -2396,9 +2007,8 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   p.pad = g_pad;
   static const int test_mode = getenv("DS41_FUSED_TEST") ? atoi(getenv("DS41_FUSED_TEST")) : 0;
   p.test = test_mode;
-  // DS41_FUSED_ATTN_PER_CHUNK=0 restores the legacy single attention flag for m < TWO_SHOT_MIN (A/B toggle).
-  static const int attn_per_chunk = getenv("DS41_FUSED_ATTN_PER_CHUNK") ? atoi(getenv("DS41_FUSED_ATTN_PER_CHUNK")) : 1;
-  p.attn_per_chunk_flags = attn_per_chunk;
+  // 0 restores the legacy single attention flag for m < TWO_SHOT_MIN (A/B toggle, TP3Config.fused_attn_per_chunk via create()).
+  p.attn_per_chunk_flags = e.attn_per_chunk_flags;
   p.peers = e.peers;
   p.s = e.s;
   p.w = l.w;
@@ -2415,70 +2025,12 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   p.attn_post = mut<float>(attn_post);
   p.attn_comb = mut<float>(attn_comb);
   p.attn_pre = mut<float>(attn_pre);
-  p.attn_mix = attn_scale.has_value();
-  p.attn_scale = p.attn_mix ? ptr<float>(*attn_scale) : nullptr;
-  p.attn_base = p.attn_mix ? ptr<float>(*attn_base) : nullptr;
   p.y_ffn = mut<__nv_bfloat16>(y_ffn);
   p.resid1 = mut<__nv_bfloat16>(resid1);
   p.ffn_post = mut<float>(ffn_post);
   p.ffn_comb = mut<float>(ffn_comb);
   p.ffn_pre = mut<float>(ffn_pre);
   launch_pdl("layer kernel", layer_kernel, dim3(e.ctas), dim3(THREADS), sizeof(Smem), p);
-}
-
-int prologue_ctas() {
-  static const int ctas = [] {
-    opt_in_smem<prologue_kernel>(PRO_SMEM);
-    int device = 0, sms = 0, per = 0;
-    TORCH_CHECK(cudaGetDevice(&device) == cudaSuccess && cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess);
-    TORCH_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, prologue_kernel, GT, PRO_SMEM) == cudaSuccess && per > 0);
-    TORCH_CHECK(sms * per >= QKV_CTAS, "prologue grid too small");  // TP3: WQB blocks are grid-strided
-    return sms * per;
-  }();
-  return ctas;
-}
-
-void prologue(int64_t handle, torch::Tensor y, torch::Tensor resid, torch::Tensor post, torch::Tensor comb, torch::Tensor pre, torch::Tensor fn, torch::Tensor norm,
-              torch::Tensor wqa, torch::Tensor wqa_s, torch::Tensor q_norm, torch::Tensor kv_norm, double eps, torch::Tensor wqb, torch::Tensor wqb_s,
-              torch::Tensor positions, torch::Tensor cos_sin, torch::Tensor resid_out, torch::Tensor input_out, torch::Tensor qr, torch::Tensor kv,
-              torch::Tensor qr_q, torch::Tensor qr_s, torch::Tensor q, c10::optional<torch::Tensor> swa, int64_t swa_page, c10::optional<torch::Tensor> swa_slots) {
-  const auto& e = engines.at(handle);
-  const int m = int(resid.size(0));
-  TORCH_CHECK(m >= 1 && m <= MAXM && resid.dim() == 3 && resid.size(1) == HC && resid.size(2) == HID && y.size(0) == m && y.size(-1) == HID);
-  TORCH_CHECK(fn.size(0) == MIX && fn.size(1) == HCD && resid_out.sizes() == resid.sizes() && input_out.size(0) == m && input_out.size(1) == HID);
-  TORCH_CHECK(wqa.size(0) == QKV && wqa.size(1) == HID && wqb.size(0) == WQB_ROWS && wqb.size(1) == QR && positions.scalar_type() == at::kLong);
-  // Flare port: cos_sin carries Flare's 32 rotary frequencies, not a [positions, 64] table.
-  TORCH_CHECK(cos_sin.scalar_type() == at::kFloat && cos_sin.numel() == ROPE / 2 && qr.size(1) == QR && kv.size(1) == KVW && q.numel() == long(m) * WQB_ROWS);
-  TORCH_CHECK(qr_s.numel() >= long(act_scale(QR / 32 - 1, m - 1, m)) + 1);
-  const c10::cuda::CUDAGuard guard(resid.device());
-  Prologue a{};
-  a.in = AttnIn{ptr<__nv_bfloat16>(y), ptr<__nv_bfloat16>(resid), ptr<float>(post), ptr<float>(comb), ptr<float>(pre), ptr<float>(fn), ptr<__nv_bfloat16>(norm),
-                mut<__nv_bfloat16>(resid_out), mut<__nv_bfloat16>(input_out), m};
-  a.wqa = ptr<uint8_t>(wqa);
-  a.wqa_s = ptr<uint8_t>(wqa_s);
-  a.q_norm = ptr<__nv_bfloat16>(q_norm);
-  a.kv_norm = ptr<__nv_bfloat16>(kv_norm);
-  a.eps = float(eps);
-  a.qr = mut<__nv_bfloat16>(qr);
-  a.kv = mut<__nv_bfloat16>(kv);
-  a.qr_q = mut<uint8_t>(qr_q);
-  a.qr_s = mut<uint8_t>(qr_s);
-  a.wqb = ptr<uint8_t>(wqb);
-  a.wqb_s = ptr<uint8_t>(wqb_s);
-  a.positions = ptr<long>(positions);
-  a.cos_sin = ptr<float>(cos_sin);
-  a.q = mut<__nv_bfloat16>(q);
-  if (swa.has_value()) {
-    TORCH_CHECK(swa->is_cuda() && swa->scalar_type() == at::kByte && swa->dim() == 2 && swa->stride(1) == 1 && swa->size(1) >= swa_page * SWA_RECORD);
-    TORCH_CHECK(swa_slots->scalar_type() == at::kLong && swa_slots->numel() >= m);
-    a.swa = data_as<uint8_t>(*swa);
-    a.swa_stride = swa->stride(0);
-    a.swa_capacity = swa->size(0) * swa_page;
-    a.swa_slots = ptr<long>(*swa_slots);
-    a.swa_page = int(swa_page);
-  }
-  a.s = e.s;
-  launch_pdl("prologue", prologue_kernel, dim3(prologue_ctas()), dim3(GT), PRO_SMEM, a);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2492,7 +2044,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("OAK") = OAK;
   m.attr("SH2_LD") = SH2_LD;
   m.attr("RP_LAYOUT") = int(RP_LAYOUT);
-  m.attr("KVW") = KVW;
   // Constants contract: Engine.register asserts these against Flare's model config and mHC options.
   m.attr("MIX") = MIX;
   m.attr("TOPK") = TOPK;
@@ -2508,10 +2059,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_pad", &set_pad);
   m.def("csf_expand_all", &csf_expand_all);
   m.def("inbox_bytes", &inbox_bytes);
-  m.def("act_scale_bytes", &act_scale_bytes);
   m.def("alloc_ipc", &alloc_ipc);
   m.def("open_ipc", &open_ipc);
-  m.def("create", &create, py::arg("buffers"), py::arg("rank"), py::arg("epoch_addr") = 0);
+  m.def("create", &create, py::arg("buffers"), py::arg("rank"), py::arg("epoch_addr") = 0, py::arg("attn_per_chunk_flags") = 1);
   m.def("add_layer", &add_layer, py::arg("handle"), py::arg("woa"), py::arg("woa_s"), py::arg("wob"), py::arg("wob_s"), py::arg("gate"), py::arg("gate_b"),
         py::arg("bias_vl"), py::arg("sh13"), py::arg("sh13_s"), py::arg("sh2"), py::arg("sh2_s"), py::arg("w13"), py::arg("s13"), py::arg("w2"), py::arg("s2"),
         py::arg("fn"), py::arg("hc_scale"), py::arg("hc_base"), py::arg("norm"), py::arg("image_lo"), py::arg("csf13_storage") = py::none(),
@@ -2521,5 +2071,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("dense_native") = false, py::arg("route_counts") = py::none(), py::arg("hot_map") = py::none(),
         py::arg("hot_rows") = int64_t(EXPERTS));
   m.def("run", &run);
-  m.def("prologue", &prologue);
 }

@@ -41,8 +41,9 @@ def test_compacted_prefill_feedback_transitions_to_accepted_verification_under_n
     torch.manual_seed(410638)
     prefixes = ("mtp.0.main_proj", "mtp.0.main_norm", *(f"mtp.{i}.attn.{part}"
                 for i in range(3) for part in ("wkv", "kv_norm")))
-    with DeepSeekWeightLoader(inspect_indexed_checkpoint(snapshot), device,
-            shard=TensorParallelShard(0, 4), prefixes=prefixes, dspark=True) as loader:
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
+    with DeepSeekWeightLoader(inspect_indexed_checkpoint(snapshot), device, shard=TensorParallelShard(0, 4),
+            prefixes=prefixes, dspark=True, tp3=TP3Config.from_environment()) as loader:
         config = loader.config
         draft = SimpleNamespace(main_projection=loader.load_linear("mtp.0.main_proj"),
             context_kv=loader.load_linear_group(tuple(f"mtp.{i}.attn.wkv" for i in range(3))),
