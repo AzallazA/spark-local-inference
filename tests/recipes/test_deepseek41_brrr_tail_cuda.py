@@ -34,6 +34,19 @@ choice and its experts / MLP all-reduce rerun.
 mlp_output then differs only by the FP8 (e4m3, 32-group) activation quantization each implementation applies to the
 expert inputs and intermediates: two independent quantizers give ~5% relative norm (cosine ~0.9985), so mlp_output uses
 MLP_TOLERANCE while the mHC outputs keep TOLERANCE. A dropped route, missing rank partial or wrong expert fails both.
+
+Primary check (brrr_tail_reference.py, after NVIDIA's persistent-decoder qualification): every observable kernel output
+is compared elementwise with an FP64 recomputation of its stage from that stage's own inputs, within a per-operator
+bound of gamma(n) FP32 accumulation error (n = reduction length) plus half an ulp of each declared BF16/E4M3 seam
+(the kernel's activation quantizers are emulated in FP64; elements a 32-sigma FP32 error model could move across a
+rounding boundary get one grid step of slack, see brrr_tail_reference.py). ffn_hc.residual is checked from the shared
+inputs (inverse RoPE, WO-A, WO-B, attention all-reduce, residual mix); pre_mix/post/comb from the kernel's residual
+(rtol 2e-5, atol 4e-5); the kernel's routing must equal the FP64 top-6 of its own FFN input except for swaps inside
+the propagated key error bound (such rows are counted and excluded from the mlp_output bound); mlp_output from the
+FP64 routed/shared experts (checkpoint MXFP4 and MXFP8 bytes decoded in FP64) with the kernel's routing and the MLP
+all-reduce. The cosine statistics above remain as the secondary report. After the width sweep one held-out random
+input runs through a freshly constructed PreparedBRRRTail (new scratch, positions and object) under the same bounds.
+The rope negative control fails on the ffn_residual bound.
 """
 
 import inspect
@@ -46,6 +59,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+try:
+    import brrr_tail_reference as reference64  # sibling module; pytest puts tests/recipes on sys.path
+except ImportError:  # pragma: no cover - imported from another working directory
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import brrr_tail_reference as reference64
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                 reason="requires three explicitly assigned CUDA devices")
@@ -327,49 +348,81 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                         rows[r] = route_counts.cpu()
                     return rows
                 session.tune(show_progress=False)
+                # FP64 stage references with per-operator bounds (primary check); weights come from the checkpoint
+                # bytes the kernel's planes were packed from, routing/mHC parameters from Flare's loaded tensors.
+                ref64 = reference64.TailReference(
+                    layer=layer, rank=rank, world=WORLD, group=group, device=device, checkpoint=engine.checkpoint,
+                    text=config.text, frequencies=frequencies, oa=ext.OA, inter=ext.INTER,
+                    gate=weights.experts.router, gate_bias=weights.experts.correction,
+                    fn=weights.residual["hc_ffn_fn"], hc_scale=weights.residual["hc_ffn_scale"],
+                    hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"])
+
+                def kernel_inputs(rows, m):
+                    # Taken before the launches: the stock path rotates its own attended in place, the kernel reads o as is.
+                    return {name: t[:m].clone() for name, t in (
+                        ("attended", rows.attention.attended), ("residual", rows.attention_hc.residual),
+                        ("post", rows.attention_hc.post), ("comb", rows.attention_hc.comb), ("attn_mix", rows.attn_mix))}
+
+                def launch(m, profile, resid_scale, seed, ref_rows, brrr_rows, reference, tail, tail_positions):
+                    p0 = _fill_inputs(ref_rows, m, seed=seed, rank=rank, profile=profile, resid_scale=resid_scale, device=device)
+                    p1 = _fill_inputs(brrr_rows, m, seed=seed, rank=rank, profile=profile, resid_scale=resid_scale, device=device)
+                    assert torch.equal(p0, p1)
+                    positions[:m].copy_(p0)  # the stock reference and the probe read this tensor
+                    tail_positions[:m].copy_(p0)
+                    snapshot = kernel_inputs(brrr_rows, m)
+                    if route_counts is not None:
+                        route_counts.zero_()
+                    torch.cuda.synchronize(device)
+                    reference(positions[:m])
+                    tail(brrr_rows.attention.attended)  # same launch sequence on every rank: the kernel all-reduces internally
+                    torch.cuda.synchronize(device)
+                    dist.barrier(group=group)
+                    routes = reference.route_report()
+                    kernel_rows = None
+                    if route_counts is not None:
+                        launch_counts = route_counts.clone()
+                        kernel_rows = kernel_routing(snapshot, p0, m)
+                        routes.update(reference.reconcile(kernel_rows, launch_counts))
+                    got, want = _outputs(brrr_rows, m), _outputs(ref_rows, m)
+                    stats = {name: _stats(got[name], want[name]) for name in COMPARED}
+                    # Collective (two FP64 all-reduces): every rank evaluates every launch.
+                    bounds = ref64.evaluate(inputs={**snapshot, "positions": p0}, outputs=got, kernel_rows=kernel_rows)
+                    bad = [f"bound:{name}" for name, report in bounds.items() if not report["ok"]]
+                    bad += [name for name, st in stats.items() if not st["finite"]
+                            or st["cosine"] < (MLP_TOLERANCE if name == "mlp_output" else TOLERANCE)
+                            or (name == "mlp_output" and st["row_min_cosine"] < MLP_ROW_TOLERANCE)]
+                    if "routing_error" in routes:
+                        bad.append("routing")
+                    reports.append((m, profile, routes, bounds, stats, bad))
+                    if rank == 0:
+                        line = " ".join(f"{name}: cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f} "
+                                        f"maxrel={st['max_rel']:.3e} maxabs={st['max_abs']:.3e}" for name, st in stats.items())
+                        print(f"[brrr-tail] layer {layer} m={m} {profile}: {routes} | bounds: {reference64.summarize(bounds)} | {line}"
+                              + (f" | FAIL {bad}" if bad else ""), flush=True)
+                    if bad:
+                        details = {name: stats[name] for name in bad if name in stats}
+                        details.update({name: bounds[name.removeprefix("bound:")] for name in bad if name.startswith("bound:")})
+                        if "routing_error" in routes:
+                            details["routing"] = routes["routing_error"]
+                        failures.append((rank, m, profile, bad, details))
+                    if profile == "uniform" and m > 16:
+                        assert routes["max_routes_per_expert"] == m > 16, routes  # > one 16-route chunk per expert
+                    if parked and profile == "random" and m == capacity:
+                        assert routes["cold_routes"] > 0, f"no cold route hit with hot_rows={weights.experts.hot_rows}: {routes}"
+
                 seed = 1000 * layer
                 for m in rows_sweep:
                     ref_rows, brrr_rows, reference, tail = paths[m]
                     for profile, resid_scale in PROFILES:
                         seed += 1
-                        p0 = _fill_inputs(ref_rows, m, seed=seed, rank=rank, profile=profile, resid_scale=resid_scale, device=device)
-                        p1 = _fill_inputs(brrr_rows, m, seed=seed, rank=rank, profile=profile, resid_scale=resid_scale, device=device)
-                        assert torch.equal(p0, p1)
-                        positions[:m].copy_(p0)
-                        if route_counts is not None:
-                            route_counts.zero_()
-                            snapshot = {name: t[:m].clone() for name, t in (
-                                ("attended", brrr_rows.attention.attended), ("residual", brrr_rows.attention_hc.residual),
-                                ("post", brrr_rows.attention_hc.post), ("comb", brrr_rows.attention_hc.comb), ("attn_mix", brrr_rows.attn_mix))}
-                        torch.cuda.synchronize(device)
-                        reference(positions[:m])
-                        tail(brrr_rows.attention.attended)  # same launch sequence on every rank: the kernel all-reduces internally
-                        torch.cuda.synchronize(device)
-                        dist.barrier(group=group)
-                        routes = reference.route_report()
-                        if route_counts is not None:
-                            launch_counts = route_counts.clone()
-                            routes.update(reference.reconcile(kernel_routing(snapshot, p0, m), launch_counts))
-                        got, want = _outputs(brrr_rows, m), _outputs(ref_rows, m)
-                        stats = {name: _stats(got[name], want[name]) for name in COMPARED}
-                        bad = [name for name, st in stats.items() if not st["finite"]
-                               or st["cosine"] < (MLP_TOLERANCE if name == "mlp_output" else TOLERANCE)
-                               or (name == "mlp_output" and st["row_min_cosine"] < MLP_ROW_TOLERANCE)]
-                        if "routing_error" in routes:
-                            bad.append("routing")
-                        reports.append((m, profile, routes, stats, bad))
-                        if rank == 0:
-                            line = " ".join(f"{name}: cos={st['cosine']:.6f} rowmin={st['row_min_cosine']:.6f} "
-                                            f"maxrel={st['max_rel']:.3e} maxabs={st['max_abs']:.3e}" for name, st in stats.items())
-                            print(f"[brrr-tail] layer {layer} m={m} {profile}: {routes} | {line}"
-                                  + (f" | FAIL {bad}" if bad else ""), flush=True)
-                        if bad:
-                            failures.append((rank, m, profile, bad, {name: stats[name] for name in bad if name in stats}
-                                             | ({"routing": routes["routing_error"]} if "routing_error" in routes else {})))
-                        if profile == "uniform" and m > 16:
-                            assert routes["max_routes_per_expert"] == m > 16, routes  # > one 16-route chunk per expert
-                        if parked and profile == "random" and m == capacity:
-                            assert routes["cold_routes"] > 0, f"no cold route hit with hot_rows={weights.experts.hot_rows}: {routes}"
+                        launch(m, profile, resid_scale, seed, ref_rows, brrr_rows, reference, tail, positions)
+                # Held-out input on a fresh tail: new scratch, new positions tensor and a newly constructed
+                # PreparedBRRRTail (fresh extension call with buffers the sweep never used), same bounds.
+                heldout_rows = Scratch.allocate(capacity, capacity, WORLD, device).rows(capacity, capacity)
+                heldout_positions = torch.zeros((capacity,), dtype=torch.int64, device=device)
+                heldout = PreparedBRRRTail(layer, weights, heldout_rows, heldout_positions[:capacity], frequencies, **tail_kwargs)
+                ref_rows, _, reference, _ = paths[capacity]
+                launch(capacity, "heldout", 1.0, 1000 * layer + 999, ref_rows, heldout_rows, reference, heldout, heldout_positions)
                 dist.barrier(group=group)
                 gathered = [None] * WORLD
                 dist.all_gather_object(gathered, failures, group=group)

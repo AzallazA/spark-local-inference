@@ -282,8 +282,12 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 2. **Single runs decide nothing.** Run-to-run spread is 2-3% at c1 and c8 and more in coding. *Incident:* the
    route-reuse quick bench showed c1 +4.7%; three user runs showed level. The first settings sweep crowned alpha 1.0 /
    throughput on one lucky run because the ranking mixed single runs with multi-run averages.
-3. **Judge by tok/s, not steps/s, when speculation widths can change.** A row cap or BRRR gate shifts tokens per
-   step. *Incident:* BRRR at c8 showed higher steps/s but lower tok/s.
+3. **Judge by tok/s, but read steps/s and tokens/step next to it.** A row cap or BRRR gate shifts tokens per step,
+   so steps/s alone overstates a change (*incident:* BRRR at c8 showed higher steps/s but lower tok/s). The converse
+   also happens: tok/s moves while steps/s does not, which means draft acceptance (sampling at temperature 1) moved,
+   not the build (*incident, 11-08:* the config-object package looked 1.5% slower at c8 over 4 rounds at equal or
+   higher steps/s; tok/step 15.8-16.8 vs 16.3-17.7 explained all of it). Chain logs print both via
+   `tp3-tools/bench_cell.py`; `tp3-tools/bench_steps.py` gives the full per-cell table.
 4. **Know the confounders before reading a KV or speed number:** power and offsets; `BUDGET` 24 vs 128 (the cap
    drops 13 speculative graphs, ~76 MiB/rank: 2,373,760 KV at 128 vs 2,461,184 at 24 for the same package);
    `--prefix-cache-memory` (32G costs ~10 MiB device headroom); whether the bench respects EOS. *Incident:* three
