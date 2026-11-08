@@ -9,12 +9,61 @@ targets, store the same tables as packed MXFP4 E2M1 nibbles (128 bytes per row,
 same scales). Upstream Flare cannot load those tables. The packed form halves
 host RAM per table (31.5 GiB to 16.2 GiB per rank per layer measured in the
 fork at TP3) and lets both tables stay RAM-resident on 192 to 256 GB hosts.
-Fork measurement (TP3, GB202, `flare run`): decode 79.5 to 84.4 steps/s at 32k
-context, concurrency 1, with both tables in RAM instead of one on disk;
-WikiText perplexity +2.6 %, code perplexity unchanged, the fork's 43-item
-answer check 43/43. The tables are lossy (about 12 % relative RMS against FP8).
+Fork measurement (TP3, GB202): decode 79.5 to 84.4 steps/s at 32k context,
+concurrency 1, with both tables in RAM instead of one on disk; WikiText
+perplexity +2.6 %, code perplexity unchanged, the fork's 43-item answer check
+43/43 (details in the next section). The tables are lossy (about 12 % relative RMS against FP8).
 
-## What the fork does today (6f9fcba)
+## Quality evidence (fork measurements, 2026-11-05 to 11-08)
+
+Full write-up with method and raw numbers: `docs/tp3/ENGRAM-PRECISION.md`; tooling in `tp3-tools/engram-eval/`.
+The comparison baseline is the engine's own run-to-run noise: vLLM on this stack is not bit-reproducible (fused
+kernels reduce with float atomics), so FP8 was run twice and MXFP4 is judged against that floor.
+
+**Teacher-forced next-token distributions**, same engine and day, only the tables changed (197 fixed 1,024-token
+passages, 201,531 scored positions, top-20 logprobs at every position, KL over the reference top-20 plus a residual
+bucket):
+
+| | FP8 vs FP8 (noise floor) | FP8 vs MXFP4 |
+| --- | --- | --- |
+| Encyclopedia text (117 WikiText-103 articles): top-1 agreement | 95.5 % | 93.8 % |
+| Encyclopedia text: mean KL (nats/token) | 0.024 | 0.055 |
+| Encyclopedia text: perplexity | 2.735 to 2.737 (+0.07 %) | 2.735 to 2.805 (+2.6 %) |
+| Code (80 source files): top-1 agreement | 96.7 % | 96.2 % |
+| Code: mean KL | 0.010 | 0.013 |
+| Code: perplexity | +0.05 % | -0.2 % |
+
+The loss concentrates in encyclopedic prose, where the n-gram tables carry the most signal; code is at the noise
+floor.
+
+**Benchmarks**, greedy, thinking off (vLLM): TriviaQA 1,000 questions exact/contains FP8 836/881 and 844/886 (two
+runs) vs MXFP4 838/882; MMLU-Pro 1,000 questions FP8 774 and 774 vs MXFP4 768. Question-level churn between the two
+FP8 runs (26 flips each way on MMLU-Pro) is as large as the FP8-vs-MXFP4 churn (33 vs 27), so both gaps sit inside
+the engine's own noise.
+
+**Table-level checks**: value error of NVIDIA's MXFP4 tables against the FP8 tables, relative RMS 0.120 (first 262K
+rows of layer 1); our own round-to-nearest conversion of the FP8 tables reproduces NVIDIA's block scales on 100 % of
+blocks and 89 % of packed bytes (the rest are rounding ties); the packed-FP4 lookup kernel is bit-exact against a
+reference decode on real rows.
+
+**Whole-model qualification on the MXFP4 tables** (Flare TP3 releases 20261105 and 20261107, sampling at
+temperature 1): 43-question eval 43/43 (FP8 on vLLM: 41-42/43); LiveBench coding 82.9 and 82.2 against 81.3 for the
+single FP8 run and 81.5-84.2 across seven MXFP4 vLLM runs, i.e. no difference beyond run-to-run spread; hotel-lights
+and lavd 30/30 at c8; long retrieval at 128K and 900K pass; long generation after a 581K-token conversation 4/4 with
+worst 8-gram repeat 0.0011 (FP8: 0.0005); tool calls 60/60; vision 60/60 and 59/60 on the two image sets. Greedy
+open-ended generations diverge from FP8 after the first token whose probability shifts, the expected fingerprint of
+a lossy table; in every check we read, the content stayed equivalent.
+
+**What this buys**: both tables (97 GiB) RAM-resident on a 256 GB host instead of 189 GiB for FP8. On vLLM at TP3 that
+was +6 % decode (one table no longer read from disk); on Flare it is the difference between both tables in RAM with
+~100 GiB free and either ~14 GiB free or one table on disk (9 % slower decode, the other table loses the page cache).
+It also answers the disk-mode first-touch prefill complaint in upstream issue 78.
+
+**Not yet measured** (candidates for the PR's evidence section if maintainers ask): a greedy FP8-vs-MXFP4 A/B on
+Flare itself (Flare samples at temperature 1), a larger prose perplexity set, and the per-layer contribution (layer 1
+vs layer 14 tables) to the +2.6 %.
+
+## What the fork does today (`ds41-tp3-v3`, 2026-11-08; line numbers as of that tip)
 
 - Protobuf: `EngramTable.Encoding.MXFP4_E2M1_E8M0 = 3` in
   `helios/proto/package.proto:253` and `helios/proto/runtime_package.proto:533`.
