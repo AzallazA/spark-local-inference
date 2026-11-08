@@ -119,7 +119,7 @@ Traces: `nsys profile` on the serving process at c1 and c8 (existing captures `s
 | Upstream Flare | `origin` = https://github.com/NVIDIA/flare-local-inference (read-only for us) | source of truth; our branch `ds41-tp3-v3` sits on top of it (merge-base 972e28e4 as of 2026-11-08; upstream main has moved on, see B.5) |
 | Local Gitea (private view) | remote `gitea` = http://192.168.0.8:3000/azallaza/flare-tp3-fork (LAN) or http://localhost:3000; repo `azallaza/rtx-recipes` for the release folder | browse commits, diffs and Markdown; push every commit here (`git push gitea <branch>`); experiment branches welcome (`stage2-wide-rows`, `vision-staging`, `config-object`, `upstream-main`); login `azallaza`; container `gitea`, data `~/gitea` |
 | Public release (GitHub) | https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes (`origin` of `~/rtx-recipes`); private staging copy `RTX-PRO-6000-TP3-Inference-Recipes-staging` (`staging` remote, branch `proposals` holds the proposal drafts) | user-facing release folders (docs, export/serve scripts, source.patch, qualification results); push only with the user's explicit OK, after the hygiene grep (D.4.1) |
-| Public fork (GitHub, planned) | a real fork of NVIDIA/flare-local-inference under AzallazA, created when the user says the tree is ready | reviewed branches and release tags only; upstream PRs for `docs/upstream-proposals` open from it; GitHub cannot make a fork private, hence Gitea for the private view |
+| Public fork (GitHub) | remote `public` = https://github.com/AzallazA/spark-local-inference (fork of NVIDIA/spark-local-inference, the renamed flare-local-inference; default branch `ds41-tp3-v3`) | reviewed main line and release tags only (`flare-tp3-YYYYMMDD`, each with a GitHub Release note); push with the user's explicit OK; upstream PRs for `docs/upstream-proposals` open from it; GitHub cannot make a fork private, hence Gitea for the private view |
 
 The fork tree is kept publication-clean at all times: no experiment scripts at the root (they live outside the repo, e.g.
 `~/ds41-tp3/fork-archive` and the untracked `serve-best.sh`), no `/home/<user>` paths, no hostnames. `git grep -n
@@ -197,7 +197,16 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 3. Fix, rebuild (`cargo build --release` for Helios, re-export for recipe/kernel changes), re-run `verify_fix`.
 4. Record verdicts (fixed / no change needed / tabled) in the commit message.
 
-### B.5 Sync from upstream (deliberate, never automatic)
+### B.5 Publishing a release
+
+1. Validate the state (B.1/B.2), commit on `ds41-tp3-v3`, push to Gitea.
+2. Tag it `flare-tp3-YYYYMMDD` (annotated: settings and measurements in the message), push branch and tag to `public`,
+   and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
+3. Regenerate the recipes folder's `source.patch` from the tag (`git diff --binary 972e28e44 <tag>`), verify it on a
+   clean upstream worktree (tree-identical), update the folder docs to cite the tag, run the hygiene grep, commit, push
+   `origin` (GitHub) and `gitea`. The folder and the tag must always agree.
+
+### B.6 Sync from upstream (deliberate, never automatic)
 
 1. `git fetch origin` and read `git log --oneline <merge-base>..origin/main` for anything that touches the DeepSeek
    recipe, Helios memory/Engram/package loading, b12x pins or the CLI. Note it in the status report.
