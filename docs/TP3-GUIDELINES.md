@@ -334,6 +334,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 7. **vLLM prompt logprobs one request at a time**; MMLU-style evals need 2,048 output tokens (20% of replies reason
    first; 207 answers were unparsed with an 8-token cap).
 8. **No `flare models gc` during an export.**
+12. **`/tmp` is a 126 GB tmpfs: it is RAM.** Never point a large or long-running log, download, clone or checkpoint
+    at `/tmp`; use `~/ds41-tp3/` or `/m2-2/`. `aria2c --log` writes at debug level unless `--log-level=warn` is given.
+    *Incident (11-08):* a 30 GB aria2c debug log in `/tmp` starved the vLLM TP3 image of pinned host RAM (driver
+    "out of memory" while pinning the Engram tables, kernel OOM kills, a restart loop) during the .11/.12 check.
 11. **Exports from a worktree must put the worktree first on the import path.** The shared venv's `ignition` console
     script imports the editable install, which points at `~/flare-up-v3`, whatever the current directory is; pytest
     imports from the cwd, so tests look right while exports silently build the main checkout's code. Run
