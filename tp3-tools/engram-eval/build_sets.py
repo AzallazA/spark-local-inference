@@ -40,7 +40,7 @@ for text in articles:
     if sum(p["kind"] == "wiki" for p in passages) == 120:
         break
 
-code_files = sorted(p for root in ("/home/USER/flare-up-v3/ignition", "/home/USER/flare-up-v3/helios/src")
+code_files = sorted(p for root in (str(REPO / "ignition"), str(REPO / "helios" / "src"))
                     for p in Path(root).rglob("*") if p.suffix in (".py", ".rs") and p.stat().st_size > 8000)
 rng.shuffle(code_files)
 for path in code_files:
