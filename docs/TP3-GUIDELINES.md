@@ -341,6 +341,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     package id. *Incident (11-08):* the "stage 2" and "vision staging" packages were stage 1 and plain v3; a
     "compiled cache hit" for a graph that should have changed and a missing progress line were the tells.
 9. **Scripts that are running must not be edited in place**; copy to a new name (`sweep2.sh`) and start that.
+   **Never switch branches in a repository a script is running from**: `git checkout` of a branch that lacks the
+   folder deletes and recreates it, the running process keeps a dead cwd, and every relative path fails from then on.
+   Use a worktree per branch (`~/rtx-recipes-proposals` for `proposals`). *Incident (11-08):* a qualification run lost
+   hotel-lights, retrieval, long generation and stress to a branch switch made to update a proposal file.
 10. **Qualification tooling quirks**: `long_context.py` asserted power ≤ 400 W (now 600) and refused existing output
     dirs; LiveBench needs `--livebench-release-option 2024-11-25`; docker engine crashes restart the container, so
     re-check which model is up after an OOM.
