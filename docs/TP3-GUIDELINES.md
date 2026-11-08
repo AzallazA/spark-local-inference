@@ -224,6 +224,20 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    corruptions), one alternating A/B round vs the current default. Then commit, push to Gitea, and only then update
    the release folder (`source.patch` is regenerated from the new base).
 
+### B.7 Upstream watch (what NVIDIA's branches hold for us, 2026-11-08)
+
+- `astra/ds41-brrr-poc` (10-28, research-only): NVIDIA's own fused layer tail, same stage range as ours, kernel in
+  FlashInfer's experimental tree, TP4 all-resident with native scales, selected per layer by a race against the stock
+  path after FP64 per-operator bound checks and a held-out input; the stock path won at the one 8-row graph they tried,
+  the whole-model export never finished, no tok/s. Our port is further along (BRRR-40 c1 +6.5%, c4 +2.2%, gated parked
+  layers at c8). Borrowed: FP64 bounds + held-out check for our layer test; native-replay fixtures are a candidate. A
+  contribution of ours would have to live in that shape: kernel in FlashInfer, a Flare component with a CLI flag in the
+  signed rebuild manifest, and a per-layer race it must win.
+- `fix/vocabulary-parallel-top-p`, `astra/startup-weight-storage-upstream-20261104`: already in our base in merged
+  form (the explicit top_p range our bootstrap adds to the server config is now redundant; proposal 03 can drop it).
+- `fix/checkpoint-gds-capability-probe`: forces the bounce read mode this host already uses; arrives with the next sync.
+- Everything else (GLM, Windows, RoCE, multi-host, scheduler) does not touch our path.
+
 ---
 
 ## C. Tips for agents
