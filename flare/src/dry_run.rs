@@ -66,8 +66,8 @@ pub fn render(plan: &MemoryPlan, default_free: bool) -> String {
     if default_free {
         let _ = writeln!(
             out,
-            "Assumed free memory per GPU: total minus {} for the CUDA context, driver, and display; \
-             --dry-run-free-memory overrides it.",
+            "Assumed free memory per GPU: the CUDA driver's device total minus {} for the CUDA \
+             context, driver, and display; --dry-run-free-memory overrides it.",
             bytes(IDLE_DEVICE_RESERVE_BYTES)
         );
     } else {
@@ -260,8 +260,10 @@ mod tests {
             memory_limit: Some(MemoryLimit::Reserve(1 << 30)),
         };
         let report = render(&plan, true);
-        assert!(report.contains("Assumed free memory per GPU: total minus 1.12 GiB"));
-        assert!(report.contains("GPU 2 · 96.00 GiB total · 94.88 GiB assumed free"));
+        assert!(report.contains(
+            "Assumed free memory per GPU: the CUDA driver's device total minus 606.0 MiB"
+        ));
+        assert!(report.contains("GPU 2 · 96.00 GiB total · 95.41 GiB assumed free"));
         assert!(report.contains("estimate: 6,138 modules, 91,448 graph nodes"));
         assert!(report.contains("cache planned (49 execution rows + 19,228 KV pages)"));
         assert!(report.contains(
@@ -274,6 +276,6 @@ mod tests {
         assert!(report.contains("prepared image inputs"));
         let explicit = render(&plan, false);
         assert!(explicit.contains("Assumed free memory per GPU: --dry-run-free-memory."));
-        assert!(!explicit.contains("total minus"));
+        assert!(!explicit.contains("device total minus"));
     }
 }

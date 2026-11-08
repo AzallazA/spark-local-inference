@@ -762,7 +762,7 @@ pub struct Run {
     pub dry_run: bool,
 
     /// Free GPU memory the dry run assumes before loading: one size for every GPU or one per
-    /// selected GPU [default: each GPU's total memory minus 1152 MiB].
+    /// selected GPU [default: each GPU's CUDA driver total minus 606 MiB].
     #[arg(
         long,
         value_name = "SIZE[,SIZE...]",

@@ -652,7 +652,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
 | `--dry-run` | Print the memory plan and KV capacity this configuration would get on the selected GPUs, then exit without a CUDA context, GPU allocations, or weight reads | off |
-| `--dry-run-free-memory SIZE[,SIZE...]` | Free GPU memory the dry run assumes before loading, one size for every GPU or one per selected GPU; requires `--dry-run` | Each GPU's total memory minus 1152 MiB |
+| `--dry-run-free-memory SIZE[,SIZE...]` | Free GPU memory the dry run assumes before loading, one size for every GPU or one per selected GPU; requires `--dry-run` | Each GPU's CUDA driver total minus 606 MiB |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; package defaults apply unless overridden |
@@ -791,14 +791,17 @@ and pool registration at startup.
 
 The plan follows the loader's arithmetic, per rank:
 
-1. Free memory before loading is assumed, not observed: each GPU's total minus
-   1152 MiB for the CUDA context, driver bookkeeping, and the display.
-   `--dry-run-free-memory` replaces the assumption with explicit sizes, one for
-   every GPU or one per selected GPU in `--gpus` order.
+1. Free memory before loading is assumed, not observed: the device total the
+   CUDA driver reports (`cuDeviceTotalMem`) minus 606 MiB for the CUDA context,
+   driver bookkeeping, and the display. The driver total already excludes the
+   memory `nvidia-smi` lists as reserved; on a 97,887 MiB RTX PRO 6000
+   Blackwell it is 97,340.875 MiB. `--dry-run-free-memory` replaces the
+   assumption with explicit sizes, one for every GPU or one per selected GPU in
+   `--gpus` order.
 2. Fixed device allocations are subtracted exactly: weights, execution state,
    scratch, and the device prefix of each mixed device/host expert bank.
 3. Driver memory for the selected kernels and graphs is estimated as a per-rank
-   base of 136 MiB, the stored module images plus 11,776 bytes per module, the
+   base of 135.875 MiB, the stored module images plus 11,776 bytes per module, the
    module globals, and 3,584 bytes per graph node, counted after the serving
    flags select graphs and prune unused kernels. These constants were
    calibrated on five recorded loads of DeepSeek-V4.1-Flash tensor-parallel-3
@@ -824,9 +827,9 @@ image input window.
 
 Accuracy: items 2, 4, 5, and 6 are exact for the package and flags given. Item 1
 and the kernel and graph estimate of item 3 are the residual. The calibration
-loads showed 1.10 to 1.13 GiB unavailable across ranks before loading; the
-assumption uses the larger value, so the plan reproduces the capacity the most
-constrained rank imposes. On the calibration hosts the planned KV token count
+loads showed 576 to 606 MiB of the driver total unavailable across ranks
+before loading; the assumption uses the larger value, so the plan reproduces
+the capacity the most constrained rank imposes. On the calibration hosts the planned KV token count
 matched the recorded one exactly for a 32 GiB and a 16 GiB prefix cache at
 verification budgets 24 and 128 (2,461,184 and 2,373,760 tokens). A package
 whose kernels differ substantially from those loads, another GPU model, or a

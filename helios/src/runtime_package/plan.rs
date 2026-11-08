@@ -21,14 +21,17 @@ use super::{
 use crate::{Result, startup::StartupProgress};
 
 /// Device memory assumed unavailable to Flare on an otherwise idle GPU before loading: the CUDA
-/// context, driver bookkeeping, and the display. The dry run subtracts it from the device total
-/// unless the caller supplies the free memory. Calibrated with the constants below.
-pub const IDLE_DEVICE_RESERVE_BYTES: u64 = 1152 << 20;
+/// context, driver bookkeeping, and the display, measured against the device total the CUDA
+/// driver reports (`cuDeviceTotalMem`). That total already excludes the memory `nvidia-smi` lists
+/// as reserved (547 MiB on a 97,887 MiB RTX PRO 6000 Blackwell, whose driver total is 97,340.875
+/// MiB). The dry run subtracts this reserve from the driver total unless the caller supplies the
+/// free memory. Calibrated with the constants below.
+pub const IDLE_DEVICE_RESERVE_BYTES: u64 = 606 << 20;
 
 /// Device memory one rank's load takes beyond its fixed allocations and the per-module and
 /// per-node terms: streams, events, graph executables, and page tables of the reserved virtual
-/// ranges.
-const RUNTIME_BASE_BYTES: u64 = 136 << 20;
+/// ranges. 135.875 MiB.
+const RUNTIME_BASE_BYTES: u64 = 139_136 << 10;
 
 /// Device memory the driver takes per loaded module beyond its stored image: function
 /// descriptors, constant banks, and allocation granularity.
@@ -39,13 +42,14 @@ const MODULE_OVERHEAD_BYTES: u64 = 11776;
 const GRAPH_NODE_BYTES: u64 = 3584;
 
 // Calibration of the three constants above and of IDLE_DEVICE_RESERVE_BYTES: five recorded loads
-// of DeepSeek-V4.1-Flash tensor-parallel-3 packages on three RTX PRO 6000 Blackwell GPUs (97,887
-// MiB each), two complete packages with 6,138 or 7,026 selected modules and 91,448 or 109,408
-// graph nodes and two truncated test packages with 5,663 or 6,911 modules and 38,587 or 45,928
-// nodes. Each load's "Allocate cache" line fixes the limiting rank's cache budget to within one
-// page step (8 MiB for the complete packages, 2 MiB for the truncated ones); the constants place
-// every planned budget inside its recorded step. The split between the idle reserve and the
-// per-rank base is not observable separately; only their sum, 1,288 MiB, is measured.
+// of DeepSeek-V4.1-Flash tensor-parallel-3 packages on three RTX PRO 6000 Blackwell GPUs (driver
+// total 102,069,305,344 bytes each), two complete packages with 6,138 or 7,026 selected modules
+// and 91,448 or 109,408 graph nodes and two truncated test packages with 5,663 or 6,911 modules
+// and 38,587 or 45,928 nodes. Each load's "Allocate cache" line fixes the limiting rank's cache
+// budget to within one page step (8 MiB for the complete packages, 2 MiB for the truncated
+// ones); the constants place every planned budget inside its recorded step. The split between
+// the idle reserve and the per-rank base is not observable separately; only their sum,
+// 741.875 MiB below the driver total, is measured.
 
 /// Assumed state of one selected GPU before loading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -760,7 +764,8 @@ mod tests {
     /// the "Allocate cache" line of its serve log: the default DeepSeek-V4.1-Flash
     /// tensor-parallel-3 package (`serve-best.log`, `serve-v3-2x.log`, `serve-prefix.log` in the
     /// repository root) and two truncated test packages (`serve-mini-v3m8.log`,
-    /// `serve-mini-v3m8fused.log`). The three GPUs are RTX PRO 6000 Blackwell with 97,887 MiB each.
+    /// `serve-mini-v3m8fused.log`). The three GPUs are RTX PRO 6000 Blackwell with a driver total of
+    /// 102,069,305,344 bytes each.
     /// Absent packages or an absent development publisher profile skip the case or the test.
     #[test]
     fn actual_dry_run_reproduces_recorded_kv_capacities() {
@@ -774,10 +779,17 @@ mod tests {
         };
         let publishers: Vec<super::super::Publisher> =
             serde_json::from_slice(&std::fs::read(profile).unwrap()).unwrap();
-        let total = 97887u64 << 20;
-        let devices: Vec<_> = (0..3)
-            .map(|label| PlannedDevice {
-                label,
+        // The CLI reads each device's total through the CUDA driver; without a usable driver the
+        // test assumes the calibration hosts' driver total, which nvidia-smi shows as 97,887 MiB.
+        let totals = device_total_memory(&[0, 1, 2]).unwrap_or_else(|error| {
+            eprintln!("assuming the calibration hosts' device total: {error}");
+            vec![102_069_305_344; 3]
+        });
+        let devices: Vec<_> = totals
+            .iter()
+            .enumerate()
+            .map(|(label, &total)| PlannedDevice {
+                label: label as i32,
                 total_bytes: total,
                 free_bytes: total - IDLE_DEVICE_RESERVE_BYTES,
             })
