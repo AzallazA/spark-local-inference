@@ -355,6 +355,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    folder deletes and recreates it, the running process keeps a dead cwd, and every relative path fails from then on.
    Use a worktree per branch (`~/rtx-recipes-proposals` for `proposals`). *Incident (11-08):* a qualification run lost
    hotel-lights, retrieval, long generation and stress to a branch switch made to update a proposal file.
+   **A chain's "wait for empty GPUs" loop only knows the processes it stops.** If a manual test leaves a container or
+   server on the GPUs, the chain waits forever with no log line (`sleep 2` child, no output). Before launching a chain,
+   check `nvidia-smi` and `docker ps`; never run a chain's steps by hand while another chain is queued on the GPUs.
 10. **Qualification tooling quirks**: `long_context.py` asserted power ≤ 400 W (now 600) and refused existing output
     dirs; LiveBench needs `--livebench-release-option 2024-11-25`; docker engine crashes restart the container, so
     re-check which model is up after an OOM.
