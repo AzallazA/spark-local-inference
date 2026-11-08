@@ -30,7 +30,7 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; default `...202611070243`; each non-default package is ~4 GB on disk (shared blobs) |
 | Server scripts | `~/flare-up-v3/serve-best.sh` (defaults: pkg 070243, K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=balanced), restart via `/tmp/restart-default.sh` |
 | Release folder (public) | `~/rtx-recipes/DeepSeek-V4.1-Flash Flare-tp3-20261107/` (README, EXPORT, MEASUREMENTS, ENGRAM-PRECISION, export.sh, serve.sh, source.patch, qualification/) |
-| Upstream proposals (private) | `docs/upstream-proposals/` on the Gitea-only branch `upstream-proposals` (kept off the public fork); mirrored on the `proposals` branch of the private staging repo |
+| Upstream proposals | `docs/upstream-proposals/` in the fork (public with the branch, not submitted upstream); mirrored on the `proposals` branch of the private staging repo |
 | Scratch / logs / older vLLM-era work | `~/ds41-tp3/` (bench logs, eval_*.json, analyze_trace.py, compose files); `~/engram-eval/` (FP8 vs MXFP4 Engram perplexity eval) |
 | Archive of old builds | `/mnt/ai_a` (AI_A), cold storage `/mnt/ai_b` |
 
@@ -124,9 +124,9 @@ Traces: `nsys profile` on the serving process at c1 and c8 (existing captures `s
 | Repository | Where | Purpose and rules |
 | --- | --- | --- |
 | Upstream Flare | `origin` = https://github.com/NVIDIA/flare-local-inference (read-only for us) | source of truth; our branch `ds41-tp3-v3` sits on top of it (merge-base 972e28e4 as of 2026-11-08; upstream main has moved on, see B.5) |
-| Local Gitea (private view) | remote `gitea` on the LAN (address, login and password location: agent memory note `gitea-local`); repos `flare-tp3-fork` and `rtx-recipes` | browse commits, diffs and Markdown; push every commit here (`git push gitea <branch>`); experiment branches welcome (`stage2-wide-rows`, `vision-staging`, `config-object`, `upstream-main`); `upstream-proposals` holds the proposal drafts; container `gitea` |
+| Local Gitea (private view) | remote `gitea` on the LAN (address, login and password location: agent memory note `gitea-local`); repos `flare-tp3-fork` and `rtx-recipes` | browse commits, diffs and Markdown; push every commit here (`git push gitea <branch>`); experiment branches welcome (`stage2-wide-rows`, `vision-staging`, `config-object`, `upstream-main`); container `gitea` |
 | Public release (GitHub) | https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes (`origin` of `~/rtx-recipes`); private staging copy `RTX-PRO-6000-TP3-Inference-Recipes-staging` (`staging` remote, branch `proposals` holds the proposal drafts) | user-facing release folders (docs, export/serve scripts, source.patch, qualification results); push only with the user's explicit OK, after the hygiene grep (D.4.1) |
-| Public fork (GitHub) | remote `public` = https://github.com/AzallazA/spark-local-inference (fork of NVIDIA/spark-local-inference, the renamed flare-local-inference; default branch `ds41-tp3-v3`) | reviewed main line and release tags only (`flare-tp3-YYYYMMDD`, each with a GitHub Release note); push with the user's explicit OK; upstream PRs for the proposals (Gitea branch `upstream-proposals`) open from it; proposals stay off this remote until submitted; GitHub cannot make a fork private, hence Gitea for the private view |
+| Public fork (GitHub) | remote `public` = https://github.com/AzallazA/spark-local-inference (fork of NVIDIA/spark-local-inference, the renamed flare-local-inference; default branch `ds41-tp3-v3`) | reviewed main line and release tags only (`flare-tp3-YYYYMMDD`, each with a GitHub Release note); push with the user's explicit OK; upstream PRs for `docs/upstream-proposals` open from it; GitHub cannot make a fork private, hence Gitea for the private view |
 
 The fork tree is kept publication-clean at all times: no experiment scripts at the root (they live outside the repo, e.g.
 `~/ds41-tp3/fork-archive` and the untracked `serve-best.sh`), no `/home/<user>` paths, no hostnames. `git grep -n

@@ -59,7 +59,7 @@ embedding/vision in host (done).
    Rebase, re-apply the six `tp3-patches/` to the venv, rebuild, layer test, export, verify.
 2. **FlashInfer `tiny_decode` SwiGLU clamp**: still unfixed upstream (head 07c41f32); a PR with the 45-line patch and
    the 10 → 0 corruption A/B is self-contained and benefits every clamped-SwiGLU model at TP1-3.
-3. **Proposals 01-06** (Gitea-only branch `upstream-proposals`) (MXFP4 Engram encoding first, with the quality evidence now
+3. **Proposals 01-06** in `docs/upstream-proposals/` (MXFP4 Engram encoding first, with the quality evidence now
    attached), each as a small PR after the sync; proposal 03 can drop the now-redundant top-p range.
 4. **Cold tuning cache at HOT=342** needs the HOT=300 warm-up; upstream's 11-07 "bound host memory during TP kernel
    preparation" may remove it; re-test after the sync.
