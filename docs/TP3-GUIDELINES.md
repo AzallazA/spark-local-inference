@@ -22,7 +22,7 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | FlashInfer (b12x) site-package patches | `tp3-patches/*.patch` (re-apply to `.venv` after every `uv sync`) |
 | TP3 test tooling | `tp3-tools/` (`bench_steps.py`, `spec_metrics.py`, `steps_logger.py`, `test_fused_qkv_norm.py`, `test_flare_sparse_decode.py`) |
 | GPU unit tests | `tests/recipes/test_deepseek41_*_cuda.py`; the TP3 ones are `..._brrr_tail_cuda.py` (3 GPUs) and `..._expert_parking_cuda.py` (1 GPU) |
-| Quality and consistency checks | `release/tools/verify_fix.py` (TRUE corruptions), `consistency.py` (decode vs prefill logprobs), `~/ds41-tp3/bench.py` (fixed 43-answer set + c4) |
+| Quality and consistency checks | `tp3-tools/verify_fix.py` (TRUE corruptions), `tp3-tools/consistency.py` (decode vs prefill logprobs), `~/ds41-tp3/bench.py` (fixed 43-answer set + c4) |
 | KV capacity without a serve | `flare run <pkg> <serve flags> --dry-run` (per-rank memory plan + KV tokens + snapshot slots; exact on 5 recorded loads; `--dry-run-free-memory` overrides the assumed free VRAM) |
 | Full qualification suite | release folder `qualification/qual_all.sh` (eval tools lavd hotel retrieval longgen eos livebench stress); needs `~/llm-inference-bench`, `~/LiveBench` |
 | Checkpoints | full view `/m2-2/flare-ckpt/ds41-1017-engram-mxfp4` (built by `release/make_checkpoint_view.sh`; the release docs' `~/ds41-1017-engram-mxfp4` is an example path, not ours); truncated test models `/m2-2/flare-ckpt/ds41-mini6` (6 layers) and `ds41-mini8` (8 layers, has native scales, use for parking/BRRR tests) |
@@ -74,10 +74,10 @@ coding c1 ≈ 456 tok/s. Spread between runs is 2-3%. See D.1 before interpretin
 
 ### A.4 Quality checks (cheapest first)
 
-1. `python3 release/tools/verify_fix.py 10` on the running server: look only at `TRUE corruptions` (must be 0).
+1. `python3 tp3-tools/verify_fix.py 10` on the running server: look only at `TRUE corruptions` (must be 0).
 2. `python3 ~/ds41-tp3/bench.py out.json` : 43 known-answer checks (expect 42-43/43), 1,500-token decodes, 32K needle,
    4 concurrent.
-3. `.venv/bin/python consistency.py 96 6 <tokenizer dir>` : decode-vs-prefill logprob agreement; compare against the
+3. `.venv/bin/python tp3-tools/consistency.py 96 6 <tokenizer dir>` : decode-vs-prefill logprob agreement; compare against the
    same number from the default build in the same session (it is biased toward b12x rounding).
 4. `qualification/qual_all.sh` from the release folder (about 1 h at c8). Needs `FLARE_LOG`, `CKPT`, writes to
    `QUAL_OUT`. LiveBench needs `--livebench-release-option 2024-11-25`. Expected: eval 43/43, tools 60/60, lavd/hotel
@@ -92,7 +92,7 @@ cd ~/flare-up-v3 && CKPT=/m2-2/flare-ckpt/ds41-1017-engram-mxfp4 HOT=342 "~/rtx-
 Full export ≈ 25-40 min with a warm tuning cache; writes a new `gb202-tp3-<timestamp>` package. Knobs are env vars
 (`HOT`, `PREFILL`, `DRAFTS`, `FLARE_DS41_VISION_HOST`, plus the `FLARE_DS41_*` set in `export.sh`). Export and serving
 cannot overlap (VRAM). Mini export for kernel/wiring checks: `./mini-exp.sh "<brrr layers>" <label>` (6-layer model,
-~10 min, then `consistency.py`).
+~10 min, then `tp3-tools/consistency.py`).
 
 ### A.6 GPU tests and traces
 
@@ -160,7 +160,7 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    needs `PYTHONPATH=<worktree>` (D.2.11) and its own `TORCH_EXTENSIONS_DIR=<worktree>/.brrr-ext`.
 2. Compile standalone first (the BRRR extension builds via `torch.utils.cpp_extension`; `CUDA_HOME=/usr/local/cuda-13.1`).
 3. Run the layer test (A.6) with the negative control; a per-row mismatch is usually the reference, see D.3.11.
-4. Mini export + `consistency.py` against the default's number.
+4. Mini export + `tp3-tools/consistency.py` against the default's number.
 5. Full export, `verify_fix`, A/B per B.1. Only then commit; then regenerate `source.patch` and the release docs if
    the default changed (B.3).
 6. Anything that touched `.venv` site-packages must have a patch file in `tp3-patches/` before the session ends.
