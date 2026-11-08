@@ -20,7 +20,8 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | BRRR fused layer tail kernel | `brrr/kernels/decoder.cu` (+ `flare_sparse_decode.cu`, opt-in) |
 | Rust serving runtime | `helios/src/` (model/allocation accounting, Engram reader, protection), CLI in `flare/src/cli.rs` |
 | FlashInfer (b12x) site-package patches | `tp3-patches/*.patch` (re-apply to `.venv` after every `uv sync`) |
-| TP3 test tooling | `tp3-tools/` (`bench_steps.py`, `spec_metrics.py`, `steps_logger.py`, `test_fused_qkv_norm.py`, `test_flare_sparse_decode.py`) |
+| TP3 test tooling | `tp3-tools/` (`bench_steps.py`, `spec_metrics.py`, `steps_logger.py`, `test_fused_qkv_norm.py`, `test_flare_sparse_decode.py`); Engram precision eval in `tp3-tools/engram-eval/` |
+| Release scripts and guides (single source) | `tp3-tools/release/` (`export.sh`, `serve.sh`, `make_checkpoint_view.sh`, `check_env.sh`, `expert-order/`), `docs/tp3/EXPORT.md`, `docs/tp3/ENGRAM-PRECISION.md`; the dated recipes folder carries copies made at tagging time |
 | GPU unit tests | `tests/recipes/test_deepseek41_*_cuda.py`; the TP3 ones are `..._brrr_tail_cuda.py` (3 GPUs) and `..._expert_parking_cuda.py` (1 GPU) |
 | Quality and consistency checks | `tp3-tools/verify_fix.py` (TRUE corruptions), `tp3-tools/consistency.py` (decode vs prefill logprobs), `~/ds41-tp3/bench.py` (fixed 43-answer set + c4) |
 | KV capacity without a serve | `flare run <pkg> <serve flags> --dry-run` (per-rank memory plan + KV tokens + snapshot slots; exact on 5 recorded loads; `--dry-run-free-memory` overrides the assumed free VRAM) |
@@ -86,7 +87,7 @@ coding c1 ≈ 456 tok/s. Spread between runs is 2-3%. See D.1 before interpretin
 ### A.5 Export
 
 ```bash
-cd ~/flare-up-v3 && CKPT=/m2-2/flare-ckpt/ds41-1017-engram-mxfp4 HOT=342 "~/rtx-recipes/DeepSeek-V4.1-Flash Flare-tp3-20261107/export.sh"
+cd ~/flare-up-v3 && CKPT=/m2-2/flare-ckpt/ds41-1017-engram-mxfp4 HOT=342 tp3-tools/release/export.sh   # the recipes folder ships the same script
 ```
 
 Full export ≈ 25-40 min with a warm tuning cache; writes a new `gb202-tp3-<timestamp>` package. Knobs are env vars
@@ -180,7 +181,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 
 ### B.3 Release folder update
 
-1. Edit in `~/rtx-recipes/DeepSeek-V4.1-Flash Flare-tp3-20261107/`. Regenerate `source.patch` from the fork
+1. Scripts and guides are edited in the fork (`tp3-tools/release/`, `docs/tp3/`) and copied into the dated folder
+   `~/rtx-recipes/DeepSeek-V4.1-Flash Flare-tp3-YYYYMMDD/`; per-release docs (README, MEASUREMENTS, results) are edited
+   in the folder. Regenerate `source.patch` from the fork
    (`git diff <upstream base>..HEAD` plus untracked new files) and verify it in a temp worktree of clean upstream:
    apply, then compare `git ls-files -s | md5sum` with the fork.
 2. Hygiene pass: `grep -rn "/home/\|~/\|$(hostname)\|gmail" .`; `find . -name __pycache__`; scrub `hostname`/`uname`
