@@ -54,6 +54,7 @@ CONTRIBUTING.md requires `git commit -s` (DCO sign-off) on every commit.
 | 4 | [04 shared all-reduce sizing](04-chunked-all-reduce-sizing.md) | flare | small | Confirm the DMA all-reduce divisibility constraint in b12x; prefill measurements |
 | 5 | [01 MXFP4 Engram encoding](01-engram-mxfp4-encoding.md) | flashinfer, then flare | medium | Kernel authorship statement; decode round-trip test; maintainer view on lossy tables |
 | 6 | [02 mixed device/host allocations](02-mixed-device-host-allocations.md) | flare | large | Explicit maintainer decision: upstream has no consumer without a placement policy |
+| 7 | [06 memory dry run](06-kv-memory-dry-run.md) (`flare run --dry-run`) | flare | medium, Rust only | Calibration of the idle reserve and kernel/graph constants on SM103/SM121; maintainer view on storing the constants in the package |
 
 05 also covers the `--history-drafts` input rule (ships with 03) and the
 embedding-table accounting (only meaningful with a per-table storage setting
