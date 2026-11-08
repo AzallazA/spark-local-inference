@@ -112,7 +112,20 @@ CUDA_VISIBLE_DEVICES=0 FLARE_RUN_CUDA_TESTS=1 FLARE_DS41_SNAPSHOT=/m2-2/flare-ck
 Traces: `nsys profile` on the serving process at c1 and c8 (existing captures `serve-node-v3-c1.nsys-rep`,
 `serve-node-v3-c8.nsys-rep` in the fork root); summarise per-stream busy intervals, not just kernel sums (D.1.5).
 
-### A.7 Knob glossary (what each lever does and what we know)
+### A.7 Repositories and where to push
+
+| Repository | Where | Purpose and rules |
+| --- | --- | --- |
+| Upstream Flare | `origin` = https://github.com/NVIDIA/flare-local-inference (read-only for us) | source of truth; our branch `ds41-tp3-v3` sits on top of it (merge-base 972e28e4 as of 2026-11-08; upstream main has moved on, see B.5) |
+| Local Gitea (private view) | remote `gitea` = http://192.168.0.8:3000/azallaza/flare-tp3-fork (LAN) or http://localhost:3000; repo `azallaza/rtx-recipes` for the release folder | browse commits, diffs and Markdown; push every commit here (`git push gitea <branch>`); experiment branches welcome (`stage2-wide-rows`, `vision-staging`, `config-object`, `upstream-main`); login `azallaza`; container `gitea`, data `~/gitea` |
+| Public release (GitHub) | https://github.com/AzallazA/RTX-PRO-6000-TP3-Inference-Recipes (`origin` of `~/rtx-recipes`); private staging copy `RTX-PRO-6000-TP3-Inference-Recipes-staging` (`staging` remote, branch `proposals` holds the proposal drafts) | user-facing release folders (docs, export/serve scripts, source.patch, qualification results); push only with the user's explicit OK, after the hygiene grep (D.4.1) |
+| Public fork (GitHub, planned) | a real fork of NVIDIA/flare-local-inference under AzallazA, created when the user says the tree is ready | reviewed branches and release tags only; upstream PRs for `docs/upstream-proposals` open from it; GitHub cannot make a fork private, hence Gitea for the private view |
+
+The fork tree is kept publication-clean at all times: no experiment scripts at the root (they live outside the repo, e.g.
+`~/ds41-tp3/fork-archive` and the untracked `serve-best.sh`), no `/home/<user>` paths, no hostnames. `git grep -n
+"/home/\|$(hostname)" HEAD` must stay empty before any push.
+
+### A.8 Knob glossary (what each lever does and what we know)
 
 | Knob | Effect / verdict |
 | --- | --- |
@@ -183,6 +196,19 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 2. Verify every finding against the code before fixing; discard the ones that do not reproduce.
 3. Fix, rebuild (`cargo build --release` for Helios, re-export for recipe/kernel changes), re-run `verify_fix`.
 4. Record verdicts (fixed / no change needed / tabled) in the commit message.
+
+### B.5 Sync from upstream (deliberate, never automatic)
+
+1. `git fetch origin` and read `git log --oneline <merge-base>..origin/main` for anything that touches the DeepSeek
+   recipe, Helios memory/Engram/package loading, b12x pins or the CLI. Note it in the status report.
+2. While the public fork has no open upstream PRs, rebase: `git rebase origin/main ds41-tp3-v3` in a worktree,
+   resolve conflicts, keep commit messages. After PRs are open from the public fork, merge instead
+   (`git merge origin/main`) so published hashes stay stable.
+3. Re-apply `tp3-patches/` to the venv if `uv.lock` or the FlashInfer pin changed (`uv sync`, `ignition.patches`,
+   then the patches).
+4. Validate before trusting it: `cargo build --release`, the 3-GPU layer test, a full export, `verify_fix` (0 true
+   corruptions), one alternating A/B round vs the current default. Then commit, push to Gitea, and only then update
+   the release folder (`source.patch` is regenerated from the new base).
 
 ---
 
