@@ -28,6 +28,7 @@ pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
 mod model;
 mod payload;
+pub mod plan;
 mod protection;
 mod protobuf;
 pub use protobuf::wire;
@@ -54,7 +55,7 @@ pub use model::{
     CacheAgreement, ClusterRank, NativeModel, RankNeeds, RoceSpec, package_cluster, rank_needs,
     rank_ranges, reserve_bytes,
 };
-pub use selection::LoadOptions;
+pub use selection::{EmbeddingTableStorage, EmbeddingTableStorageSpec, LoadOptions, TableSelector};
 
 use std::collections::HashMap;
 use std::ffi::CString;

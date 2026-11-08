@@ -651,6 +651,8 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--max-concurrency N` | Reduce concurrency within captured batch capacities | Model/default configuration, otherwise package default |
 | `--kv-cache-limit concurrency\|context\|memory` | Bound shared KV history by prepared context times selected concurrency, one prepared context, or available memory | `memory` |
 | `--memory-limit LIMIT` | Per-GPU occupied size (`30G`), free-memory reserve (`-30G`, including `-0G`), or fraction of total memory (`0.8`) | `[memory] reserve`, otherwise package serving reserve |
+| `--dry-run` | Print the memory plan and KV capacity this configuration would get on the selected GPUs, then exit without a CUDA context, GPU allocations, or weight reads | off |
+| `--dry-run-free-memory SIZE[,SIZE...]` | Free GPU memory the dry run assumes before loading, one size for every GPU or one per selected GPU; requires `--dry-run` | Each GPU's total memory minus 1152 MiB |
 | `--mtp-draft-tokens N` | Reduce the maximum draft count; zero selects ordinary execution without draft generation, absorption, or draft-state maintenance | Package default |
 | `--mtp-adaptive-verification` / `--no-mtp-adaptive-verification` | Adaptive or fixed selection among captured widths | Package default |
 | `--history-drafts` / `--no-history-drafts` | Augment learned drafts with shared decoded-history continuations; requires enabled speculation and captured history inputs, as Qwen Flash provides | Off; package defaults apply unless overridden |
@@ -774,6 +776,63 @@ prepared virtual extents limited the pool. TP ranks agree on a capacity each
 can back. Runtime memory flags reuse the same prepared package and do not
 alter preparation or captured graphs. They are absent
 from `ignition export` and the diagnostic `ignition debug-serve` commands.
+
+### Memory dry run
+
+`flare run PACKAGE --dry-run` prints what a load of `PACKAGE` under the given
+serving flags would allocate and the KV capacity it would announce, then exits.
+It verifies the package and resolves the configuration file, model defaults,
+and `--gpus` as a load does, but creates no CUDA context, allocates no GPU
+memory, and reads no weights; the CUDA driver is initialized only to read each
+selected GPU's total memory. A load takes minutes and needs the GPUs idle;
+the dry run answers in seconds while they serve. Multi-host packages and
+`--prefix-cache-pool` are refused: their capacities depend on rank agreement
+and pool registration at startup.
+
+The plan follows the loader's arithmetic, per rank:
+
+1. Free memory before loading is assumed, not observed: each GPU's total minus
+   1152 MiB for the CUDA context, driver bookkeeping, and the display.
+   `--dry-run-free-memory` replaces the assumption with explicit sizes, one for
+   every GPU or one per selected GPU in `--gpus` order.
+2. Fixed device allocations are subtracted exactly: weights, execution state,
+   scratch, and the device prefix of each mixed device/host expert bank.
+3. Driver memory for the selected kernels and graphs is estimated as a per-rank
+   base of 136 MiB, the stored module images plus 11,776 bytes per module, the
+   module globals, and 3,584 bytes per graph node, counted after the serving
+   flags select graphs and prune unused kernels. These constants were
+   calibrated on five recorded loads of DeepSeek-V4.1-Flash tensor-parallel-3
+   packages on three 96 GiB RTX PRO 6000 Blackwell GPUs; each load's
+   "Allocate cache" line bounds the limiting rank's budget to one page step,
+   and the constants place every planned budget inside its step.
+4. The headroom of the runtime memory limits above is subtracted: the package
+   reserve or the `--memory-limit` reserve, plus 64 MiB of engine headroom; an
+   occupied or fractional limit caps the budget as it does at startup.
+5. The host prefix cache's device share is subtracted when `--prefix-cache-memory`
+   or `--prefix-cache-disk` is set: transfer streams, events, and the mapped
+   intake slots, which grow with the configured memory.
+6. The remaining budget backs the execution rows and KV pages exactly as
+   `Allocate cache` sizes them, including the `--kv-cache-limit` ceiling,
+   plane alignment, and the smallest rank's capacity governing every rank.
+
+The report lists each step per GPU, the announced cache line (bytes, KV
+tokens, shared snapshot slots, and what limited the pool), and the host RAM
+the load commits: mixed expert bank host parts, mapped host allocations,
+resident embedding table planes, embedding gather staging and row cache, the
+host prefix cache with its intake, input staging, and index, and the prepared
+image input window.
+
+Accuracy: items 2, 4, 5, and 6 are exact for the package and flags given. Item 1
+and the kernel and graph estimate of item 3 are the residual. The calibration
+loads showed 1.10 to 1.13 GiB unavailable across ranks before loading; the
+assumption uses the larger value, so the plan reproduces the capacity the most
+constrained rank imposes. On the calibration hosts the planned KV token count
+matched the recorded one exactly for a 32 GiB and a 16 GiB prefix cache at
+verification budgets 24 and 128 (2,461,184 and 2,373,760 tokens). A package
+whose kernels differ substantially from those loads, another GPU model, or a
+GPU with other processes resident shifts the estimate; one MiB of error on the
+limiting rank moves the capacity by about 1,200 tokens for that package, and
+`--dry-run-free-memory` corrects a known offset.
 
 ### Downloading published packages
 

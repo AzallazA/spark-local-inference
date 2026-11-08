@@ -443,7 +443,8 @@ impl DiskReader {
         for (ordinal, plane) in planes.iter().enumerate() {
             if ordinal == 1 {
                 if let Some(scales) = &self.resident_scales {
-                    gather_resident(scales, plane.row_bytes, ids, &mut output[base..]);
+                    // Scale rows are a few bytes each; the whole plane copies faster than a thread starts.
+                    gather_resident(scales, plane.row_bytes, ids, &mut output[base..], 1);
                     base += ids.len() * plane.row_bytes;
                     continue;
                 }
@@ -721,14 +722,27 @@ enum Data {
     Cached(Box<CachedReader>),
 }
 
-fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8]) {
+/// Bytes one gather thread copies at minimum; smaller planes (the 64 KiB scale plane, decode-sized
+/// weight gathers) stay on the calling thread rather than paying thread start-up per call.
+const GATHER_BYTES_PER_THREAD: usize = 128 << 10;
+
+/// Default cap on CPU threads one RAM-resident gather fans out across.
+pub fn default_gather_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(16)
+}
+
+/// Threads a gather of `bytes` may use, capped by the configured `max_threads`.
+fn gather_threads(bytes: usize, max_threads: usize) -> usize {
+    (bytes / GATHER_BYTES_PER_THREAD).clamp(1, max_threads.max(1))
+}
+
+fn gather_resident(data: &Resident, row_bytes: usize, ids: &[i64], output: &mut [u8], max_threads: usize) {
     let data = data.bytes();
+    let output = &mut output[..ids.len() * row_bytes];
     // Prefill gathers thousands of random rows; split large gathers across CPU threads.
-    const PARALLEL_ROWS: usize = 8192;
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
-    if ids.len() >= PARALLEL_ROWS && threads > 1 {
+    let threads = gather_threads(output.len(), max_threads);
+    if threads > 1 {
         let rows_per = ids.len().div_ceil(threads);
-        let output = &mut output[..ids.len() * row_bytes];
         std::thread::scope(|scope| {
             for (chunk_ids, chunk_out) in ids.chunks(rows_per).zip(output.chunks_mut(rows_per * row_bytes)) {
                 scope.spawn(move || copy_rows(data, row_bytes, chunk_ids, chunk_out));
@@ -753,6 +767,8 @@ fn copy_rows(data: &[u8], row_bytes: usize, ids: &[i64], output: &mut [u8]) {
 pub(crate) struct Reader {
     data: Data,
     stats: Arc<Stats>,
+    /// Upper bound on threads one RAM-resident gather fans out across.
+    gather_threads: usize,
 }
 impl Reader {
     #[cfg(test)]
@@ -764,6 +780,7 @@ impl Reader {
         max_rows: usize,
         stats: Arc<Stats>,
     ) -> Result<Self> {
+        // Cap 4 so resident gathers of a few MiB exercise the chunked parallel path.
         Self::from_files(
             &[Arc::new(open_file(path)?)],
             planes,
@@ -774,6 +791,7 @@ impl Reader {
             1,
             false,
         )
+        .map(|reader| reader.with_gather_threads(4))
     }
     pub fn from_files(
         files: &[Arc<File>],
@@ -813,13 +831,21 @@ impl Reader {
                 Data::Disk(disk)
             }
         };
-        Ok(Self { data, stats })
+        Ok(Self { data, stats, gather_threads: 1 })
     }
+    /// Allow RAM-resident gathers to fan out across up to `threads` CPU threads.
+    pub fn with_gather_threads(mut self, threads: usize) -> Self {
+        self.gather_threads = threads.max(1);
+        self
+    }
+    /// A reader over already-loaded resident planes (prepared tables); prefill-sized gathers
+    /// fan out with the same default cap the package loader configures.
     #[cfg(unix)]
     pub(super) fn resident(data: [Arc<Resident>; 2], stats: Arc<Stats>) -> Self {
         Self {
             data: Data::Ram(data),
             stats,
+            gather_threads: default_gather_threads(),
         }
     }
     pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
@@ -841,7 +867,7 @@ impl Reader {
             Data::Ram(data) => {
                 let mut base = 0;
                 for (plane, data) in planes.iter().zip(data) {
-                    gather_resident(data, plane.row_bytes, ids, &mut output[base..]);
+                    gather_resident(data, plane.row_bytes, ids, &mut output[base..], self.gather_threads);
                     base += ids.len() * plane.row_bytes;
                 }
                 Ok(())
@@ -860,6 +886,19 @@ impl Reader {
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
+
+    #[test]
+    fn gather_fan_out_follows_bytes_and_the_configured_cap() {
+        // The 64 KiB scale plane and decode-sized weight gathers stay on the calling thread.
+        assert_eq!(gather_threads(64 << 10, 16), 1);
+        assert_eq!(gather_threads(8 * 256, 16), 1);
+        // A 2 MiB prefill gather fans out, bounded by the configured thread count.
+        assert_eq!(gather_threads(2 << 20, 16), 16);
+        assert_eq!(gather_threads(2 << 20, 4), 4);
+        assert_eq!(gather_threads(1 << 20, 16), 8);
+        // A zero cap never divides by zero or disables the copy.
+        assert_eq!(gather_threads(2 << 20, 0), 1);
+    }
 
     #[test]
     fn resident_scales_preserve_bytes_and_cache_hits_without_reading_the_scale_file() {

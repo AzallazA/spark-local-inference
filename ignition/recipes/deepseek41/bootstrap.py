@@ -27,7 +27,7 @@ from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
-    PrefillVisionInputs, PreparedVisionGeneration, VisionState)
+    PrefillVisionInputs, PreparedVisionGeneration, VisionState, staged_aligner_geometry)
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
     create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime, create_roce_runtime)
@@ -44,7 +44,7 @@ from ignition.progress import phase
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import RECIPE
 from .attention import INDEXER_QUERY_ROWS
-from .decoder import PreparedDecoder, Scratch, DraftScratch
+from .decoder import PreparedDecoder, Scratch, DraftScratch, check_brrr_decisions
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -52,7 +52,7 @@ from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
-from .weights import ModelWeights
+from .weights import ModelWeights, vision_host_parked
 
 
 # TP3 test tooling: truncated mini views (FLARE_DS41_MINI=1) have no ratio-1 decoder suffix to compact prefill feedback.
@@ -556,14 +556,38 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             graph_buffers=graph_buffers, forward_inputs=forward_inputs,
             host_allocate=package_storage.host_allocate, device=device)
         if vision_state is not None:
+            # TP3: FLARE_DS41_VISION_STAGE=1 stages the host-parked tower's weights through VRAM slots taken from
+            # each vision graph's cursor (so they share the activation pool with the other graphs and are counted
+            # with the graph operands); FLARE_DS41_VISION_STAGE_COPY=kernel copies with an elementwise kernel
+            # instead of cudaMemcpy. The parked bytes stay host-resident either way.
+            stage_vision = os.environ.get("FLARE_DS41_VISION_STAGE") == "1"
+            copy_mode = os.environ.get("FLARE_DS41_VISION_STAGE_COPY", "memcpy") or "memcpy"
+            if copy_mode not in ("memcpy", "kernel"):
+                raise ValueError(f"FLARE_DS41_VISION_STAGE_COPY must be unset, 'memcpy' or 'kernel', not {copy_mode!r}")
+            if stage_vision and not vision_host_parked(weights.vision, package_storage.host_regions):
+                # Nothing to stage from: the tower is already resident (no host allocator parked it).
+                if progress is not None:
+                    progress("FLARE_DS41_VISION_STAGE=1 ignored: the vision tower is not host-parked; using it resident")
+                stage_vision = False
+            staging_report = None
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
                 cursor = activation_buffers.cursor()
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120, buffers=cursor)
+                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120, buffers=cursor,
+                    staging=staged_aligner_geometry(weights.vision) if stage_vision else None)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                    session=session, workspace=arena, name=name, buffers=cursor)
+                    session=session, workspace=arena, name=name, buffers=cursor,
+                    stage_weights=stage_vision, kernel_copy=copy_mode == "kernel")
+                if stage_vision:
+                    report = (encoder.staging_bytes, encoder.allocated_staging_bytes, encoder.aliased_staging_bytes, name)
+                    staging_report = max(staging_report, report) if staging_report else report
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor),
                     "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
+            if staging_report is not None and progress is not None:
+                total, allocated, aliased, largest = staging_report
+                progress(f"vision weight staging ({copy_mode}): {total >> 20} MiB of slots, max over vision graphs "
+                         f"({largest}): {allocated >> 20} MiB newly allocated in the activation pool, "
+                         f"{aliased >> 20} MiB of aligner slots aliasing block-stage scratch")
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             suffix = "-no-mtp" if config.dspark and not enabled else ""
@@ -583,6 +607,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     transient.close()
+    # TP3 BRRR: ranks must agree on every layer's fused-kernel decision before any of them can enter the kernel
+    # (its all-reduce would deadlock); plain construction code, before tuning and capture.
+    check_brrr_decisions(group)
     release_unused()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
@@ -633,6 +660,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             scratch_pool.release_backing()
             if progress is not None:
                 progress(f"released {sum(size for _, size in scratch_pool.unbacked) >> 20} MiB of scratch for compilation")
+        check_brrr_decisions(group)  # anything constructed since the catalog (contextual selection, tuning)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,

@@ -69,6 +69,29 @@ def _shard(rank, size):
     return slice(rank * size, (rank + 1) * size)
 
 
+def check_constants(ext, config, weights):
+    """Constants contract: the kernel's compile-time model constants against Flare's config and the mHC options
+    decoder.py hands to PreparedMHC (rms_eps = norm_eps = rms_norm_eps, hc_eps, hc_sinkhorn_iters)."""
+    import math
+
+    text = config.text
+    ints = {"HC": text["hc_mult"], "TOPK": text["num_experts_per_tok"], "ROPE": text["qk_rope_head_dim"],
+            "EXPERTS": text["n_routed_experts"], "HID": text["hidden_size"], "SINKHORN": text["hc_sinkhorn_iters"]}
+    floats = {"LIMIT": text["swiglu_limit"], "ROUTE_SCALE": text["routed_scaling_factor"],
+              "HC_EPS": text["hc_eps"], "NORM_EPS": text["rms_norm_eps"]}
+    bad = [f"{k}={getattr(ext, k)} (config {v})" for k, v in ints.items() if getattr(ext, k) != int(v)]
+    bad += [f"{k}={getattr(ext, k)!r} (config {v!r})" for k, v in floats.items()
+            if not math.isclose(getattr(ext, k), float(v), rel_tol=1e-6, abs_tol=0.0)]  # kernel floats are fp32
+    if text.get("scoring_func") != "sqrtsoftplus" or not text.get("norm_topk_prob", False):
+        bad.append(f"router scoring {text.get('scoring_func')!r}/norm_topk_prob={text.get('norm_topk_prob')!r} (kernel: sqrtsoftplus, normalized)")
+    res = weights.residual
+    if tuple(res["hc_ffn_fn"].shape) != (ext.MIX, ext.HC * ext.HID) or res["hc_ffn_base"].numel() != ext.MIX or res["hc_ffn_scale"].numel() != 3:
+        bad.append(f"mHC fn {tuple(res['hc_ffn_fn'].shape)} base {res['hc_ffn_base'].numel()} scale {res['hc_ffn_scale'].numel()} "
+                   f"(kernel MIX={ext.MIX}, HC*HID={ext.HC * ext.HID}, 3)")
+    if bad:
+        raise RuntimeError("BRRR kernel constants do not match the model: " + "; ".join(bad))
+
+
 class Checkpoint:
     def __init__(self, root):
         from safetensors import safe_open
@@ -131,10 +154,12 @@ class Engine:
             out[: got.shape[0]] = got
         return out
 
-    def register(self, index, weights):
+    def register(self, index, weights, config=None):
         if index in self.slots:
             return self.slots[index]
         ext, r, p = self.ext, self.rank, f"layers.{index}"
+        if config is not None:
+            check_constants(ext, config, weights)
         inter, oa = ext.INTER, ext.OA
         experts = weights.experts.experts
         impl = experts._impl
@@ -165,7 +190,11 @@ class Engine:
             norm=self.raw(f"{p}.ffn_norm.weight").contiguous(),
             image_lo=0, dense_native=False,
             # Merged hot/cold bank: experts are stored hot-first; the kernel routes by global ID and reads the slot.
-            hot_map=None if weights.experts.hot_map is None else weights.experts.hot_map.to(torch.int32).contiguous())
+            hot_map=None if weights.experts.hot_map is None else weights.experts.hot_map.to(torch.int32).contiguous(),
+            # Cold-first job ordering: slots >= hot_rows are host-RAM experts. Default EXPERTS (all resident) keeps
+            # the arrival order; a merged bank without a known hot count also stays unordered (safe).
+            hot_rows=ext.EXPERTS if weights.experts.hot_map is None or weights.experts.hot_rows is None
+                     else int(weights.experts.hot_rows))
         if os.environ.get("FLARE_DS41_BRRR_DENSE_NATIVE", "1") == "1":
             # Read Flare's own row-major E4M3 dense values (same bytes as the checkpoint shards; block scales stay as
             # small checkpoint copies) instead of staged copies: ~35-40 MB per layer back to the KV pool.
@@ -373,11 +402,11 @@ def _skinny_scales(scales_u8, rows, cols):
 class PreparedBRRRTail:
     """Layer tail through the BRRR kernel. Reads s.attended (pre-inverse-RoPE attention output)."""
 
-    def __init__(self, index, weights, scratch, positions, frequencies):
+    def __init__(self, index, weights, scratch, positions, frequencies, config=None):
         e = engine()
         if e is None:
             raise RuntimeError("BRRR engine was not created")
-        self.handle, self.slot = int(e.handle), int(e.register(index, weights))
+        self.handle, self.slot = int(e.handle), int(e.register(index, weights, config))
         self.scratch, self.positions, self.frequencies = scratch, positions, frequencies
         if os.environ.get("FLARE_DS41_BRRR_BREAK") == "rope":
             # Negative control for test tooling: reversed RoPE frequencies (wrong inverse rotation of the attention output).

@@ -459,6 +459,8 @@ impl OrbitPush {
             transfer_streams: self.transfer_streams,
             package_cache: None,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: None,
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
@@ -632,6 +634,8 @@ impl OrbitRun {
             transfer_streams: self.transfer_streams,
             package_cache: None,
             stage_only: false,
+            dry_run: false,
+            dry_run_free_memory: Vec::new(),
             api_key_file: self.api_key_file.clone(),
             scheduler_policy: self
                 .scheduler_policy
@@ -747,6 +751,27 @@ pub struct Run {
     /// Distribute and verify rank packages, then exit before GPU initialization.
     #[arg(long, help_heading = "Multi-host options")]
     pub stage_only: bool,
+
+    /// Print the memory plan and KV capacity this configuration would get on the selected GPUs,
+    /// then exit without creating a CUDA context, allocating GPU memory, or reading weights.
+    #[arg(
+        long,
+        conflicts_with_all = ["hosts", "rank", "rendezvous", "stage_only"],
+        help_heading = "Planning options"
+    )]
+    pub dry_run: bool,
+
+    /// Free GPU memory the dry run assumes before loading: one size for every GPU or one per
+    /// selected GPU [default: each GPU's total memory minus 1152 MiB].
+    #[arg(
+        long,
+        value_name = "SIZE[,SIZE...]",
+        value_delimiter = ',',
+        value_parser = parse_size,
+        requires = "dry_run",
+        help_heading = "Planning options"
+    )]
+    pub dry_run_free_memory: Vec<u64>,
 
     /// File containing the serving API key; overrides [server].api_key, including with an empty file.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
@@ -1129,6 +1154,8 @@ impl ServingOptions {
             kv_cache_limit: self.kv_cache_limit,
             memory_limit: self.memory_limit,
             embedding_table_storage: self.embedding_table_storage,
+            // Per-table storage has no CLI flag yet; Helios applies the legacy env shim at load.
+            embedding_table_storage_per_table: None,
             embedding_table_cache_bytes: self.embedding_table_cache_size,
             embedding_table_resident_scales: if self.embedding_table_resident_scales {
                 Some(true)
@@ -1481,6 +1508,29 @@ mod tests {
         assert_eq!(head.transfer_streams, Some(16));
         assert!(head.stage_only);
         assert!(Cli::try_parse_from(["flare", "run"]).is_err());
+        let planned = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--gpus",
+            "0,1",
+            "--dry-run",
+            "--dry-run-free-memory",
+            "90G,91GiB",
+        ]);
+        assert!(planned.dry_run);
+        assert_eq!(planned.dry_run_free_memory, [90 << 30, 91 << 30]);
+        assert!(!run(&["flare", "run", "model.safetensors"]).dry_run);
+        for conflicting in [
+            vec!["--dry-run", "--stage-only"],
+            vec!["--dry-run", "--rank", "1", "--rendezvous", "host:1"],
+            vec!["--dry-run", "--hosts", "peer1"],
+            vec!["--dry-run-free-memory", "90G"],
+        ] {
+            let mut arguments = vec!["flare", "run", "model.safetensors"];
+            arguments.extend(conflicting);
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
         assert!(
             Cli::try_parse_from([
                 "flare",

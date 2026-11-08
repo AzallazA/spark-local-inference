@@ -18,7 +18,7 @@ use crate::{
 
 // Graphs are uploaded before sizing caches; leave room for driver bookkeeping
 // and the execution streams and events created when the server starts.
-const HEADROOM_BYTES: u64 = 64 << 20;
+pub(super) const HEADROOM_BYTES: u64 = 64 << 20;
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
@@ -162,7 +162,7 @@ impl NativeResources {
     }
 }
 
-fn headroom(config: &serde_json::Value) -> Result<u64> {
+pub(super) fn headroom(config: &serde_json::Value) -> Result<u64> {
     let reserve = config
         .get("reserve_bytes")
         .map(|value| {
@@ -216,7 +216,7 @@ impl NativeResources {
     }
 }
 
-fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
+pub(super) fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
     package
         .allocations
         .iter()
@@ -232,7 +232,7 @@ fn fixed_bytes(package: &Package, integrated: bool) -> Result<u64> {
         })
 }
 
-fn limited_budget(
+pub(super) fn limited_budget(
     memory: MemorySnapshot,
     loaded: u64,
     limit: Option<MemoryLimit>,
@@ -273,12 +273,12 @@ fn limited_budget(
 /// Token limits describe useful history. Draft-page offsets are storage required in addition
 /// to that history, and depend on the selected graphs' actual page-table bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PageLimit {
-    minimum: u64,
-    maximum: u64,
+pub(super) struct PageLimit {
+    pub minimum: u64,
+    pub maximum: u64,
 }
 
-fn page_ceiling(
+pub(super) fn page_ceiling(
     mode: KvCacheLimit,
     context: u64,
     active: u64,
@@ -327,7 +327,7 @@ fn page_ceiling(
     Ok(Some(PageLimit { minimum, maximum }))
 }
 
-fn bytes(package: &Package, capacity: i32, units: u64) -> Result<u64> {
+pub(super) fn bytes(package: &Package, capacity: i32, units: u64) -> Result<u64> {
     package
         .allocations
         .iter()
@@ -353,7 +353,7 @@ fn bytes(package: &Package, capacity: i32, units: u64) -> Result<u64> {
         })
 }
 
-fn capacities(
+pub(super) fn capacities(
     packages: &[Package],
     available: &[u64],
     active: u64,
@@ -491,6 +491,162 @@ fn capacities(
     Ok((execution + cached, low, cached))
 }
 
+/// Cache sizing inputs that follow from the selected packages and options alone: the package
+/// reserve plus engine headroom, the physical page geometry, the prepared contract restricted to
+/// the selected graphs, the widest execution-row requirement, and the host prefix cache's device
+/// and host headroom. The loader and the memory dry run both size caches from these.
+pub(super) struct CacheSizing {
+    /// Package serving reserve plus [`HEADROOM_BYTES`], subtracted from each rank's free memory.
+    pub reserve: u64,
+    /// Tokens per physical page on each rank.
+    pub page_tokens: u64,
+    pub contract: crate::model::PreparedContract,
+    /// Continuation rows one active request needs across the selected graphs.
+    pub width: u64,
+    /// Ordinary host memory for serialized prepared inputs; zero without image inputs.
+    pub input_window: u64,
+    /// Device bytes each rank sets aside for host prefix cache transfer streams and intake.
+    pub offload_bytes: u64,
+    /// Host bytes the prefix cache occupies: retention memory, intake slots, input staging and index.
+    pub offload_host: u64,
+    /// Host bytes allocated after sizing, charged against integrated GPU budgets.
+    pub host_future: u64,
+}
+
+pub(super) fn cache_sizing(
+    packages: &[Package],
+    server_config: &serde_json::Value,
+    options: &LoadOptions,
+    active: usize,
+) -> Result<CacheSizing> {
+    let reserve = headroom(server_config)?;
+    let page_tokens = server_config["page_tokens"]
+        .as_u64()
+        .ok_or_else(|| invalid("model requires physical page geometry"))?;
+    let mut contract: crate::model::PreparedContract =
+        serde_json::from_value(server_config["model_contract"].clone())
+            .map_err(|error| invalid(format!("invalid prepared storage contract: {error}")))?;
+    let execution = packages
+        .first()
+        .and_then(|package| package.execution.as_ref())
+        .ok_or_else(|| invalid("model package has no serving contract"))?;
+    // The package also declares graphs excluded by runtime reductions. Their storage
+    // requirements must not enlarge the selected cache budget.
+    contract
+        .graphs
+        .retain(|g| execution.graphs.iter().any(|graph| graph.name == g.graph));
+    let width = execution
+        .graphs
+        .iter()
+        .map(|graph| {
+            contract
+                .graph(&graph.name)
+                .map(|g| g.state_rows_per_request as u64)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(1);
+    let input_window = crate::offload::input_staging_bytes(&contract, |name| {
+        execution
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == name)
+            .map(|buffer| buffer.nbytes)
+    })?;
+    let (offload_bytes, offload_host) = if options.prefix_cache.enabled() {
+        let geometry = packages
+            .iter()
+            .map(|package| {
+                cache_geometry(
+                    package,
+                    contract.cache.page_tokens as u64,
+                    (active as u64)
+                        .checked_mul(width)
+                        .and_then(|rows| rows.checked_add(1))
+                        .filter(|&rows| rows < u32::MAX as u64)
+                        .ok_or_else(|| {
+                            invalid("cache execution row capacity exceeds state slot IDs")
+                        })?,
+                    1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let staging = input_window;
+        let (device, host) = options.prefix_cache.headroom_with_inputs(
+            packages.len(),
+            &flare_selene::Layout::new(&geometry)?,
+            active,
+            staging != 0,
+        )?;
+        let index = if staging == 0 {
+            0
+        } else {
+            flare_selene::input::INDEX_HEADROOM_BYTES
+        };
+        let host = host
+            .checked_add(staging)
+            .and_then(|n| n.checked_add(index))
+            .ok_or_else(|| invalid("prepared input staging overflows host memory"))?;
+        (device, host)
+    } else {
+        (0, 0)
+    };
+    #[cfg(feature = "images")]
+    let source_window = if input_window == 0 {
+        0
+    } else {
+        crate::frontend::images::ImageLimits::default().source_retention_bytes()?
+    };
+    #[cfg(not(feature = "images"))]
+    let source_window = 0;
+    let host_future = offload_host
+        .checked_add(input_window)
+        .and_then(|bytes| bytes.checked_add(source_window))
+        .ok_or_else(|| invalid("CPU image input windows overflow host memory"))?;
+    Ok(CacheSizing {
+        reserve,
+        page_tokens,
+        contract,
+        width,
+        input_window,
+        offload_bytes,
+        offload_host,
+        host_future,
+    })
+}
+
+/// What bounded the agreed page count: the KV cache limit, the prepared virtual extent, or memory.
+pub(super) fn limiting_factor(
+    packages: &[Package],
+    ceiling: Option<PageLimit>,
+    pages: u64,
+    mode: KvCacheLimit,
+) -> String {
+    let virtual_pages = packages
+        .iter()
+        .flat_map(|p| &p.allocations)
+        .filter_map(|a| a.sizing.as_ref().filter(|s| s.capacity == 1))
+        .map(|s| s.maximum)
+        .min()
+        .unwrap_or(0);
+    if ceiling.is_some_and(|limit| pages == limit.maximum) {
+        mode.to_string()
+    } else if pages == virtual_pages {
+        "prepared extent".into()
+    } else {
+        "memory".into()
+    }
+}
+
+/// Physical bytes one rank's cache takes: its execution rows plus `pages` KV pages, each plane
+/// rounded to its allocation granularity. Snapshot rows alias page backing and add nothing.
+pub(super) fn rank_cache_bytes(package: &Package, execution: u64, pages: u64) -> Result<u64> {
+    bytes(package, 0, execution)?
+        .checked_add(bytes(package, 1, pages)?)
+        .ok_or_else(|| invalid("cache footprint overflow"))
+}
+
 impl NativeModel {
     /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
     pub(super) unsafe fn check_memory_limit(
@@ -554,100 +710,21 @@ impl NativeModel {
         embedding_host_bytes: u64,
     ) -> Result<()> {
         // Local host tiers register after cache backing; pool regions register before sizing.
-        let reserve = headroom(&self.server_config)?;
-        let page_tokens = self.server_config["page_tokens"]
-            .as_u64()
-            .ok_or_else(|| invalid("model requires physical page geometry"))?;
-        let mut contract: crate::model::PreparedContract =
-            serde_json::from_value(self.server_config["model_contract"].clone())
-                .map_err(|error| invalid(format!("invalid prepared storage contract: {error}")))?;
-        // The package also declares graphs excluded by runtime reductions. Their storage
-        // requirements must not enlarge the selected cache budget.
-        contract.graphs.retain(|g| {
-            packages[0]
-                .execution
-                .as_ref()
-                .unwrap()
-                .graphs
-                .iter()
-                .any(|graph| graph.name == g.graph)
-        });
-        let width = packages[0]
-            .execution
-            .as_ref()
-            .unwrap()
-            .graphs
-            .iter()
-            .map(|graph| {
-                contract
-                    .graph(&graph.name)
-                    .map(|g| g.state_rows_per_request as u64)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(1);
+        let CacheSizing {
+            reserve,
+            page_tokens,
+            contract,
+            width,
+            offload_bytes,
+            host_future,
+            ..
+        } = cache_sizing(packages, &self.server_config, options, active)?;
         let observations = self
             .ranks
             .iter()
             .map(|rank| unsafe { rank.memory_snapshot() })
             .collect::<Result<Vec<_>>>()?;
         let integrated = self.ranks.iter().filter(|rank| rank.integrated).count() as u64;
-        let input_window = crate::offload::input_staging_bytes(&contract, |name| {
-            packages[0]
-                .execution
-                .as_ref()?
-                .buffers
-                .iter()
-                .find(|buffer| buffer.name == name)
-                .map(|buffer| buffer.nbytes)
-        })?;
-        let (offload_bytes, offload_host) = if options.prefix_cache.enabled() {
-            let geometry = packages
-                .iter()
-                .map(|package| {
-                    cache_geometry(
-                        package,
-                        contract.cache.page_tokens as u64,
-                        (active as u64).checked_mul(width).and_then(|rows| rows.checked_add(1))
-                            .filter(|&rows| rows < u32::MAX as u64)
-                            .ok_or_else(|| invalid("cache execution row capacity exceeds state slot IDs"))?,
-                        1,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let staging = input_window;
-            let (device, host) = options.prefix_cache.headroom_with_inputs(
-                self.ranks.len(),
-                &flare_selene::Layout::new(&geometry)?,
-                active,
-                staging != 0,
-            )?;
-            let index = if staging == 0 {
-                0
-            } else {
-                flare_selene::input::INDEX_HEADROOM_BYTES
-            };
-            let host = host
-                .checked_add(staging)
-                .and_then(|n| n.checked_add(index))
-                .ok_or_else(|| invalid("prepared input staging overflows host memory"))?;
-            (device, host)
-        } else {
-            (0, 0)
-        };
-        #[cfg(feature = "images")]
-        let source_window = if input_window == 0 {
-            0
-        } else {
-            crate::frontend::images::ImageLimits::default().source_retention_bytes()?
-        };
-        #[cfg(not(feature = "images"))]
-        let source_window = 0;
-        let host_future = offload_host
-            .checked_add(input_window)
-            .and_then(|bytes| bytes.checked_add(source_window))
-            .ok_or_else(|| invalid("CPU image input windows overflow host memory"))?;
         let mut available = Vec::new();
         let mut loaded_bytes = Vec::new();
         for (index, (rank, package)) in self.ranks.iter().zip(packages.iter()).enumerate() {
@@ -816,20 +893,7 @@ impl NativeModel {
         // the smallest capacity any rank can back fits every rank. Snapshot rows need no
         // dedicated backing; the alias layout below rejects rows the agreed pages cannot back.
         let (rows, pages) = agree.caches((local_rows, local_pages))?;
-        let virtual_pages = packages
-            .iter()
-            .flat_map(|p| &p.allocations)
-            .filter_map(|a| a.sizing.as_ref().filter(|s| s.capacity == 1))
-            .map(|s| s.maximum)
-            .min()
-            .unwrap();
-        let limiting = if ceiling.is_some_and(|limit| pages == limit.maximum) {
-            options.kv_cache_limit.to_string()
-        } else if pages == virtual_pages {
-            "prepared extent".into()
-        } else {
-            "memory".into()
-        };
+        let limiting = limiting_factor(packages, ceiling, pages, options.kv_cache_limit);
         let gib = |values: &[u64]| {
             let format = |n: u64| format!("{:.2}", n as f64 / (1u64 << 30) as f64);
             let low = format(*values.iter().min().unwrap());
@@ -925,7 +989,7 @@ impl NativeModel {
         }
         let mut gpu_bytes = 0;
         for package in packages.iter_mut() {
-            gpu_bytes += bytes(package, 0, rows - snapshots)? + bytes(package, 1, pages)?;
+            gpu_bytes += rank_cache_bytes(package, rows - snapshots, pages)?;
             for allocation in &mut package.allocations {
                 if let Some(sizing) = allocation.sizing.take() {
                     let units = if sizing.capacity == 0 { rows } else { pages };
@@ -1014,7 +1078,7 @@ impl NativeModel {
 
 /// The row plane and page planes of one rank in name order, read before
 /// the sizing records are consumed. Peer allocations never carry sizing.
-fn cache_geometry(
+pub(super) fn cache_geometry(
     package: &Package,
     page_tokens: u64,
     rows: u64,

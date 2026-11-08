@@ -142,6 +142,7 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             sources[file] =
                 std::sync::Arc::new(crate::os::direct_file(&failed_source, false).unwrap());
         }
+        let table_storage = vec![storage; tables.tables.len()];
         let shared = Shared::new(
             tables,
             &sources,
@@ -149,8 +150,9 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             4,
             owner.context as usize,
             0,
-            storage,
+            &table_storage,
             cache_bytes,
+            1,
             1,
             resident_scales,
         )

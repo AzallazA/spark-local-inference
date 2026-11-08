@@ -30,6 +30,8 @@ class ExpertWeights:
     cold: object = None
     hot_map: torch.Tensor | None = None
     cold_map: torch.Tensor | None = None
+    # Merged bank only: bank slots < hot_rows are VRAM rows, the rest pinned host memory (None = no host tail).
+    hot_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -115,13 +117,24 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
-            if vision and os.environ.get("FLARE_DS41_VISION_HOST") == "1" and host_allocator is not None:
+            if vision and host_allocator is not None and (os.environ.get("FLARE_DS41_VISION_HOST") == "1"
+                                                          or os.environ.get("FLARE_DS41_VISION_STAGE") == "1"):
                 # TP3: the vision tower (~0.8 GiB, replicated) runs only for image prompts; its projections consume these
                 # tensors as-is, so read them from device-visible host memory and give the VRAM to KV.
+                # FLARE_DS41_VISION_STAGE=1 keeps the tower parked and additionally stages each block's weights through
+                # double-buffered VRAM slots inside the vision graphs (ignition/components/vision_staging.py). Without a
+                # host allocator nothing is parked, and bootstrap (`vision_host_parked`) then skips staging as well.
                 from ignition.components.weights import _park_on_host
                 vision = {name: _park_on_host(host_allocator, name, tensor) for name, tensor in vision.items()}
         return cls(config, shard, embedding, norm, head, layers, draft,
                    torch.cuda.memory_allocated(device) - before, vision)
+
+
+def vision_host_parked(vision: dict, host_regions) -> bool:
+    """Whether every vision/aligner tensor lives in one of the package's mapped host regions (`_park_on_host`)."""
+    spans = [(region.address, region.address + region.extent) for region in host_regions if not region.closed]
+    tensors = [tensor for name, tensor in vision.items() if name.startswith(("vision.", "aligner."))]
+    return bool(tensors) and all(any(start <= tensor.data_ptr() < end for start, end in spans) for tensor in tensors)
 
 
 def hot_expert_ids(layer: int, experts: int) -> list | None:
@@ -261,7 +274,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         count = self.config.draft.experts if draft else text["n_routed_experts"]
         parked = not draft and layer in self._host_layers
         hot = hot_expert_ids(layer, count) if parked else None
-        cold = hot_map = cold_map = None
+        cold = hot_map = cold_map = hot_rows = None
         if hot is None or len(hot) == count:
             experts = self.load_experts([f"{ffn}.experts.{i}" for i in range(count)], interval,
                                         host=parked and hot is None)
@@ -280,6 +293,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
             hot_map = torch.empty((count,), dtype=torch.int32)
             hot_map[order] = torch.arange(count, dtype=torch.int32)
             hot_map = hot_map.to(self.device)
+            hot_rows = len(hot)
         else:
             hot_set = set(hot)
             cold_ids = [e for e in range(count) if e not in hot_set]
@@ -295,7 +309,7 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
         routed = ExpertWeights(self.load_tensor(ffn + ".gate.weight"),
             self.load_tensor(ffn + ".gate.bias"), experts, shared,
             self.load_tensor(ffn + ".gate.bias_vl") if self.config.vision is not None else None,
-            cold=cold, hot_map=hot_map, cold_map=cold_map)
+            cold=cold, hot_map=hot_map, cold_map=cold_map, hot_rows=hot_rows)
         residual = {name: self.load_tensor(prefix + "." + name) for name in (
             "hc_attn_fn", "hc_attn_base", "hc_attn_scale", "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale",
             "attn_norm.weight", "ffn_norm.weight")}

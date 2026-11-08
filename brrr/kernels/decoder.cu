@@ -224,8 +224,12 @@ constexpr int CACHED = C_FIN;
 constexpr int C_PUB = C_FIN + 1;
 constexpr int C_R1A = C_PUB + 4 * CHUNKS;
 constexpr int C_R1D = C_R1A + ENTRIES * R1_BLOCKS;
-constexpr int C_NENT = C_R1D + ENTRIES;
-constexpr int C_ECOUNT = C_NENT + 1;
+// Cold-first routed jobs: route entries (expert slot, 16-route chunk) are kept in one table of ENTRIES, cold slots
+// (slot >= Weights::hot_rows, host RAM over PCIe) filling it from the front and hot slots from the back, so job index
+// a < ncold is cold. Their sum is bounded by ENTRIES (each slot adds at most ceil(count / SPAN) entries).
+constexpr int C_NHOT = C_R1D + ENTRIES;
+constexpr int C_NCOLD = C_NHOT + 1;
+constexpr int C_ECOUNT = C_NCOLD + 1;
 constexpr int COUNTERS = C_ECOUNT + EXPERTS;
 
 struct Peers {
@@ -296,6 +300,7 @@ struct Weights {
   long woa_ld, wob_ld, gate_ld, sh13_ld, sh2_ld;
   unsigned* route_counts;  // TP3 dynamic expert cache: optional per-layer routed-slot counters (accumulate across steps)
   const int* hot_map;      // Flare merged bank: global expert ID -> slot in the hot-first bank (null = identity)
+  int hot_rows;            // Flare merged bank: slots < hot_rows live in VRAM, the rest in pinned host RAM (EXPERTS = all hot)
   const uint8_t* woa;
   const uint8_t* woa_s;
   const uint8_t* wob;
@@ -325,6 +330,7 @@ struct Params {
   const bool* pad;  // TP3 route log: vLLM's is_padding mask (persistent buffer; nullptr = count every row)
   unsigned long long* prof;  // TP3 debug: per job type [acquire wait, dependency wait, run, count] in ns (nullptr = off)
   int test;  // TP3 debug: 1 = add CSF-style per-stage barriers on the raw path; 2 = CSF expands into sm.sx instead of in place
+  int attn_per_chunk_flags;  // TP3: one-shot (m < TWO_SHOT_MIN) attention exchange posts a flag per chunk like the FFN exchange (0 = one flag for all chunks)
   Peers peers;
   Scratch s;
   Weights w;
@@ -661,7 +667,11 @@ __device__ void share(Ctx& c, int which, int k, __nv_bfloat16* out) {
   const unsigned epoch = c.epoch;
   const int nv = p.m * CHUNK_VECS;
   const unsigned peers = ((1u << RANKS) - 1) & ~(1u << p.rank);
-  const int per = which == 0 && p.m < TWO_SHOT_MIN ? CHUNKS : 1, g = k / per;
+  // Attention one-shot exchange: with attn_per_chunk_flags every WOB chunk publishes its own flag (same protocol as the
+  // FFN exchange, flag g = k), so a peer's OWNA slice of chunk k only waits for chunk k instead of all CHUNKS; the legacy
+  // single flag (per = CHUNKS, g = 0) is the last chunk's CTA posting once for all. Flags stay within flag_index's
+  // [0, 2 * 2 * RANKS * CHUNKS) words; the epoch compare in await() is unchanged.
+  const int per = which == 0 && p.m < TWO_SHOT_MIN && !p.attn_per_chunk_flags ? CHUNKS : 1, g = k / per;
   if (p.m < TWO_SHOT_MIN) {
     post(c, which, 0, g, per, epoch, peers);
     await(c, which, 0, g, epoch, peers);
@@ -794,8 +804,6 @@ __device__ __forceinline__ void dense_q(Ctx& c, const Span& sp, int ks, int kw, 
   stores(c, sp, acc, store);
 }
 
-__device__ __forceinline__ float2 rope_cs(const float* row, int pair) { return make_float2(__ldg(row + pair), __ldg(row + ROPE / 2 + pair)); }
-
 __device__ __forceinline__ float rot_add(float a, float b, float2 cs) { return a * cs.x + b * cs.y; }
 
 // Flare port: (cos, sin) for one rotary pair from Flare's 32 frequencies (angle = float(pos) * freq[pair]).
@@ -806,18 +814,6 @@ __device__ __forceinline__ float2 rope_cs_freq(const float* freq, long pos, int 
 }
 
 __device__ __forceinline__ float rot_sub(float a, float b, float2 cs) { return a * cs.x - b * cs.y; }
-
-__device__ __forceinline__ uint4 rope(uint4 v, const float* cs, int d) {
-  if (d < HDIM - ROPE) return v;
-  unsigned u[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-  for (int q = 0; q < 4; ++q) {
-    const float2 r = rope_cs(cs, (d + 2 * q - (HDIM - ROPE)) >> 1);
-    const float2 x = unpack_bf16(u[q]);
-    u[q] = pack_bf16(rot_add(x.x, x.y, r), rot_sub(x.y, x.x, r));
-  }
-  return make_uint4(u[0], u[1], u[2], u[3]);
-}
 
 // Flare port: RoPE angles from the 32 frequencies Flare uses (angle = float(pos) * freq[pair]) instead of a
 // [positions, 64] cos/sin table, which would cost 256 MB per GPU at 1M positions.
@@ -932,7 +928,11 @@ __device__ void job_route(Ctx& c, int tok) {
       if (p.w.route_counts && !(p.pad && p.pad[tok])) atomicAdd(p.w.route_counts + e2, 1u);  // skip CUDA-graph padding rows
       tb->routes[slot * MAXM + pos] = r;
       if (pos % SPAN == 0) {
-        const int ent = int(atomicAdd(p.s.counters + C_NENT, 1u));
+        // Cold-first: entries of host-RAM slots fill the table from the front, VRAM slots from the back, so the
+        // producer issues cold R1/R2 jobs (PCIe reads) before hot ones. Accumulation targets (hacc/yracc) are
+        // reached through red.global.add already, so the order of experts changes only the atomic summation order.
+        const bool cold = slot >= p.w.hot_rows;
+        const int ent = cold ? int(atomicAdd(p.s.counters + C_NCOLD, 1u)) : ENTRIES - 1 - int(atomicAdd(p.s.counters + C_NHOT, 1u));
         tb->expert[ent] = slot;
         tb->chunk[ent] = pos / SPAN;
       }
@@ -1475,7 +1475,7 @@ __device__ void deps(Ctx& c, const Job& job) {
     case J_SH2: return c.wait(C_HS + job.c, SH1_BLOCKS);
     case J_MIX: return c.wait(C_A + job.a * GW / TILE, SLICES);
     case J_R2: return c.wait(C_R1D + job.a, R1_BLOCKS);
-    case J_XF: return c.wait(C_SF + job.a, __ldcg(p.s.counters + C_NENT) + 2 * c.L.tg);
+    case J_XF: return c.wait(C_SF + job.a, __ldcg(p.s.counters + C_NHOT) + __ldcg(p.s.counters + C_NCOLD) + 2 * c.L.tg);
     default: return;
   }
 }
@@ -1499,14 +1499,20 @@ __device__ void run_job(Ctx& c, const Job& job) {
   }
 }
 
-__device__ int route_table(const Params& p, int lane) {
-  int n = 0;
+// Total route entries (hot + cold) once every J_ROUTE job has signalled; ncold = how many fill the table from the front.
+__device__ int route_table(const Params& p, int lane, int& ncold) {
+  int n = 0, cold = 0;
   if (lane == 0) {
     while (ld_acquire_gpu(p.s.counters + C_ROUTE) < unsigned(p.m)) __nanosleep(SPIN_NS);
-    n = int(__ldcg(p.s.counters + C_NENT));
+    cold = int(__ldcg(p.s.counters + C_NCOLD));
+    n = cold + int(__ldcg(p.s.counters + C_NHOT));
   }
+  ncold = __shfl_sync(0xffffffffu, cold, 0);
   return __shfl_sync(0xffffffffu, n, 0);
 }
+
+// Job entry index a in [0, n) -> table row: cold entries [0, ncold) from the front, hot ones from the back (see job_route).
+__device__ __forceinline__ int entry_row(int a, int ncold) { return a < ncold ? a : ENTRIES - 1 - (a - ncold); }
 
 struct Issue {
   uint8_t* stage;
@@ -1605,62 +1611,42 @@ __device__ void issue(const Params& p, const Job& job, int s, const Issue& is) {
       }
       return;
     case J_R1: {
-      const int e = job.e, g4 = job.c * 4 + s, nt = job.b / 2, rows = nt < INTER / 128 ? 128 : INTER % 128, n0 = (job.b % 2) * 2;
-      if constexpr (RP_LAYOUT) {
-        // TP3 port: b12x's natural W4A8 layout (N256 x K128 tiles of 4096 words; within a tile
-        // [k32][32-row block][inner 128 words], the same inner order as the exact N128 layout). Scales:
-        // per (256-row tile, 128-K tile) 256 row-ordered words (4 k32 scales per row).
-        const int kt = g4;
+      // TP3: only b12x's natural W4A8 layout is reachable (RP_LAYOUT is a constexpr of INTER); the exact N128/N64
+      // layout arm for 64-row tails (TP4's INTER 576) was removed as dead code.
+      static_assert(RP_LAYOUT, "the fused tail reads b12x's natural W4A8 tile layout");
+      const int e = job.e, nt = job.b / 2, n0 = (job.b % 2) * 2;
+      // b12x's natural W4A8 layout (N256 x K128 tiles of 4096 words; within a tile [k32][32-row block][inner 128 words],
+      // the same inner order as the exact N128 layout). Scales: per (256-row tile, 128-K tile) 256 row-ordered words
+      // (4 k32 scales per row).
+      const int kt = job.c * 4 + s;
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int half = 1 - h, nt256 = half * (INTER / 256) + nt / 2, n8c0 = (nt % 2) * 4 + n0;
-          const uint4* tile = w.w13 + e * w.w13_stride + (long(nt256) * (HID / 128) + kt) * 1024;
-          for (int q = 0; q < 4; ++q) {
-            is.frag(q * 4 + h * 2, tile + (q * 8 + n8c0) * 32);
-            is.frag(q * 4 + h * 2 + 1, tile + (q * 8 + n8c0 + 1) * 32);
-          }
-          // scales: this k-tile's 128-row half (nt % 2) of the 256-row tile, rows n0*32 .. n0*32+63 (one word per row).
-          if (w.csf13.storage) issue_csf(w.csf13, is.stage + SCALE_OFF, is.lane, h, e * w.csf13.sections + half, nt, kt, n0 * 32, 64);
-          else is.words(h * 256, w.s13 + e * w.s13_stride + (long(nt256) * (HID / 128) + kt) * 256 + (nt % 2) * 128 + n0 * 32, 256);
+      for (int h = 0; h < 2; ++h) {
+        const int half = 1 - h, nt256 = half * (INTER / 256) + nt / 2, n8c0 = (nt % 2) * 4 + n0;
+        const uint4* tile = w.w13 + e * w.w13_stride + (long(nt256) * (HID / 128) + kt) * 1024;
+        for (int q = 0; q < 4; ++q) {
+          is.frag(q * 4 + h * 2, tile + (q * 8 + n8c0) * 32);
+          is.frag(q * 4 + h * 2 + 1, tile + (q * 8 + n8c0 + 1) * 32);
         }
-        return;
-      } else {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int half = 1 - h;
-          const uint4* base = w.w13 + e * w.w13_stride + long(half) * (INTER * HID / 32) + long(nt) * (128 * HID / 32) + long(g4) * rows * 4 + n0 * 32;
-          for (int q = 0; q < 4; ++q) {
-            is.frag(q * 4 + h * 2, base + q * rows);
-            is.frag(q * 4 + h * 2 + 1, base + q * rows + 32);
-          }
-          is.words(h * 256, w.s13 + e * w.s13_stride + long(half) * (INTER * SLICES / 4) + long(nt) * (128 * SLICES / 4) + n0 * 32 + long(g4) * rows, 256);
-        }
-        return;
+        // scales: this k-tile's 128-row half (nt % 2) of the 256-row tile, rows n0*32 .. n0*32+63 (one word per row).
+        if (w.csf13.storage) issue_csf(w.csf13, is.stage + SCALE_OFF, is.lane, h, e * w.csf13.sections + half, nt, kt, n0 * 32, 64);
+        else is.words(h * 256, w.s13 + e * w.s13_stride + (long(nt256) * (HID / 128) + kt) * 256 + (nt % 2) * 128 + n0 * 32, 256);
       }
+      return;
     }
     case J_R2: {
       const int e = job.e, kq = s == INTER / 128 ? (INTER % 128) / 32 : 4;
-      if constexpr (RP_LAYOUT) {
-        const int nt = job.b, kt = s, nt256 = nt / 2;
-        const uint4* tile = w.w2 + e * w.w2_stride + (long(nt256) * (INTER / 128) + kt) * 1024;
-        for (int q = 0; q < kq; ++q)
+      const int nt = job.b, kt = s, nt256 = nt / 2;
+      const uint4* tile = w.w2 + e * w.w2_stride + (long(nt256) * (INTER / 128) + kt) * 1024;
+      for (int q = 0; q < kq; ++q)
 #pragma unroll
-          for (int rt = 0; rt < 4; ++rt) is.frag(q * 4 + rt, tile + (q * 8 + (nt % 2) * 4 + rt) * 32);
-        // scales: k-tile kt, the 128 rows of half (nt % 2) of the 256-row tile (one word per row = 4 k32 scales).
-        if (w.csf2.storage) {
-          issue_csf(w.csf2, is.stage + SCALE_OFF, is.lane, 0, e, nt, kt, 0, 128);
-        } else {
-          is.words(0, w.s2 + e * w.s2_stride + (long(nt256) * (INTER / 128) + kt) * 256 + (nt % 2) * 128, kq * 128);
-        }
-        return;
+        for (int rt = 0; rt < 4; ++rt) is.frag(q * 4 + rt, tile + (q * 8 + (nt % 2) * 4 + rt) * 32);
+      // scales: k-tile kt, the 128 rows of half (nt % 2) of the 256-row tile (one word per row = 4 k32 scales).
+      if (w.csf2.storage) {
+        issue_csf(w.csf2, is.stage + SCALE_OFF, is.lane, 0, e, nt, kt, 0, 128);
       } else {
-        const uint4* base = w.w2 + e * w.w2_stride + long(job.b) * (128 * INTER / 32) + s * 512;
-        for (int q = 0; q < kq; ++q)
-#pragma unroll
-          for (int rt = 0; rt < 4; ++rt) is.frag(q * 4 + rt, base + q * 128 + rt * 32);
-        is.words(0, w.s2 + e * w.s2_stride + long(job.b) * (128 * INTER / 32 / 4) + s * 128, kq * 128);
-        return;
+        is.words(0, w.s2 + e * w.s2_stride + (long(nt256) * (INTER / 128) + kt) * 256 + (nt % 2) * 128, kq * 128);
       }
+      return;
     }
     default: return;
   }
@@ -1671,12 +1657,14 @@ __device__ void producer(const Params& p, Smem& sm) {
   const Layout L = layout(p.m);
   const unsigned long long policy = evict_first_policy();
   const volatile int* ready = &sm.ready;
-  int n = -1, it = 0, j = int(blockIdx.x);
+  int n = -1, ncold = 0, it = 0, j = int(blockIdx.x);
   for (int seq = 0;; ++seq) {
-    if (n < 0 && j >= L.routed) n = route_table(p, lane);
+    if (n < 0 && j >= L.routed) n = route_table(p, lane, ncold);
     Job job = n < 0 || j < total_jobs(L, n) ? decode(L, n, j) : Job{J_END, 0, 0, 0, 1};
     if (job.type == J_R1 || job.type == J_R2) {
-      const int e = __ldcg(p.s.table->expert + job.a), ch = __ldcg(p.s.table->chunk + job.a);
+      // job.a stays the dense entry id (R1 arrive/done counters); the table row is cold-first permuted.
+      const int row = entry_row(job.a, ncold);
+      const int e = __ldcg(p.s.table->expert + row), ch = __ldcg(p.s.table->chunk + row);
       job.e = e;
       job.f = e * MAXM + ch * SPAN;
       job.n = min(SPAN, int(__ldcg(p.s.counters + C_ECOUNT + e)) - ch * SPAN);
@@ -1755,6 +1743,8 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
     }
   }
   __syncthreads();
+  // No pdl_launch_dependents() here: an early trigger at this point measured ~2% slower at c4/c8 (2026-11-08 bisect,
+  // 3 alternating rounds). The only trigger in this file is the one in the opt-in prologue_kernel.
   if (threadIdx.x == 0) {
     __threadfence();
     sm.last = atomicAdd(p.s.counters + C_FIN, 1u) == gridDim.x - 1;
@@ -2261,7 +2251,7 @@ int64_t add_layer(int64_t handle, torch::Tensor woa, torch::Tensor woa_s, torch:
                   std::optional<torch::Tensor> csf13_debug, std::optional<torch::Tensor> csf2_debug,
                   std::optional<torch::Tensor> csf13_debug_desc = std::nullopt, std::optional<torch::Tensor> csf2_debug_desc = std::nullopt,
                   bool dense_native = false, std::optional<torch::Tensor> route_counts = std::nullopt,
-                  std::optional<torch::Tensor> hot_map = std::nullopt) {
+                  std::optional<torch::Tensor> hot_map = std::nullopt, int64_t hot_rows = EXPERTS) {
   TORCH_CHECK(woa.numel() == long(OA) * OAK && sh2_s.size(-1) == SH2_LD);
   auto ld_bytes = [&](const torch::Tensor& t, long rows) {
     TORCH_CHECK(t.dim() == 2 && t.size(0) == rows && t.stride(1) == 1 && (t.stride(0) * t.element_size()) % 16 == 0 && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
@@ -2283,6 +2273,9 @@ int64_t add_layer(int64_t handle, torch::Tensor woa, torch::Tensor woa_s, torch:
     l.w.hot_map = hot_map->data_ptr<int>();
     l.keep.push_back(*hot_map);
   }
+  // Cold-first job ordering: slots >= hot_rows are host-RAM experts (merged bank is hot-first). EXPERTS = all resident.
+  TORCH_CHECK(hot_rows >= 0 && hot_rows <= EXPERTS, "hot_rows must be in [0, ", EXPERTS, "]");
+  l.w.hot_rows = int(hot_rows);
   if (dense_native) {
     l.w.woa_ld = ld_bytes(woa, OA);
     l.w.wob_ld = ld_bytes(wob, HID);
@@ -2363,6 +2356,38 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   const bool ids = l.w.bias_vl && input_ids && input_ids->numel() && input_ids->is_contiguous();
   TORCH_CHECK(!ids || input_ids->scalar_type() == at::kLong || input_ids->scalar_type() == at::kInt);
   TORCH_CHECK(attn_scale.has_value() == attn_base.has_value());
+  // Scratch contract (Flare MHCScratch / decoder Scratch layout, indexed by the kernel as tok * HC, tok * HC * HC,
+  // (tok * HC + k) * HID and tok * HID with unit inner strides): residual [m, HC, HID] bf16, post [m, HC] f32,
+  // comb [m, HC, HC] f32, pre/attn mix [m, HC] f32, y [m, HID] bf16; capacities may exceed m, the leading rows are used.
+  auto dense = [&](const torch::Tensor& t, const char* what, at::ScalarType dtype, std::initializer_list<long> inner) {
+    TORCH_CHECK(t.is_cuda() && t.device() == resid0.device(), "BRRR tail: ", what, " must live on the layer's device");
+    TORCH_CHECK(t.scalar_type() == dtype, "BRRR tail: ", what, " dtype ", t.scalar_type(), ", expected ", dtype);
+    TORCH_CHECK(t.dim() == long(inner.size()) + 1 && t.size(0) >= m, "BRRR tail: ", what, " shape ", t.sizes(), " needs [>=", m, ", ...]");
+    long expect = 1;
+    int d = t.dim() - 1;
+    for (auto it = std::rbegin(inner); it != std::rend(inner); ++it, --d) {
+      TORCH_CHECK(t.size(d) == *it && t.stride(d) == expect, "BRRR tail: ", what, " shape ", t.sizes(), " strides ", t.strides(),
+                  " must be dense with inner dims ", std::vector<long>(inner));
+      expect *= *it;
+    }
+    TORCH_CHECK(t.stride(0) == expect, "BRRR tail: ", what, " row stride ", t.stride(0), " must be ", expect);
+  };
+  dense(resid0, "resid0", at::kBFloat16, {HC, HID});
+  dense(resid1, "resid1", at::kBFloat16, {HC, HID});
+  dense(y_ffn, "y", at::kBFloat16, {HID});
+  dense(attn_post, "attn_post", at::kFloat, {HC});
+  dense(ffn_post, "post1", at::kFloat, {HC});
+  dense(attn_comb, "attn_comb", at::kFloat, {HC, HC});
+  dense(ffn_comb, "comb1", at::kFloat, {HC, HC});
+  dense(attn_pre, "attn_pre", at::kFloat, {HC});
+  dense(ffn_pre, "pre1", at::kFloat, {HC});
+  TORCH_CHECK(positions.is_contiguous() && positions.numel() >= m, "BRRR tail: positions must hold ", m, " contiguous int64 rows");
+  TORCH_CHECK(o.size(0) >= m, "BRRR tail: attention output has ", o.size(0), " rows, needs ", m);
+  if (attn_scale.has_value()) {
+    // mix_finish reads scale[0..3) and base[0..MIX) (hc_attn_scale [3], hc_attn_base [24]).
+    TORCH_CHECK(attn_scale->scalar_type() == at::kFloat && attn_scale->is_contiguous() && attn_scale->numel() == 3, "BRRR tail: attn_scale must be 3 fp32");
+    TORCH_CHECK(attn_base->scalar_type() == at::kFloat && attn_base->is_contiguous() && attn_base->numel() == MIX, "BRRR tail: attn_base must be ", MIX, " fp32");
+  }
   const c10::cuda::CUDAGuard guard(resid0.device());
   Params p{};
   static const bool prof_on = getenv("DS41_FUSED_PROF") && atoi(getenv("DS41_FUSED_PROF"));
@@ -2371,6 +2396,9 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   p.pad = g_pad;
   static const int test_mode = getenv("DS41_FUSED_TEST") ? atoi(getenv("DS41_FUSED_TEST")) : 0;
   p.test = test_mode;
+  // DS41_FUSED_ATTN_PER_CHUNK=0 restores the legacy single attention flag for m < TWO_SHOT_MIN (A/B toggle).
+  static const int attn_per_chunk = getenv("DS41_FUSED_ATTN_PER_CHUNK") ? atoi(getenv("DS41_FUSED_ATTN_PER_CHUNK")) : 1;
+  p.attn_per_chunk_flags = attn_per_chunk;
   p.peers = e.peers;
   p.s = e.s;
   p.w = l.w;
@@ -2465,6 +2493,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("SH2_LD") = SH2_LD;
   m.attr("RP_LAYOUT") = int(RP_LAYOUT);
   m.attr("KVW") = KVW;
+  // Constants contract: Engine.register asserts these against Flare's model config and mHC options.
+  m.attr("MIX") = MIX;
+  m.attr("TOPK") = TOPK;
+  m.attr("ROPE") = ROPE;
+  m.attr("LIMIT") = double(LIMIT);
+  m.attr("ROUTE_SCALE") = double(ROUTE_SCALE);
+  m.attr("SINKHORN") = SINKHORN;
+  m.attr("HC_EPS") = double(HC_EPS);
+  m.attr("NORM_EPS") = double(NORM_EPS);
+  m.attr("TWO_SHOT_MIN") = TWO_SHOT_MIN;
   m.def("flag_bytes", &flag_bytes);
   m.def("prof_read", &prof_read);
   m.def("set_pad", &set_pad);
@@ -2480,7 +2518,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("csf13_gdesc") = py::none(), py::arg("csf13_meta") = std::vector<int64_t>{}, py::arg("csf2_storage") = py::none(),
         py::arg("csf2_gdesc") = py::none(), py::arg("csf2_meta") = std::vector<int64_t>{}, py::arg("csf13_debug") = py::none(),
         py::arg("csf2_debug") = py::none(), py::arg("csf13_debug_desc") = py::none(), py::arg("csf2_debug_desc") = py::none(),
-        py::arg("dense_native") = false, py::arg("route_counts") = py::none(), py::arg("hot_map") = py::none());
+        py::arg("dense_native") = false, py::arg("route_counts") = py::none(), py::arg("hot_map") = py::none(),
+        py::arg("hot_rows") = int64_t(EXPERTS));
   m.def("run", &run);
   m.def("prologue", &prologue);
 }

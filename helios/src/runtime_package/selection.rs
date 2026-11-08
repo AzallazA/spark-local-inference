@@ -19,6 +19,9 @@ pub struct LoadOptions {
     pub memory_limit: Option<super::MemoryLimit>,
     /// Auxiliary embedding-table storage; defaults to disk when absent.
     pub embedding_table_storage: Option<crate::engram::Storage>,
+    /// Per-table storage overrides, resolved once by [`LoadOptions::embedding_table_storage`]
+    /// ahead of the global setting. Absent means the global setting decides every table.
+    pub embedding_table_storage_per_table: Option<EmbeddingTableStorageSpec>,
     /// Per-host RAM bytes for disk-backed embedding rows; zero disables, absent selects by memory topology.
     pub embedding_table_cache_bytes: Option<u64>,
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
@@ -41,6 +44,173 @@ pub struct LoadOptions {
     pub cluster_rank: Option<usize>,
 }
 
+/// Which embedding tables one storage entry selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableSelector {
+    /// Every table of one table group (one Engram table set).
+    Group(usize),
+    /// One table ordinal within every group.
+    Table(usize),
+    /// One table of one group.
+    Cell(usize, usize),
+}
+
+/// Explicit per-table embedding storage, before resolution against the package's table geometry.
+///
+/// Spec grammar: comma-separated entries `G`, `G.T` or `*.T`, each optionally suffixed `=ram` or
+/// `=disk` (default `ram`). `G` is a table group (Engram table set) index, `T` a table index within
+/// a group. Entries apply in order; a later entry overrides an earlier one for the same table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddingTableStorageSpec {
+    pub entries: Vec<(TableSelector, crate::engram::Storage)>,
+}
+
+/// Storage of every embedding table, indexed `[group][table]`.
+pub type EmbeddingTableStorage = Vec<Vec<crate::engram::Storage>>;
+
+impl EmbeddingTableStorageSpec {
+    /// Parse the spec grammar; every token must parse, range checks happen at resolution.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let mut entries = Vec::new();
+        for item in spec.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            let (selector, storage) = match item.split_once('=') {
+                Some((selector, storage)) => (selector.trim(), parse_storage(storage.trim())?),
+                None => (item, crate::engram::Storage::Ram),
+            };
+            let selector = match selector.split_once('.') {
+                None => TableSelector::Group(parse_index(selector)?),
+                Some(("*", table)) => TableSelector::Table(parse_index(table)?),
+                Some((group, table)) => TableSelector::Cell(parse_index(group)?, parse_index(table)?),
+            };
+            entries.push((selector, storage));
+        }
+        Ok(Self { entries })
+    }
+
+    /// The legacy pair of comma-separated index lists: RAM table groups, then RAM table ordinals
+    /// within every group. Groups apply first, so a table ordinal entry also covers RAM groups.
+    pub fn from_legacy_lists(ram_groups: &str, ram_tables: &str) -> Result<Self> {
+        let mut entries = Vec::new();
+        for group in ram_groups.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            entries.push((TableSelector::Group(parse_index(group)?), crate::engram::Storage::Ram));
+        }
+        for table in ram_tables.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            entries.push((TableSelector::Table(parse_index(table)?), crate::engram::Storage::Ram));
+        }
+        Ok(Self { entries })
+    }
+
+    /// Compatibility shim for the `FLARE_ENGRAM_RAM_TABLES` (groups) and `FLARE_ENGRAM_RAM_LAYERS`
+    /// (tables within every group) environment switches. This is the only environment read behind
+    /// embedding storage. Its one caller is `NativeModel::load_agreeing` (model.rs), which applies
+    /// the result through [`resolve_embedding_table_storage`]; it is intended to move to the CLI
+    /// that builds [`LoadOptions`] once that grows a per-table flag. Returns `None` when neither
+    /// variable is set; parse errors are reported by the caller only for packages with tables.
+    pub fn from_legacy_env() -> Result<Option<Self>> {
+        let read = |name: &str| -> Result<Option<String>> {
+            match std::env::var_os(name) {
+                None => Ok(None),
+                Some(value) => value
+                    .into_string()
+                    .map(Some)
+                    .map_err(|_| invalid(format!("{name} is not valid UTF-8"))),
+            }
+        };
+        let groups = read("FLARE_ENGRAM_RAM_TABLES")?;
+        let tables = read("FLARE_ENGRAM_RAM_LAYERS")?;
+        if groups.is_none() && tables.is_none() {
+            return Ok(None);
+        }
+        Self::from_legacy_lists(groups.as_deref().unwrap_or(""), tables.as_deref().unwrap_or(""))
+            .map(Some)
+            .map_err(|error| invalid(format!("FLARE_ENGRAM_RAM_TABLES/FLARE_ENGRAM_RAM_LAYERS: {error}")))
+    }
+
+    /// Apply the entries over `default`, for `tables_per_group[g]` tables in group `g`.
+    /// Every selector must address existing tables; a `*.T` ordinal must exist in every group.
+    pub fn resolve(
+        &self,
+        tables_per_group: &[usize],
+        default: crate::engram::Storage,
+    ) -> Result<EmbeddingTableStorage> {
+        let mut resolved: EmbeddingTableStorage = tables_per_group
+            .iter()
+            .map(|&tables| vec![default; tables])
+            .collect();
+        let groups = tables_per_group.len();
+        for &(selector, storage) in &self.entries {
+            match selector {
+                TableSelector::Group(group) => {
+                    let row = resolved.get_mut(group).ok_or_else(|| {
+                        invalid(format!("embedding table group {group} does not exist ({groups} groups)"))
+                    })?;
+                    row.fill(storage);
+                }
+                TableSelector::Table(table) => {
+                    for (group, row) in resolved.iter_mut().enumerate() {
+                        let count = row.len();
+                        *row.get_mut(table).ok_or_else(|| {
+                            invalid(format!(
+                                "embedding table {table} does not exist in group {group} ({count} tables)"
+                            ))
+                        })? = storage;
+                    }
+                }
+                TableSelector::Cell(group, table) => {
+                    let row = resolved.get_mut(group).ok_or_else(|| {
+                        invalid(format!("embedding table group {group} does not exist ({groups} groups)"))
+                    })?;
+                    let count = row.len();
+                    *row.get_mut(table).ok_or_else(|| {
+                        invalid(format!(
+                            "embedding table {table} does not exist in group {group} ({count} tables)"
+                        ))
+                    })? = storage;
+                }
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+fn parse_index(text: &str) -> Result<usize> {
+    text.parse::<usize>()
+        .map_err(|_| invalid(format!("invalid embedding table index {text:?}")))
+}
+
+fn parse_storage(text: &str) -> Result<crate::engram::Storage> {
+    match text {
+        "ram" => Ok(crate::engram::Storage::Ram),
+        "disk" => Ok(crate::engram::Storage::Disk),
+        other => Err(invalid(format!("invalid embedding table storage {other:?}; expected ram or disk"))),
+    }
+}
+
+/// Whether any table of the resolved layout reads from disk.
+pub(super) fn any_disk_table(storage: &EmbeddingTableStorage) -> bool {
+    storage.iter().flatten().any(|s| *s == crate::engram::Storage::Disk)
+}
+
+/// Resolve table storage for a package of `tables_per_group` geometry, honouring the legacy
+/// environment outcome `legacy` (from [`EmbeddingTableStorageSpec::from_legacy_env`], already
+/// copied into `options` when it parsed). A package without embedding tables ignores the legacy
+/// environment entirely, including unparsable values, as it did before per-table resolution;
+/// packages with tables report those errors. An explicit per-table option stays strict.
+pub(super) fn resolve_embedding_table_storage(
+    options: &LoadOptions,
+    tables_per_group: &[usize],
+    legacy: &Result<Option<EmbeddingTableStorageSpec>>,
+) -> Result<EmbeddingTableStorage> {
+    let legacy_set = !matches!(legacy, Ok(None));
+    if tables_per_group.is_empty() && legacy_set {
+        return Ok(Vec::new());
+    }
+    if let Err(error) = legacy {
+        return Err(invalid(error.to_string()));
+    }
+    options.embedding_table_storage(tables_per_group)
+}
+
 impl LoadOptions {
     /// Resolve the disk-reader default without treating it as an explicit storage override.
     pub fn embedding_workers(&self) -> usize {
@@ -48,17 +218,49 @@ impl LoadOptions {
             .unwrap_or(if cfg!(windows) { 4 } else { 1 })
     }
 
-    pub(super) fn embedding_resident_scales(&self, has_tables: bool, integrated: bool) -> bool {
-        has_tables
-            && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
-            && self.embedding_table_resident_scales.unwrap_or(!integrated)
+    /// CPU threads one RAM-resident gather may fan out across; sized once here rather than per call.
+    pub fn embedding_gather_threads(&self) -> usize {
+        crate::engram::default_gather_threads()
     }
 
-    pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {
+    /// The one resolution of embedding table storage, `[group][table]`: the per-table spec first,
+    /// then the global `embedding_table_storage`, then disk.
+    pub fn embedding_table_storage(&self, tables_per_group: &[usize]) -> Result<EmbeddingTableStorage> {
+        let default = self.embedding_table_storage.unwrap_or_default();
+        match &self.embedding_table_storage_per_table {
+            Some(spec) => spec.resolve(tables_per_group, default),
+            None => EmbeddingTableStorageSpec::default().resolve(tables_per_group, default),
+        }
+    }
+
+    /// Options that only make sense with at least one disk-backed table, checked against the
+    /// resolved layout (`has_disk_tables`), not the global flag alone.
+    pub(super) fn validate_embedding_storage(&self, has_disk_tables: bool) -> Result<()> {
+        if has_disk_tables {
+            return Ok(());
+        }
+        if self.embedding_table_workers.is_some() {
+            return Err(invalid("embedding table workers require disk storage"));
+        }
+        if self.embedding_table_cache_bytes.is_some_and(|bytes| bytes != 0) {
+            return Err(invalid("embedding row cache requires disk table storage"));
+        }
+        if self.embedding_table_resident_scales == Some(true) {
+            return Err(invalid(
+                "resident embedding scales require disk table storage; RAM storage already retains all planes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resident scale planes apply to disk tables only; `has_disk_tables` is the resolved layout's.
+    pub(super) fn embedding_resident_scales(&self, has_disk_tables: bool, integrated: bool) -> bool {
+        has_disk_tables && self.embedding_table_resident_scales.unwrap_or(!integrated)
+    }
+
+    pub(super) fn embedding_cache_bytes(&self, has_disk_tables: bool, integrated: bool) -> u64 {
         self.embedding_table_cache_bytes.unwrap_or_else(|| {
-            if has_tables
-                && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
-            {
+            if has_disk_tables {
                 if integrated { 1 << 30 } else { 4 << 30 }
             } else {
                 0
@@ -77,31 +279,22 @@ impl LoadOptions {
         if let Some(limit) = self.memory_limit {
             limit.validate()?;
         }
+        // Without per-table overrides the global setting fixes the layout, so disk-only options
+        // can be rejected before any package is read; with overrides the resolved layout decides
+        // (`validate_embedding_storage` runs again in the loader against it).
+        if self.embedding_table_storage_per_table.is_none() {
+            self.validate_embedding_storage(
+                self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk,
+            )?;
+        }
         if let Some(workers) = self.embedding_table_workers {
             if !matches!(workers, 1 | 2 | 4 | 8) {
                 return Err(invalid("embedding table workers must be 1, 2, 4, or 8"));
-            }
-            if self.embedding_table_storage == Some(crate::engram::Storage::Ram) {
-                return Err(invalid("embedding table workers require disk storage"));
             }
             #[cfg(unix)]
             if workers != 1 {
                 return Err(invalid("parallel embedding disk workers require Windows"));
             }
-        }
-        if self
-            .embedding_table_cache_bytes
-            .is_some_and(|bytes| bytes != 0)
-            && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
-        {
-            return Err(invalid("embedding row cache requires disk table storage"));
-        }
-        if self.embedding_table_resident_scales == Some(true)
-            && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
-        {
-            return Err(invalid(
-                "resident embedding scales require disk table storage; RAM storage already retains all planes",
-            ));
         }
         let execution = packages
             .first()
@@ -697,9 +890,173 @@ mod tests {
                 ..Default::default()
             };
             options.select(&mut [package()], &mut config()).unwrap();
-            assert_eq!(options.embedding_cache_bytes(true, false), 0);
-            assert_eq!(options.embedding_cache_bytes(true, true), 0);
+            // RAM-only layouts have no disk table, so the default budget is zero.
+            let has_disk = any_disk_table(&options.embedding_table_storage(&[2, 2]).unwrap());
+            assert!(!has_disk);
+            assert_eq!(options.embedding_cache_bytes(has_disk, false), 0);
+            assert_eq!(options.embedding_cache_bytes(has_disk, true), 0);
         }
+    }
+
+    #[test]
+    fn embedding_table_storage_spec_parses_strictly() {
+        use crate::engram::Storage::{Disk, Ram};
+        use TableSelector::{Cell, Group, Table};
+        assert_eq!(EmbeddingTableStorageSpec::parse("").unwrap().entries, vec![]);
+        assert_eq!(
+            EmbeddingTableStorageSpec::parse(" 0, 1.1=disk ,*.0=ram,2=disk").unwrap().entries,
+            vec![(Group(0), Ram), (Cell(1, 1), Disk), (Table(0), Ram), (Group(2), Disk)]
+        );
+        assert_eq!(
+            EmbeddingTableStorageSpec::from_legacy_lists("0,2", "1").unwrap().entries,
+            vec![(Group(0), Ram), (Group(2), Ram), (Table(1), Ram)]
+        );
+        assert_eq!(EmbeddingTableStorageSpec::from_legacy_lists("", "").unwrap().entries, vec![]);
+        for garbage in ["x", "0,,a", "-1", "0.", ".1", "0=fast", "0.1.2", "1 2", "0=", "*"] {
+            assert!(EmbeddingTableStorageSpec::parse(garbage).is_err(), "{garbage:?} parsed");
+        }
+        for (groups, tables) in [("a", ""), ("", "0 1"), ("0,", "x"), ("1.0", "")] {
+            assert!(EmbeddingTableStorageSpec::from_legacy_lists(groups, tables).is_err());
+        }
+    }
+
+    #[test]
+    fn disk_only_options_validate_against_the_resolved_layout_not_the_global_flag() {
+        use crate::engram::Storage::Ram;
+        let geometry = [2, 2];
+        // (A) Global RAM plus a per-table disk override: the layout has disk tables, so a row
+        // cache and resident scales are legitimate and `select` must not reject them early.
+        let mixed = LoadOptions {
+            embedding_table_storage: Some(Ram),
+            embedding_table_storage_per_table: Some(EmbeddingTableStorageSpec::parse("1=disk").unwrap()),
+            embedding_table_cache_bytes: Some(1 << 30),
+            embedding_table_resident_scales: Some(true),
+            ..Default::default()
+        };
+        mixed.select(&mut [package()], &mut config()).unwrap();
+        let layout = mixed.embedding_table_storage(&geometry).unwrap();
+        assert!(any_disk_table(&layout));
+        mixed.validate_embedding_storage(any_disk_table(&layout)).unwrap();
+        assert_eq!(mixed.embedding_cache_bytes(true, false), 1 << 30);
+        // (B) Global unset but every table moved to RAM by the legacy lists: the same disk-only
+        // options must fail exactly as the global RAM path does.
+        for (cache, scales, message) in [
+            (Some(1u64 << 30), None, "row cache requires disk"),
+            (None, Some(true), "resident embedding scales require disk"),
+        ] {
+            let all_ram = LoadOptions {
+                embedding_table_storage_per_table: Some(
+                    EmbeddingTableStorageSpec::from_legacy_lists("0,1", "").unwrap(),
+                ),
+                embedding_table_cache_bytes: cache,
+                embedding_table_resident_scales: scales,
+                ..Default::default()
+            };
+            // `select` cannot know the layout yet and defers to the loader's resolved check.
+            all_ram.select(&mut [package()], &mut config()).unwrap();
+            let layout = all_ram.embedding_table_storage(&geometry).unwrap();
+            assert!(!any_disk_table(&layout));
+            let error = all_ram.validate_embedding_storage(false).unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+            let global = LoadOptions {
+                embedding_table_storage: Some(Ram),
+                embedding_table_cache_bytes: cache,
+                embedding_table_resident_scales: scales,
+                ..Default::default()
+            };
+            assert_eq!(
+                global.select(&mut [package()], &mut config()).unwrap_err().to_string(),
+                error
+            );
+        }
+        // Workers follow the same rule.
+        let workers = LoadOptions {
+            embedding_table_workers: Some(1),
+            embedding_table_storage_per_table: Some(EmbeddingTableStorageSpec::parse("0,1").unwrap()),
+            ..Default::default()
+        };
+        workers.select(&mut [package()], &mut config()).unwrap();
+        assert!(workers.validate_embedding_storage(false).is_err());
+        workers.validate_embedding_storage(true).unwrap();
+    }
+
+    #[test]
+    fn legacy_environment_is_ignored_without_embedding_tables_and_strict_with_them() {
+        use crate::engram::Storage::{Disk, Ram};
+        let options = LoadOptions::default();
+        let spec = EmbeddingTableStorageSpec::from_legacy_lists("0", "").unwrap();
+        let applied = LoadOptions {
+            embedding_table_storage_per_table: Some(spec.clone()),
+            ..Default::default()
+        };
+        let garbage: Result<Option<EmbeddingTableStorageSpec>> = Err(invalid("FLARE_ENGRAM_RAM_TABLES: bad"));
+        // No tables: a set (even unparsable) legacy environment is ignored, as before.
+        assert_eq!(resolve_embedding_table_storage(&applied, &[], &Ok(Some(spec.clone()))).unwrap(), Vec::<Vec<_>>::new());
+        assert_eq!(resolve_embedding_table_storage(&options, &[], &garbage).unwrap(), Vec::<Vec<_>>::new());
+        assert_eq!(resolve_embedding_table_storage(&options, &[], &Ok(None)).unwrap(), Vec::<Vec<_>>::new());
+        // Tables present: the legacy lists apply and unparsable values abort the load.
+        assert_eq!(
+            resolve_embedding_table_storage(&applied, &[2, 2], &Ok(Some(spec))).unwrap(),
+            vec![vec![Ram, Ram], vec![Disk, Disk]]
+        );
+        assert!(resolve_embedding_table_storage(&options, &[2, 2], &garbage).unwrap_err().to_string().contains("bad"));
+        // An explicit per-table option (no legacy environment) stays strict even without tables.
+        assert!(resolve_embedding_table_storage(&applied, &[], &Ok(None)).is_err());
+    }
+
+    #[test]
+    fn embedding_table_storage_resolves_spec_then_global_then_disk() {
+        use crate::engram::Storage::{Disk, Ram};
+        let geometry = [2, 2];
+        // Nothing set: every table on disk.
+        assert_eq!(
+            LoadOptions::default().embedding_table_storage(&geometry).unwrap(),
+            vec![vec![Disk, Disk], vec![Disk, Disk]]
+        );
+        // Global RAM: every table in RAM.
+        let global = LoadOptions { embedding_table_storage: Some(Ram), ..Default::default() };
+        assert_eq!(
+            global.embedding_table_storage(&geometry).unwrap(),
+            vec![vec![Ram, Ram], vec![Ram, Ram]]
+        );
+        // Release command: FLARE_ENGRAM_RAM_TABLES=0 keeps both tables of group 0 in RAM.
+        let release = LoadOptions {
+            embedding_table_storage_per_table: Some(
+                EmbeddingTableStorageSpec::from_legacy_lists("0", "").unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            release.embedding_table_storage(&geometry).unwrap(),
+            vec![vec![Ram, Ram], vec![Disk, Disk]]
+        );
+        // The per-table spec outranks the global setting; later entries win.
+        let mixed = LoadOptions {
+            embedding_table_storage: Some(Ram),
+            embedding_table_storage_per_table: Some(
+                EmbeddingTableStorageSpec::parse("1=disk,*.1=ram,0.0=disk").unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            mixed.embedding_table_storage(&geometry).unwrap(),
+            vec![vec![Disk, Ram], vec![Disk, Ram]]
+        );
+        // Out-of-range selectors are errors, including a table ordinal absent from one group.
+        for spec in ["2", "0.2", "*.2", "1.0=disk,3=ram"] {
+            let options = LoadOptions {
+                embedding_table_storage_per_table: Some(EmbeddingTableStorageSpec::parse(spec).unwrap()),
+                ..Default::default()
+            };
+            let error = options.embedding_table_storage(&geometry).unwrap_err().to_string();
+            assert!(error.contains("does not exist"), "{spec}: {error}");
+        }
+        let ragged = LoadOptions {
+            embedding_table_storage_per_table: Some(EmbeddingTableStorageSpec::parse("*.1").unwrap()),
+            ..Default::default()
+        };
+        assert!(ragged.embedding_table_storage(&[2, 1]).is_err());
+        assert!(ragged.embedding_table_storage(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -712,10 +1069,12 @@ mod tests {
                     embedding_table_resident_scales: override_value,
                     ..Default::default()
                 };
+                let has_disk = any_disk_table(&options.embedding_table_storage(&[2]).unwrap());
+                assert_eq!(has_disk, storage != Some(Storage::Ram));
                 for integrated in [false, true] {
                     assert!(!options.embedding_resident_scales(false, integrated));
                     assert_eq!(
-                        options.embedding_resident_scales(true, integrated),
+                        options.embedding_resident_scales(has_disk, integrated),
                         storage != Some(Storage::Ram) && override_value.unwrap_or(!integrated)
                     );
                 }

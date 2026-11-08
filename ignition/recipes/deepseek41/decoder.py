@@ -31,6 +31,54 @@ from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
 # Debug A/B (flare#193): FLARE_DS41_NO_ENGRAM=1 skips the Engram contribution in every captured forward.
 _NO_ENGRAM = os.environ.get("FLARE_DS41_NO_ENGRAM", "") not in ("", "0")
 
+# TP3 BRRR: each rank decides per layer and graph whether the fused tail (and prologue) runs, from its own environment
+# (FLARE_DS41_BRRR_LAYERS, FLARE_DS41_BRRR_PARKED_MAX_ROWS, FLARE_DS41_HOST_EXPERT_LAYERS, FLARE_DS41_HOT_EXPERTS, ...)
+# and the graph's row count. The kernel's in-kernel all-reduce needs every rank to make the same decision: a rank that
+# runs Flare's path while a peer waits in the kernel deadlocks. PreparedLayer records its decisions here and the bootstrap
+# compares them across ranks (check_brrr_decisions) in plain construction code, before any capture.
+_BRRR_DECISIONS = []
+_BRRR_CHECKED = 0
+_BRRR_DECISION_FIELDS = ("graph", "layer", "mode", "rows", "brrr", "prologue", "gated")
+
+
+def record_brrr_decision(name, index, mode, rows, uses_brrr, uses_prologue=False, gated=False):
+    _BRRR_DECISIONS.append((str(name), int(index), str(mode), int(rows), bool(uses_brrr), bool(uses_prologue), bool(gated)))
+
+
+def check_brrr_decisions(group):
+    """All-gather the BRRR decisions recorded since the previous check and raise when ranks disagree.
+
+    Collective over ``group`` (the Gloo group create_engine used): every rank must call it at the same point, from plain
+    construction code, never inside a traced or captured forward. No-op without a BRRR engine (no engine, no kernel to
+    deadlock) or without a group. Returns the number of decisions compared.
+    """
+    global _BRRR_CHECKED
+    from ignition.recipes.deepseek41.brrr import engine
+
+    if group is None or engine() is None:
+        return 0
+    import torch.distributed as dist
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("check_brrr_decisions must run outside CUDA graph capture")
+    pending, _BRRR_CHECKED = list(_BRRR_DECISIONS[_BRRR_CHECKED:]), len(_BRRR_DECISIONS)
+    gathered = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, pending, group=group)
+    root = gathered[0]
+    for rank, other in enumerate(gathered[1:], 1):
+        if other == root:
+            continue
+        if len(other) != len(root):
+            detail = f"rank 0 recorded {len(root)} layer decisions, rank {rank} recorded {len(other)}"
+        else:
+            at = next(i for i, (a, b) in enumerate(zip(root, other)) if a != b)
+            detail = (f"rank 0 decided {dict(zip(_BRRR_DECISION_FIELDS, root[at]))}, "
+                      f"rank {rank} decided {dict(zip(_BRRR_DECISION_FIELDS, other[at]))}")
+        raise RuntimeError("BRRR layer decisions differ between ranks (the fused kernel's all-reduce would deadlock): "
+                           f"{detail}. Every rank must see the same FLARE_DS41_BRRR_* and FLARE_DS41_HOST_EXPERT_LAYERS/"
+                           "FLARE_DS41_HOT_EXPERTS/FLARE_DS41_GLOBAL_COLD environment and graph catalog.")
+    return len(pending)
+
 @dataclass(frozen=True)
 class Scratch:
     """BF16 decoder activations and FP32 target vocabulary logits."""
@@ -246,7 +294,7 @@ class PreparedLayer:
             from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
             self.attention.external_tail = True
             self.brrr = PreparedBRRRTail(index, weights, s, self.attention.window_metadata.position,
-                                         rotary.frequencies[bool(self.attention.ratio)])
+                                         rotary.frequencies[bool(self.attention.ratio)], config=pool.config)
             # FLARE_DS41_BRRR_PROLOGUE=1: fused attention prologue too, on plain layers of graphs with <= 8 rows (BRRR's
             # PROLOGUE_MAXM). Excluded: no carried state (post materialized), Engram, indexer/KV sources (they reuse
             # Flare-format quantized q-low / normalized input), the layer that owns window metadata.
@@ -258,6 +306,8 @@ class PreparedLayer:
                 self.brrr_prologue = PreparedBRRRPrologue(index, weights, s, att.window_metadata.position,
                                                           rotary.frequencies[bool(att.ratio)], text["rms_norm_eps"], buffers)
                 att.external_prologue = True
+        if brrr_layers():
+            record_brrr_decision(name, index, mode, rows, self.brrr is not None, self.brrr_prologue is not None, gated)
 
     def __call__(self):
         s = self.scratch

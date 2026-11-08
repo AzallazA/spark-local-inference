@@ -152,6 +152,8 @@ impl Stats {
     }
 }
 
+pub use reader::default_gather_threads;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Storage {
     #[default]
@@ -341,50 +343,42 @@ impl Shared {
         max_tokens: usize,
         context: usize,
         device: i32,
-        storage: Storage,
+        storage: &[Storage],
         cache_bytes: u64,
         workers: usize,
+        gather_threads: usize,
         resident_scales: bool,
     ) -> Result<Arc<Self>> {
-        if storage == Storage::Ram && cache_bytes != 0 {
+        if storage.len() != index.tables.len() {
+            return Err("embedding table storage list does not match the table count".into());
+        }
+        if cache_bytes != 0 && storage.iter().all(|s| *s == Storage::Ram) {
             return Err("embedding row cache requires disk table storage".into());
         }
         let index = Arc::new(index);
         let stats = Arc::new(Stats::default());
-        let table_bytes: u128 = index
-            .tables
-            .iter()
-            .flat_map(|table| &table.planes)
-            .map(|plane| plane.nbytes as u128)
-            .sum();
-        // TP3: FLARE_ENGRAM_RAM_LAYERS="0" keeps those Engram layers (index within this table set) fully
-        // in RAM; the remaining disk layers share the whole row-cache budget.
-        let ram_layers: Vec<usize> = std::env::var("FLARE_ENGRAM_RAM_LAYERS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|v| v.trim().parse().ok())
-            .collect();
+        // Disk tables of this set share the row-cache budget in proportion to their bytes;
+        // RAM-resident tables take none of it.
         let disk_bytes: u128 = index
             .tables
             .iter()
-            .enumerate()
-            .filter(|(i, _)| !ram_layers.contains(i))
-            .flat_map(|(_, table)| &table.planes)
+            .zip(storage)
+            .filter(|(_, storage)| **storage == Storage::Disk)
+            .flat_map(|(table, _)| &table.planes)
             .map(|plane| plane.nbytes as u128)
             .sum::<u128>()
             .max(1);
         let readers = index
             .tables
             .iter()
-            .enumerate()
-            .map(|(position, table)| {
-                let ram = storage == Storage::Ram || ram_layers.contains(&position);
+            .zip(storage)
+            .map(|(table, storage)| {
+                let ram = *storage == Storage::Ram;
                 let bytes: u128 = table.planes.iter().map(|plane| plane.nbytes as u128).sum();
-                let share = if ram_layers.is_empty() { table_bytes } else { disk_bytes };
-                let budget = if ram && storage != Storage::Ram {
+                let budget = if ram {
                     0
                 } else {
-                    usize::try_from(cache_bytes as u128 * bytes / share)
+                    usize::try_from(cache_bytes as u128 * bytes / disk_bytes)
                         .map_err(|_| "embedding row cache exceeds host address range")?
                 };
                 let rows = max_tokens
@@ -400,6 +394,7 @@ impl Shared {
                     workers,
                     resident_scales && !ram,
                 )
+                .map(|reader| reader.with_gather_threads(gather_threads))
             })
             .collect::<Result<Vec<_>>>()?;
         Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)
