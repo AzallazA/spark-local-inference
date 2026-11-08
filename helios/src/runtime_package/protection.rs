@@ -2636,7 +2636,8 @@ impl PayloadAuthorizedPackage {
                     .allocations
                     .iter()
                     .filter(|allocation| matches!(allocation.memory, super::format::Memory::Device))
-                    .map(|allocation| allocation.nbytes as u64)
+                    // TP3 merged expert banks are device-resident only up to their declared device bytes.
+                    .map(|allocation| super::mixed_device_bytes(allocation).unwrap_or(allocation.nbytes) as u64)
                     .sum(),
             })
             .collect()

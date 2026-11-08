@@ -234,9 +234,11 @@ class PreparedLayer:
         # FLARE_DS41_BRRR_PARKED_MAX_ROWS=N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
         # verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300, BRRR-26 level).
         from ignition.recipes.deepseek41.weights import host_expert_layers
-        parked_rows = int(os.environ.get("FLARE_DS41_BRRR_PARKED_MAX_ROWS", "0"))
+        parked_rows = int(os.environ.get("FLARE_DS41_BRRR_PARKED_MAX_ROWS", "0") or 0)
         rows = metadata.positions.numel()
-        gated = bool(parked_rows) and index in host_expert_layers() and rows > parked_rows
+        # A layer counts as parked only if it actually has a host tail (HOT >= 384 loads it fully resident, no hot_map).
+        parked = index in host_expert_layers() and self.hot_map is not None
+        gated = bool(parked_rows) and parked and rows > parked_rows
         if index in brrr_layers() and mode in ("decode", "verify") and not gated:
             # TP3 BRRR experiment: one fused kernel from the attention output to the MLP all-reduce.
             if self.cold_experts is not None or self.image_mask is not None:

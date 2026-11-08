@@ -1485,6 +1485,16 @@ class DirectWeightLoader:
             w2_block_scales=swizzle_block_scale(s2) if format == "nvfp4" else s2, **gains)
         del s13, s2, blocks
         prepared = moe.prepare_weights(plan=plan, weights=packed, scale_scratch=scale_scratch)
+        if host_allocator is not None:
+            # Parked experts must stay in the host-mapped / mixed range: b12x's W4A8 repack is in place for our TP3
+            # geometry, but a ceil-tiled geometry (e.g. TP4's 4.5 N-tiles) makes it allocate a full device copy, which
+            # would silently undo the parking the planner already subtracted from the VRAM budget.
+            for prepared_name, parked in (("w1_fp4", w13), ("w2_fp4", w2)):
+                kept = next((getattr(obj, prepared_name) for obj in (prepared, getattr(prepared, "_impl", None))
+                             if hasattr(obj, prepared_name)), None)
+                if kept is not None and kept.untyped_storage().data_ptr() != parked.untyped_storage().data_ptr():
+                    raise RuntimeError(f"b12x re-materialised parked expert values ({prepared_name}); "
+                                       "parking would be undone and VRAM over-committed")
         source_metadata = _snapshot_fp4_sources(self._sources, tuple(
             f'{prefix}.{projection}.{name}'
             for prefix in prefixes for projection in projection_names

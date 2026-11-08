@@ -1,0 +1,27 @@
+--- a/flashinfer/experimental/b12x/moe/fused_moe/workloads.py	2026-11-07 07:30:05.283669926 -0500
++++ b/flashinfer/experimental/b12x/moe/fused_moe/workloads.py	2026-11-07 07:30:05.284736435 -0500
+@@ -8,8 +8,14 @@
+ import torch
+ 
+ 
+-TUNING_WORKLOAD_VERSION = "statistical_mix_v1"
++import os
++
++# B12X_TUNING_ROUTE_REUSE=1 adds route-reuse cases (tokens re-picking the same experts, as a request's verify rows
++# do) to the MoE tuning races; the version string keeps those tuning results apart from the default ones.
++_ROUTE_REUSE = os.environ.get("B12X_TUNING_ROUTE_REUSE") == "1"
++TUNING_WORKLOAD_VERSION = "statistical_mix_v1_route_reuse" if _ROUTE_REUSE else "statistical_mix_v1"
+ ROUTING_MIX = ("diffuse", "skewed", "correlated")
++TUNING_MIX = (*ROUTING_MIX, "shared_40", "shared_80") if _ROUTE_REUSE else ROUTING_MIX
+ ROUTING_WORKLOADS = (
+     *ROUTING_MIX,
+     "disjoint",
+@@ -150,7 +156,7 @@
+                 seed=seed + tokens + 1009 * index,
+                 device=device,
+             )
+-            for workload in ROUTING_MIX
++            for workload in TUNING_MIX
+             for index in range(samples_per_workload)
+         ]
+     )

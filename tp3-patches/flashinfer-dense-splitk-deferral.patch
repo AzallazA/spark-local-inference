@@ -1,0 +1,32 @@
+--- a/flashinfer/experimental/b12x/_lib/dense_gemm/preparation.py	2026-11-07 17:09:10.441137867 -0500
++++ b/flashinfer/experimental/b12x/_lib/dense_gemm/preparation.py	2026-11-07 18:49:53.301362565 -0500
+@@ -972,13 +972,25 @@
+             alpha_tensor_gpu=alpha_value,
+             stream_int=stream_int,
+         )
+-        if temporary is not None:
+-            self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](
+-                temporary, out, m * p.n, 1024, p.programmatic_serialization
+-            )
++        key = out.data_ptr()
++        if temporary is not None and key in DEFERRED_SPLIT_K and p.policy.split_k_slices == 4:
++            # A registered consumer (Flare's fused MLA norm) sums the FP32 partials itself; `out` stays unwritten.
++            DEFERRED_SPLIT_K[key] = (temporary, m, p.n)
++        else:
++            if key in DEFERRED_SPLIT_K:
++                DEFERRED_SPLIT_K[key] = None  # this run reduced normally: no stale partials for the consumer
++            if temporary is not None:
++                self.reduction[(triton.cdiv(m * p.n, 1024), 1, 1)](
++                    temporary, out, m * p.n, 1024, p.programmatic_serialization
++                )
+         return out
+ 
+ 
++# GEMM output buffers (data_ptr) whose 4-way FP32 split-K partials are reduced by a registered consumer instead of
++# the reduce kernel. Keys are registered as None; a deferred run stores (partials [4, m, n], m, n), any other run resets None.
++DEFERRED_SPLIT_K: dict = {}
++
++
+ def _materialize_dense(lowering, device):
+     programs = _compile_dense_lowering(lowering.to_dict(), device.index)
+     return _DenseExecutionState(

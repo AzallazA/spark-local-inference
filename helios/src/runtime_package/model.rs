@@ -156,7 +156,8 @@ pub fn rank_needs(package: &AuthorizedPackage) -> Vec<RankNeeds> {
                 .filter(|a| {
                     protobuf::wire::Memory::try_from(a.memory) == Ok(protobuf::wire::Memory::Device)
                 })
-                .map(|a| a.nbytes)
+                // TP3 merged expert banks are device-resident only up to their declared device bytes.
+                .map(|a| super::mixed_device_bytes_named(&a.name, a.nbytes).unwrap_or(a.nbytes))
                 .sum(),
         })
         .collect()
@@ -645,13 +646,34 @@ impl NativeModel {
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
             );
+            // TP3: FLARE_ENGRAM_RAM_TABLES="0,2" keeps those Engram table groups fully in RAM (applied below when
+            // the tables are prepared); count them here so the host memory check and the row-cache budget see them.
+            let ram_tables: Vec<usize> = std::env::var("FLARE_ENGRAM_RAM_TABLES")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            // FLARE_ENGRAM_RAM_LAYERS="0" (table index within each group, applied in engram::Shared::new) also
+            // keeps whole tables in RAM; count them here too so the host memory check sees them.
+            let ram_layers: Vec<usize> = std::env::var("FLARE_ENGRAM_RAM_LAYERS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
             let resident_bytes = engram
                 .iter()
-                .flat_map(|(index, _)| &index.tables)
-                .flat_map(|table| table.planes.iter().enumerate())
-                .filter(|(ordinal, _)| {
-                    ram || (embedding_table_resident_scales && *ordinal == 1)
+                .enumerate()
+                .flat_map(|(position, (index, _))| {
+                    index.tables.iter().enumerate().map(move |(table_index, table)| (position, table_index, table))
                 })
+                .flat_map(|(position, table_index, table)| {
+                    table.planes.iter().enumerate().map(move |p| (position, table_index, p))
+                })
+                .filter(|(position, table_index, (ordinal, _))| {
+                    ram || ram_tables.contains(position) || ram_layers.contains(table_index)
+                        || (embedding_table_resident_scales && *ordinal == 1)
+                })
+                .map(|(_, _, plane)| plane)
                 .try_fold(0u64, |bytes, (_, plane)| {
                     bytes
                         .checked_add(plane.resident_bytes()? as u64)
@@ -733,16 +755,15 @@ impl NativeModel {
             if !engram.is_empty() {
                 let phase = progress.phase("Prepare embedding tables", None);
                 let storage = options.embedding_table_storage.unwrap_or_default();
-                let group_budget = embedding_table_cache_bytes / engram.len() as u64;
+                // The row-cache budget is shared by the tables that are actually disk-backed; RAM tables (global
+                // storage, or FLARE_ENGRAM_RAM_TABLES groups) need none of it.
+                let cached_groups = (0..engram.len())
+                    .filter(|position| storage != crate::engram::Storage::Ram && !ram_tables.contains(position))
+                    .count()
+                    .max(1) as u64;
+                let group_budget = embedding_table_cache_bytes / cached_groups;
                 let files = files.direct_files().collect::<Result<Vec<_>>>()?;
                 let mut bindings = Vec::new();
-                // TP3: FLARE_ENGRAM_RAM_TABLES="0,2" keeps those Engram tables fully in RAM while the
-                // others follow --embedding-table-storage (the first Engram layer has the least slack).
-                let ram_tables: Vec<usize> = std::env::var("FLARE_ENGRAM_RAM_TABLES")
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter_map(|v| v.trim().parse().ok())
-                    .collect();
                 for (position, ((index, ranks), tokens)) in engram.into_iter().zip(engram_tokens).enumerate() {
                     let first = ranks[0];
                     let storage = if ram_tables.contains(&position) {

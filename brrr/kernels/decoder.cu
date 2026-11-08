@@ -1547,7 +1547,7 @@ struct Issue {
 };
 
 // TP3 CSF stage scale area (SCALE_BYTES = 512 B): [0,128) row bases (half h at h*64; J_R2: 128 rows), [128,192) 1-bit codes
-// (half h at 128 + h*32; 4 bits per row = 4 k32 columns), [192,200) group descriptors (first | count << 24, half h at 192 + h*4),
+// (half h at 128 + h*32; 4 bits per row = 4 k32 columns), [192,200) group descriptors (no longer staged here: the consumer prefetches gdesc; format first | count << 22, 10-bit count, half h at 192 + h*4),
 // [CSF_REC,512) exception records as (position | value << 16) words (half h at CSF_REC + h*CSF_CAP*4; J_R2: up to 2*CSF_CAP).
 
 // Design C: the producer only cp.asyncs the row bases and 1-bit codes; the consumer fetches the (rare) exception records
@@ -2358,6 +2358,8 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   const auto& l = e.layers.at(layer);
   const int m = int(resid0.size(0));
   TORCH_CHECK(m >= 1 && m <= MAXM && o.stride(-1) == 1 && o.size(-1) == HDIM && o.stride(1) == HDIM && positions.scalar_type() == at::kLong);
+  TORCH_CHECK(o.scalar_type() == at::kBFloat16, "BRRR tail expects a bf16 attention output");
+  TORCH_CHECK(cos_sin.scalar_type() == at::kFloat && cos_sin.numel() == ROPE / 2, "BRRR tail expects ", ROPE / 2, " fp32 RoPE frequencies");
   const bool ids = l.w.bias_vl && input_ids && input_ids->numel() && input_ids->is_contiguous();
   TORCH_CHECK(!ids || input_ids->scalar_type() == at::kLong || input_ids->scalar_type() == at::kInt);
   TORCH_CHECK(attn_scale.has_value() == attn_base.has_value());

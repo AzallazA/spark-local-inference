@@ -266,9 +266,11 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
         buffers["speculative_prefix_limits"] = prefix_limits
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
         packed_inputs += ("speculative_prefix_limits",)
-        # Copied history proposals for `flare run --history-drafts`.
-        buffers.update(speculation.copy_buffers())
-        packed_inputs += speculation.COPY_INPUTS
+        # Copied history proposals for `flare run --history-drafts`: consumed only by the TP3 vocabulary-parallel
+        # draft path, so only that path advertises the inputs (upstream rejects --history-drafts without them).
+        if config.vocabulary_parallel_sampling:
+            buffers.update(speculation.copy_buffers())
+            packed_inputs += speculation.COPY_INPUTS
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
@@ -337,7 +339,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
     if 5120 % len(config.devices):
         # FLARE_DS41_AR_ROWS=N sizes the shared runtime for N rows instead of a whole prefill chunk; the decoder's
         # chunked reductions split prefill rows to fit (786 MiB/GPU at 4096 rows vs 190 MiB at 1024).
-        ar_rows = int(os.environ.get("FLARE_DS41_AR_ROWS", "0")) or config.prefill_chunk_size
+        ar_rows = int(os.environ.get("FLARE_DS41_AR_ROWS", "0") or 0) or config.prefill_chunk_size
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=max(config.all_reduce_tokens, min(config.prefill_chunk_size, ar_rows)), hidden_size=5120, ipc=ipc)
         prefill = collective

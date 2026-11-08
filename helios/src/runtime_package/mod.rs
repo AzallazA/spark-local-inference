@@ -1218,6 +1218,14 @@ impl Drop for NativeResources {
 
 /// TP3 merged expert bank (`mixed-<index>-<device bytes>`): device bytes of a VRAM/host-NUMA allocation.
 pub(super) fn mixed_device_bytes(allocation: &format::Allocation) -> Option<usize> {
-    let rest = allocation.name.strip_prefix("mixed-")?;
-    rest.rsplit_once('-')?.1.parse().ok()
+    mixed_device_bytes_named(&allocation.name, allocation.nbytes as u64).map(|bytes| bytes as usize)
+}
+
+/// Same, from an allocation name and size (wire bundle indexes carry names, not `format::Allocation`s).
+/// A declared device prefix larger than the allocation is rejected (treated as a plain device allocation)
+/// instead of underflowing the host tail size.
+pub(super) fn mixed_device_bytes_named(name: &str, nbytes: u64) -> Option<u64> {
+    let rest = name.strip_prefix("mixed-")?;
+    let bytes: u64 = rest.rsplit_once('-')?.1.parse().ok()?;
+    (bytes <= nbytes).then_some(bytes)
 }

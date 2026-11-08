@@ -294,6 +294,76 @@ def _fake_brrr_prologue(handle, y, resid, post, comb, pre, fn, norm, wqa, wqa_s,
     pass
 
 
+@cache
+def sparse_extension():
+    extension()  # same TORCH_EXTENSIONS_DIR / sys.path setup
+    from brrr import cuext
+
+    return cuext.extension("flare_sparse_decode")
+
+
+def brrr_sparse_enabled() -> bool:
+    """FLARE_DS41_BRRR_SPARSE=1: decode/verify attention of the main layers through BRRR's sparse decode kernel."""
+    return os.environ.get("FLARE_DS41_BRRR_SPARSE", "0") == "1"
+
+
+@torch.library.custom_op("flare::brrr_sparse_decode", mutates_args=("out", "partial", "stats", "counters"))
+def brrr_sparse_decode(q: torch.Tensor, out: torch.Tensor, swa: torch.Tensor, swa_page: int, swa_indices: torch.Tensor,
+                       swa_lengths: torch.Tensor, idx: torch.Tensor | None, idx_page: int,
+                       idx_logical: torch.Tensor | None, idx_lengths: torch.Tensor | None,
+                       idx_table: torch.Tensor | None, sink: torch.Tensor, scale: float, partial: torch.Tensor,
+                       stats: torch.Tensor, counters: torch.Tensor) -> None:
+    sparse_extension().decode(q, out, swa, swa_page, swa_indices, swa_lengths, idx, idx_page, idx_logical,
+                              idx_lengths, idx_table, sink, scale, partial, stats, counters)
+
+
+@brrr_sparse_decode.register_fake
+def _fake_brrr_sparse_decode(q, out, swa, swa_page, swa_indices, swa_lengths, idx, idx_page, idx_logical,
+                             idx_lengths, idx_table, sink, scale, partial, stats, counters):
+    pass
+
+
+SPARSE_ROWS = 64  # shared split-K scratch capacity; wider graphs keep b12x attention
+_SPARSE_SCRATCH = {}
+
+
+def sparse_supported(rows, swa_width, idx_width, heads, dim) -> bool:
+    ext = sparse_extension()
+    return (rows <= SPARSE_ROWS and heads == ext.H and dim == ext.D and swa_width == 128
+            and ext.ctas_for(swa_width + idx_width) > 0)
+
+
+class PreparedBRRRSparse:
+    """Sparse MLA decode (window + indexed keys, attention sink) in one BRRR launch per layer: per-CTA key splits
+    with the softmax merge done by the last CTA, instead of b12x's decode + merge kernels."""
+
+    def __init__(self, query, window, window_page_size, window_indices, window_lengths, sink, output, *,
+                 indexed=None, indexed_page_size=0, indexed_indices=None, indexed_lengths=None, page_table=None):
+        ext = sparse_extension()
+        device = query.device
+        key = device.index
+        if key not in _SPARSE_SCRATCH:
+            _SPARSE_SCRATCH[key] = (torch.zeros(SPARSE_ROWS * ext.CL * ext.H * ext.D, device=device),
+                                    torch.zeros(SPARSE_ROWS * ext.CL * ext.H * 2, device=device),
+                                    torch.zeros(SPARSE_ROWS, device=device, dtype=torch.int32))
+        self.partial, self.stats, self.counters = _SPARSE_SCRATCH[key]
+        if page_table is not None and page_table.dtype != torch.int32:
+            raise ValueError("BRRR sparse decode expects an int32 page table")
+        self.query, self.window, self.window_page_size = query, window, int(window_page_size)
+        self.window_indices, self.window_lengths, self.output = window_indices, window_lengths, output
+        self.sink = sink if sink.dtype == torch.float32 else sink.float().contiguous()
+        self.indexed, self.indexed_page_size = indexed, int(indexed_page_size)
+        self.indexed_indices, self.indexed_lengths, self.page_table = indexed_indices, indexed_lengths, page_table
+        self.scale = query.shape[-1] ** -.5
+
+    def __call__(self):
+        brrr_sparse_decode(self.query, self.output, self.window, self.window_page_size, self.window_indices,
+                           self.window_lengths, self.indexed, self.indexed_page_size, self.indexed_indices,
+                           self.indexed_lengths, self.page_table, self.sink, self.scale, self.partial, self.stats,
+                           self.counters)
+        return self.output
+
+
 def _skinny_scales(scales_u8, rows, cols):
     """BRRR skinny GEMM scale layout from 32x32-block UE8M0 scales [rows/32, cols/32] (brrr/skinny.py prepare())."""
     s = scales_u8.repeat_interleave(32, dim=0)[:rows]
