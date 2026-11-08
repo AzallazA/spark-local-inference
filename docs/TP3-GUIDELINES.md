@@ -260,7 +260,12 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 3. **Save work incrementally.** Agents get killed by rate limits and context resets. Commit-ready files, patch files
    and result JSON on disk survive; a plan in your head does not. Write results to a file as soon as a measurement
    ends.
-4. **Do not spawn a duplicate agent** for a task that is already running; send the existing one a message instead.
+4. **Do not spawn a duplicate agent or chain** for a task that is already running; send the existing agent a message,
+   and before launching a chain script list the running ones with `ps -eo pid,etime,args | grep '[c]hain-'` (never
+   `pgrep -f`/`pkill -f` with a pattern that is in your own command line: that kills your shell, 11-08 again). Two
+   chains driving the same compose project or server port corrupt each other's results. *Incident (11-08):* a second
+   vLLM test chain was launched while the first was still in a restart loop; both brought the same container up and
+   down and one of them lost both verify runs.
 5. **Worktrees for parallel code work.** Multiple agents editing one checkout corrupt each other's diffs. One worktree
    per task; only `~/flare-up-v3` serves.
 6. **Stop and look at the command line before killing processes**: `pgrep -f` matches your own shell. Use the `ps |
@@ -324,8 +329,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 2. **Warm the tuning cache before an H342 export.** A cold tuning cache runs out of VRAM at HOT=342; export HOT=300
    first. Needed again after every tuning version or draft-count change.
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
-4. **Never `pgrep -f` a pattern that appears in your own command line.** It killed the working shell twice. Use
-   `ps -eo pid,args | awk '$2=="./flare/target/release/flare" && $3=="run"'`.
+4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
+   three times. Use `ps -eo pid,args | awk '$2=="./flare/target/release/flare" && $3=="run"'`, or kill by PID.
 5. **`chmod +x` new scripts**; run chains as tracked background jobs. **Always `/usr/bin/env`, never bare `env`:** uv
    puts its own `env` shim first on PATH and a command run through it exits 0 having done nothing (the release
    scripts already say so; the 11-08 bisect chain lost a run to it anyway). *Incident:* a confirmation chain "ran" three
