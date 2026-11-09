@@ -108,6 +108,13 @@ class TP3Config:
     """Admit vocabulary-parallel sampling at TP3 (b12x gathers enabled for world 3)."""
     joint_headroom_mib: int | None = None
     """Compile headroom override (MiB) for the --joint-tuning contextual-selection phase only."""
+    # --- graph scratch (decoder.py Scratch, engram.py; bootstrap.py sizes the pools) ---
+    engram_chunk_rows: int = 0
+    """Engram projection, its all-reduce and the mix run in row chunks of N inside wider graphs (prefill), so the
+    ``local``/``partial``/``projected`` scratch holds N rows instead of a whole prefill chunk; 0 = one pass (base)."""
+    share_engram_residual: bool = False
+    """``engram_residual`` reuses ``ffn_hc.residual``'s storage (the layer before an Engram layer never defers its
+    mHC post, so the two never hold live values at once); False = separate storage (base)."""
     # --- BRRR fused layer kernel (brrr.py, decoder.py) ---
     brrr_layers: frozenset = field(default_factory=frozenset)
     """Layers whose decode/verify tail (o-proj .. MLP all-reduce) runs in BRRR's fused kernel (``"0-39"``)."""
@@ -149,13 +156,13 @@ class TP3Config:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "global_cold", "ar_rows", "brrr_parked_max_rows"):
+        for name in ("hot_experts", "global_cold", "ar_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
         for name in ("merged_bank", "embed_host", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
-                     "brrr_sparse", "fused_qkv_norm", "mini", "no_engram", "probe"):
+                     "brrr_sparse", "fused_qkv_norm", "mini", "no_engram", "probe", "share_engram_residual"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
@@ -183,6 +190,9 @@ class TP3Config:
             raise ValueError("TP3 config: brrr_dense_native=False needs brrr_layers")
         if self.brrr_break not in (None, "rope"):
             raise ValueError(f"TP3 config: brrr_break must be unset or 'rope', not {self.brrr_break!r}")
+        if self.engram_chunk_rows % 128:
+            raise ValueError("TP3 config: engram_chunk_rows must be a multiple of 128 (row-slice alignment of the "
+                             "chunked Engram operands and the graph capacity ladder)")
         if self.tp3_graph_gib is not None and not self.tp3_graph_gib > 0:
             raise ValueError("TP3 config: tp3_graph_gib must be positive")
         if self.joint_headroom_mib is not None and (type(self.joint_headroom_mib) is not int or self.joint_headroom_mib < 0):
@@ -250,6 +260,8 @@ class TP3Config:
             tp3_graph_gib=cls.graph_gib_from_environment(env),
             tp3_vocab_parallel=cls.vocab_parallel_from_environment(env),
             joint_headroom_mib=None if not headroom else int(headroom),
+            engram_chunk_rows=integer("ENGRAM_CHUNK_ROWS"),
+            share_engram_residual=flag("SHARE_ENGRAM_RESIDUAL"),
             brrr_layers=parse_layers(get("BRRR_LAYERS")),
             brrr_parked_max_rows=integer("BRRR_PARKED_MAX_ROWS"),
             brrr_ckpt=None if not ckpt else Path(ckpt),

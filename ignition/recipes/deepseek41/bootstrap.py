@@ -453,15 +453,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         if (weights.config.decoder_start is not None
                 and weights.config.text["candidate_source_layer_id"] >= weights.config.decoder_start):
             candidate_tokens = min(candidate_tokens, 128)
+        # TP3 fork graph-scratch savings (default off): chunked Engram projection rows, engram_residual on ffn_hc.residual.
+        # Every rank reads one TP3Config, so every rank allocates the same shapes and aliases.
+        scratch_options = dict(engram_chunk_rows=tp3.engram_chunk_rows, share_engram_residual=tp3.share_engram_residual)
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=candidate_tokens)
+            buffers=activation_buffers.cursor(), candidate_tokens=candidate_tokens, **scratch_options)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=config.prefill_chunk_size)
+            buffers=activation_buffers.cursor(), candidate_tokens=config.prefill_chunk_size, **scratch_options)
             if config.prompt_logprobs else None)
         # The suffix boundary gathers from the full prefill into disjoint destinations.
-        suffix_storage = Scratch.allocate(128, 1, shard.world_size, device, buffers=prefill_storage.buffers)
+        suffix_storage = Scratch.allocate(128, 1, shard.world_size, device, buffers=prefill_storage.buffers,
+            **scratch_options)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device,
-            buffers=activation_buffers.cursor())
+            buffers=activation_buffers.cursor(), **scratch_options)
         window_staging = (decoder_storage.buffers.zeros(
             (len(weights.layers), slots, (128 + max(config.speculative_widths)) * 528), torch.uint8)
             if config.dspark else None)

@@ -75,6 +75,33 @@ def check_brrr_decisions(group):
                            "hot_experts, global_cold) and graph catalog.")
     return len(pending)
 
+def defers_post(index, engram_layers, aux_layers=()):
+    """Whether layer ``index`` leaves its mHC post to the next layer's attention mHC (lagged hyperconnection).
+
+    It never does before an Engram layer (the Engram mix reads the posted ``residual``) or a draft feedback layer
+    (which reads ``residual`` before the layer runs), nor in the last layer. ``engram_layers`` holds one flag per layer.
+    TP3 fork: tp3.share_engram_residual relies on the Engram rule (the Engram layer then never carries).
+    """
+    following = index + 1
+    return following < len(engram_layers) and not engram_layers[following] and following not in aux_layers
+
+
+def aliases(left, right):
+    """Construction-time check: do two tensors overlap in one storage? (Never call it inside a traced forward.)"""
+    if left.untyped_storage()._cdata != right.untyped_storage()._cdata:
+        return False
+    a, b = left.storage_offset() * left.element_size(), right.storage_offset() * right.element_size()
+    return a < b + right.nbytes and b < a + left.nbytes
+
+
+def check_engram_residual(index, scratch, carry):
+    """tp3.share_engram_residual guard: a carried layer's attention mHC reads the previous layer's ffn_hc.residual,
+    which the Engram mix would overwrite when engram_residual shares its storage. Construction code only."""
+    if carry and aliases(scratch.engram_residual, scratch.ffn_hc.residual):
+        raise ValueError(f"layer {index}: engram_residual shares ffn_hc.residual's storage, so an Engram layer "
+                         "must not receive a deferred mHC post (carry)")
+
+
 @dataclass(frozen=True)
 class Scratch:
     """BF16 decoder activations and FP32 target vocabulary logits."""
@@ -116,15 +143,26 @@ class Scratch:
 
     @classmethod
     def allocate(cls, tokens, samples, world, device, *, experts=384, top_k=6, buffers=None,
-                 candidate_tokens=None):
+                 candidate_tokens=None, engram_chunk_rows=0, share_engram_residual=False):
+        """``engram_chunk_rows`` and ``share_engram_residual`` are the TP3 fork's graph-scratch savings
+        (tp3.engram_chunk_rows, tp3.share_engram_residual); their defaults allocate the base layout."""
         if buffers is None:
             buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
         def zeros(*shape, dtype=torch.bfloat16, cursor=buffers):
             return cursor.zeros(shape, dtype)
-        residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
+        if share_engram_residual:
+            residual, engram_residual = zeros(tokens, 4, 5120), None
+        else:
+            residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
         pre_mix, attn_mix = zeros(tokens, 4, dtype=torch.float32), zeros(tokens, 4, dtype=torch.float32)
         attention_hc = MHCScratch.allocate(tokens, 5120, device, buffers=buffers)
         ffn_hc = MHCScratch.allocate(tokens, 5120, device, buffers=buffers)
+        if share_engram_residual:
+            # Lifetimes (PreparedLayer.__call__ with carry=False, which PreparedDecoder guarantees for Engram layers
+            # and PreparedLayer checks): the Engram mix writes engram_residual, the layer's attention mHC reads it,
+            # and only then does the layer's ffn mHC write ffn_hc.residual; the previous layer's post consumed its
+            # ffn_hc.residual into `residual` before the Engram mix runs.
+            engram_residual = ffn_hc.residual
         attention = AttentionScratch.allocate(tokens, world, device, buffers=buffers, candidate_tokens=candidate_tokens)
         attention_output, mlp_output = zeros(tokens, 5120), zeros(tokens, 5120)
         _, vocabulary = TensorParallelShard(0, world).padded_partition(129280, alignment=64)
@@ -134,7 +172,7 @@ class Scratch:
         # Embedding, Engram projection, and feed-forward intermediates execute serially.
         embed, lookup, ffn = buffers.fork(), buffers.fork(), buffers.fork()
         embedding = zeros(tokens, 5120, cursor=embed)
-        engram = EngramScratch.allocate(tokens, device, buffers=lookup, world=world)
+        engram = EngramScratch.allocate(tokens, device, buffers=lookup, world=world, chunk_rows=engram_chunk_rows)
         shared = MLPScratch.allocate(tokens, 5120, 2304 // world, device, buffers=ffn)
         router_logits = zeros(tokens, experts, dtype=torch.float32, cursor=ffn)
         router = RouterScratch.allocate(tokens, device, experts=experts, top_k=top_k, buffers=ffn)
@@ -213,6 +251,8 @@ class PreparedLayer:
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
                 runtime=runtime, coordinator=coordinator)
+        if self.engram is not None:
+            check_engram_residual(index, s, carry)
         source = s.engram_residual if self.engram is not None else s.residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
@@ -376,7 +416,8 @@ class PreparedDecoder:
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch if self.packing is None else (
             suffix_scratch if suffix_scratch is not None else Scratch.allocate(
-                128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device))
+                128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device,
+                engram_chunk_rows=tp3.engram_chunk_rows, share_engram_residual=tp3.share_engram_residual))
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
@@ -424,8 +465,7 @@ class PreparedDecoder:
                         source_indices=self.window_metadata)
                     layer = replace(layer, attention={key: value for key, value in layer.attention.items()
                                                       if key not in ("compressor", "index_k", "index_norm")})
-            defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
-                     and index + 1 not in self.aux_layers)
+            defer = defers_post(index, [layer.engram is not None for layer in weights.layers], self.aux_layers)
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
