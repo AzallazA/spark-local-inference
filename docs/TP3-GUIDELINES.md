@@ -283,6 +283,30 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     CLI flag. The fork's `FLARE_DS41_*` switches are allowed only because they stay in the recipe + `export.sh`.
 12. **Be honest about verdicts.** "Level" is a valid and common result; most fusions here measured level because the
     kernels overlap on side streams. Do not stretch a 1-run +4% into an adoption.
+13. **Size KV with the dry run, not a load.** `flare run <pkg> <serve flags> --dry-run` prints each rank's memory plan,
+    the KV tokens and snapshot slots in seconds, without a CUDA context, while the server keeps serving. Use it before
+    a sweep, when choosing serve flags, and before crediting a build with a KV change (D.1 rule 4). Accuracy:
+    exact on the five DeepSeek-V4.1-Flash TP3 loads it was calibrated on; 0.4 % low (TP3) and 1.3 % low (TP2) on
+    GLM-5.3-Flash, which was not in the calibration, so read it as a slightly conservative estimate for other models.
+    `--dry-run-free-memory` replaces the assumed free memory (driver total minus 606 MiB) when a GPU is shared.
+14. **Hide the GPUs from CPU test runs** while anything serves or benchmarks: prefix `CUDA_VISIBLE_DEVICES=`. Some
+    `*_cuda` tests run whenever a GPU is visible, not only with `FLARE_RUN_CUDA_TESTS=1`. *Incident (11-08):* a CPU
+    test pass put a CUDA test onto the GPUs for a few seconds in the middle of a benchmark sweep.
+15. **Never edit a chain script that is running or waiting;** bash reads scripts as it goes. Kill and relaunch it, or
+    write a new file and `mv` it over the old path (new inode) for a script that has not started yet. Gate each
+    follow-on chain on a success marker, not a "done" marker. *Incident (11-08):* a comparison chain waited for
+    "export done", which the failed TP3 export also wrote, and benchmarked TP2 alone.
+16. **A new rank or head count meets kernel limits that tests on other shapes never hit.** Check the qualification
+    lists before exporting: b12x's BF16 x MXFP8 batched GEMM takes 8, 16 or 32 heads only; the sparse-MLA kernel
+    mis-tiles 22 heads; the shipped TP3 runtime collective ladder stops at 24 MiB (a 4096-row prefill at hidden 4096
+    reduces 32 MiB). Check per-layer formats too: a draft layer can be stored differently from the target layers
+    (GLM-5.3-Flash FP4-Local: layer 45's `kv_b_proj` is MXFP8, the target layers' are BF16). Each of these failed a
+    TP3 export about 11 minutes in; a mini export or a format scan of the index finds them sooner.
+17. **Speculation settings trade tokens per step against steps per second.** Read both before choosing. *Example
+    (GLM-5.3-Flash TP3, 5 drafts):* adaptive verification off raised tokens per step from 2.23 to 2.72 and cut c1
+    steps/s from 112 to 76, i.e. -16 % tok/s; alpha 0.6 reached 2.49 tokens per step at level tok/s.
+18. **One Flare binary serves packages from other branches** when their Rust is unchanged: check
+    `git diff --stat <base> HEAD -- flare helios heliopause` before building a second binary.
 
 ---
 
