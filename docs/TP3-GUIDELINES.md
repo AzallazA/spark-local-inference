@@ -446,3 +446,22 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 2. Separate "bug hunt" from "how could this be better".
 3. Unadopted experiments stay only behind default-off switches, with the verdict in the docstring, and get reviewed
    like production code (they produced two latent bugs).
+
+### D.6 Quality checks per change (tiered)
+
+Small changes get quick checks before they become the local default; the full suite runs once, on the exact package
+being published, before any public release. Every change stays behind its own switch, so a full-suite failure on a
+combined build is found by exporting with switches toggled, not by reverting code.
+
+1. **Every change:** its own targeted test (layer test with FP64 bounds and the negative control, or the mini-export
+   `consistency.py` check), `verify_fix` with 0 TRUE corruptions, the 43-question eval and the 60 tool-call prompts.
+2. **Decode-path changes** (experts, BRRR tail, sampling, drafts): add hotel-lights at c8 (short prompt, long
+   generated reasoning; catches drift in the decode path).
+3. **Prefill, attention or context changes** (prefill chunking, Engram lookups over the prompt, indexer, KV writes):
+   add hotel-lights and lavd at c8 (lavd is a long structured CSV context; it exercises prefill and long-context
+   consistency, which hotel-lights does not).
+4. **Memory, KV or graph-layout changes:** add the c8 KV stress test, where they fail.
+5. **Before a public release:** the full `qual_all.sh` suite (eval, tools, lavd and hotel at c8, retrieval 128K and
+   900K, long generation, EOS, LiveBench, stress) on the package being published.
+6. **Full suite on a single change before it becomes the default** when it touches sampling or verification math, the
+   chat template or tool parsing, or when any quick check flagged it even once.
