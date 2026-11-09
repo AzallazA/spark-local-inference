@@ -81,6 +81,73 @@ DEFAULT_ROWS = (1, 6, 8, 12, 16, 17, 24, 48)
 # the attention branch dominates the FFN input (sensitive to o-projection and RoPE errors).
 PROFILES = (("random", 1.0), ("uniform", 1.0), ("branch", 0.05))
 COMPARED = ("mlp_output", "ffn_residual", "ffn_post", "ffn_comb", "pre_mix")
+# Opt-in timing pass (not a correctness check): FLARE_DS41_BRRR_TEST_PROFILE=<iterations> times every width after the
+# sweep with L2 flushed before each launch; with DS41_FUSED_PROF=1 it also prints the kernel's per-job accumulators and
+# phase marks. FLARE_DS41_BRRR_TEST_PROFILE_MIX lists row correlations (0 = independent random rows, ~36 distinct
+# experts at m=6; higher values pull every row toward row 0 so fewer distinct experts are routed, like real decode).
+JOB_NAMES = ("WOA", "AMIX", "WOB", "XA", "OWNA", "XNORM", "GATE", "ROUTE", "SH1", "SH2", "MIX", "R1", "R2", "XF")
+
+
+def _profile_widths(*, rank, group, device, ext, layer, rows_sweep, paths, positions, route_counts, iters):
+    """Median per-launch time (min over ranks: the last rank to arrive does not wait on the others) and, with
+    DS41_FUSED_PROF=1, the job-phase timeline of that launch relative to the first CTA entry (globaltimer, ~1 us
+    resolution on some drivers)."""
+    import statistics
+
+    mixes = tuple(float(x) for x in os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE_MIX", "0,0.7").split(",") if x.strip())
+    prof = os.environ.get("DS41_FUSED_PROF", "0") not in ("", "0")
+    flush = torch.empty(256 << 20, dtype=torch.uint8, device=device)  # > 128 MiB L2
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    seed = 50_000 + 1000 * layer
+    for m in rows_sweep:
+        _, brrr_rows, _, tail = paths[m]
+        for mix in mixes:
+            seed += 1
+            p0 = _fill_inputs(brrr_rows, m, seed=seed, rank=rank, profile="random", resid_scale=1.0, device=device)
+            for t in (brrr_rows.attention.attended, brrr_rows.attention_hc.residual):
+                t[:m].copy_(((1 - mix) * t[:m].float() + mix * t[:1].float()).to(t.dtype))
+            positions[:m].copy_(p0)
+            times, phases, accs, distinct = [], [], [], []
+            for _ in range(iters):
+                if route_counts is not None:
+                    route_counts.zero_()
+                flush.zero_()
+                torch.cuda.synchronize(device)
+                dist.barrier(group=group)
+                start.record()
+                tail(brrr_rows.attention.attended)
+                stop.record()
+                torch.cuda.synchronize(device)
+                times.append(start.elapsed_time(stop) * 1e3)
+                if route_counts is not None:
+                    distinct.append(int((route_counts > 0).sum()))
+                if prof:
+                    pr = ext.prof_read()
+                    accs.append(pr[:16].double())
+                    phases.append(pr[16:].double())
+            mine = statistics.median(times)
+            gathered = [None] * WORLD
+            dist.all_gather_object(gathered, mine, group=group)
+            best = min(range(WORLD), key=lambda r: gathered[r])
+            if rank == best:
+                line = (f"[brrr-profile] layer {layer} m={m} mix={mix}: {mine:.1f} us/launch (median of {iters}, L2 flushed;"
+                        f" ranks {[round(x, 1) for x in gathered]}), distinct experts "
+                        f"{statistics.median(distinct) if distinct else 'n/a'}")
+                if prof:
+                    ph = torch.stack(phases).median(0).values  # per-launch absolute marks, median over launches
+                    acc = torch.stack(accs).median(0).values
+                    rel = torch.stack([p - p[15, 0] for p in phases]).median(0).values / 1e3  # us since first CTA entry
+                    line += "\n  job    jobs  1st-acq  1st-run  last-run  last-end | sum stage-wait  dep-wait     run (us over CTAs)"
+                    for t, name in enumerate(JOB_NAMES):
+                        if acc[t, 3] == 0:
+                            continue
+                        line += (f"\n  {name:6s} {int(acc[t, 3]):5d} {rel[t, 0]:8.1f} {rel[t, 1]:8.1f} {rel[t, 3]:9.1f} {rel[t, 2]:9.1f} |"
+                                 f" {acc[t, 0] / 1e3:14.1f} {acc[t, 1] / 1e3:9.1f} {acc[t, 2] / 1e3:7.1f}")
+                    line += (f"\n  kernel: last CTA entry {rel[15, 1]:.1f}, first/last consumer exit {rel[15, 2]:.1f}/{rel[15, 3]:.1f},"
+                             f" C_FIN first/last {rel[14, 0]:.1f}/{rel[14, 1]:.1f}, counter reset done {rel[14, 2]:.1f} us"
+                             f" (marks are absolute; {int(ph[15, 0] > 0)} = recorded)")
+                print(line, flush=True)
+            dist.barrier(group=group)
 
 
 def _rows():
@@ -426,6 +493,10 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                 ref_rows, _, reference, _ = paths[capacity]
                 launch(capacity, "heldout", 1.0, 1000 * layer + 999, ref_rows, heldout_rows, reference, heldout, heldout_positions)
                 dist.barrier(group=group)
+                iters = int(os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE", "0"))
+                if iters > 0 and not expect_failure:
+                    _profile_widths(rank=rank, group=group, device=device, ext=ext, layer=layer, rows_sweep=rows_sweep,
+                                    paths=paths, positions=positions, route_counts=route_counts, iters=iters)
                 gathered = [None] * WORLD
                 dist.all_gather_object(gathered, failures, group=group)
                 every = [f for part in gathered for f in part]
@@ -459,6 +530,10 @@ def _base_env(snapshot, layer):
         "FLARE_DS41_MERGED_BANK": None,
         "FLARE_DS41_BRRR_PARKED_MAX_ROWS": None,
         "DS41_FUSED_TEST": None,
+        # Timing pass and kernel profiling pass through from the caller's environment (see _profile_widths).
+        "FLARE_DS41_BRRR_TEST_PROFILE": os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE"),
+        "FLARE_DS41_BRRR_TEST_PROFILE_MIX": os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE_MIX"),
+        "DS41_FUSED_PROF": os.environ.get("DS41_FUSED_PROF"),
     }
 
 
