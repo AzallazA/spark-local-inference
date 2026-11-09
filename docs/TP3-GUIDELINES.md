@@ -453,6 +453,11 @@ Small changes get quick checks before they become the local default; the full su
 being published, before any public release. Every change stays behind its own switch, so a full-suite failure on a
 combined build is found by exporting with switches toggled, not by reverting code.
 
+0. **Measure the benefit first.** Before any quality check, show that the change improves what it is for (speed in an
+   alternating A/B, KV in a dry run, prefill, host RAM) beyond the variances in D.1, with no loss elsewhere. A change
+   that does not pay off stays behind its default-off switch with the verdict recorded, and gets no qualification run.
+   Only correctness tests that guard the measurement itself (the layer test, the mini-export consistency check) run
+   before the A/B, so a broken build is not timed.
 1. **Every change:** its own targeted test (layer test with FP64 bounds and the negative control, or the mini-export
    `consistency.py` check), `verify_fix` with 0 TRUE corruptions, the 43-question eval and the 60 tool-call prompts.
 2. **Decode-path changes** (experts, BRRR tail, sampling, drafts): add hotel-lights at c8 (short prompt, long
