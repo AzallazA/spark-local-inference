@@ -114,6 +114,11 @@ CUDA_VISIBLE_DEVICES=0 FLARE_RUN_CUDA_TESTS=1 FLARE_DS41_SNAPSHOT=/m2-2/flare-ck
     .venv/bin/pytest -x -s tests/recipes/test_deepseek41_expert_parking_cuda.py
 # kernel micro-tests
 .venv/bin/python tp3-tools/test_fused_qkv_norm.py ; .venv/bin/python tp3-tools/test_flare_sparse_decode.py
+# GPU tests that session.tune() then compile_forward() a planned Triton kernel (GLM indexer/MLA, DS41 indexer)
+# need the kernel caches pinned as `ignition export` pins them, or Inductor's first kernel repoints
+# TRITON_CACHE_DIR and the deferred b12x load fails with "planned Triton program has not been compiled":
+export TRITON_CACHE_DIR=~/.cache/flare/kernels/triton B12X_COMPILE_CACHE_DIR=~/.cache/flare/kernels/b12x \
+       TORCHINDUCTOR_CACHE_DIR=~/.cache/flare/kernels/inductor
 ```
 
 Traces: `nsys profile` on the serving process at c1 and c8 (existing captures `serve-node-v3-c1.nsys-rep`,
