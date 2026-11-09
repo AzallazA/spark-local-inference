@@ -320,7 +320,8 @@ struct Weights {
 
 struct Params {
   const bool* pad;  // TP3 route log: vLLM's is_padding mask (persistent buffer; nullptr = count every row)
-  unsigned long long* prof;  // TP3 debug: per job type [acquire wait, dependency wait, run, count] in ns (nullptr = off)
+  unsigned long long* prof;  // TP3 debug: per job type [acquire wait, dependency wait, run, count] in ns (nullptr = off),
+                             // then PROF_PHASES phase-mark rows (see prof_mark / prof_read)
   int test;  // TP3 debug: 1 = add CSF-style per-stage barriers on the raw path; 2 = CSF expands into sm.sx instead of in place
   int attn_per_chunk_flags;  // TP3: one-shot (m < TWO_SHOT_MIN) attention exchange posts a flag per chunk like the FFN exchange (0 = one flag for all chunks)
   Peers peers;
@@ -366,6 +367,27 @@ struct Smem {
 };
 
 constexpr unsigned SPIN_NS = 200;
+
+// TP3 debug (DS41_FUSED_PROF=1 only): per-launch phase marks after the 16 x 4 accumulators, in globaltimer ns.
+// Row t < J_END (job type): [first acquire, first run start, last run end, last run start]; row PH_FIN: [first C_FIN
+// arrival, last C_FIN arrival, counter reset done, 0]; row PH_KERNEL: [first CTA entry, last CTA entry, first consumer
+// exit, last consumer exit]. "first" values are stored bit-inverted so one atomicMax keeps the minimum against the
+// zeroed buffer; prof_read() returns them decoded (0 = never recorded). Read once per launch (prof_read resets).
+constexpr int PROF_ACC = 16 * 4, PROF_PHASES = 16 * 4, PH_FIN = 14, PH_KERNEL = 15;
+
+__device__ __forceinline__ unsigned long long globaltimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+__device__ __forceinline__ void prof_first(unsigned long long* prof, int row, int col, unsigned long long t) {
+  atomicMax(prof + PROF_ACC + row * 4 + col, ~t);
+}
+
+__device__ __forceinline__ void prof_last(unsigned long long* prof, int row, int col, unsigned long long t) {
+  atomicMax(prof + PROF_ACC + row * 4 + col, t);
+}
 
 __device__ __forceinline__ void mbar_init(unsigned long long* bar, unsigned count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_u32(bar)), "r"(count) : "memory");
@@ -1698,6 +1720,11 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   } else {
     const int tid = threadIdx.x;
     Ctx c{p, sm, layout(p.m), tid >> 5, tid & 31, tid, 0, 0u};
+    if (p.prof && tid == 0) {
+      const unsigned long long t_entry = globaltimer();
+      prof_first(p.prof, PH_KERNEL, 0, t_entry);
+      prof_last(p.prof, PH_KERNEL, 1, t_entry);
+    }
     pdl_wait();
     c.epoch = ld_volatile(p.s.epoch) + 1;
     unsigned long long t_begin = 0, t0 = 0, t1 = 0, t2 = 0;
@@ -1719,12 +1746,18 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t3));
         unsigned long long* q = p.prof + job.type * 4;
         atomicAdd(q + 0, t1 - t0); atomicAdd(q + 1, t2 - t1); atomicAdd(q + 2, t3 - t2); atomicAdd(q + 3, 1ull);
+        prof_first(p.prof, job.type, 0, t1);
+        prof_first(p.prof, job.type, 1, t2);
+        prof_last(p.prof, job.type, 2, t3);
+        prof_last(p.prof, job.type, 3, t2);
       }
     }
     if (p.prof && tid == 0) {
       unsigned long long t_end;
       asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_end));
       atomicAdd(p.prof + 15 * 4 + 0, t_end - t_begin); atomicAdd(p.prof + 15 * 4 + 3, 1ull);
+      prof_first(p.prof, PH_KERNEL, 2, t_end);
+      prof_last(p.prof, PH_KERNEL, 3, t_end);
     }
   }
   __syncthreads();
@@ -1733,6 +1766,11 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   if (threadIdx.x == 0) {
     __threadfence();
     sm.last = atomicAdd(p.s.counters + C_FIN, 1u) == gridDim.x - 1;
+    if (p.prof) {
+      const unsigned long long t_fin = globaltimer();
+      prof_first(p.prof, PH_FIN, 0, t_fin);
+      prof_last(p.prof, PH_FIN, 1, t_fin);
+    }
   }
   __syncthreads();
   if (!sm.last) return;
@@ -1743,6 +1781,7 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
     __threadfence();
     atomicAdd(p.s.epoch, 1u);
     __threadfence();
+    if (p.prof) prof_last(p.prof, PH_FIN, 2, globaltimer());
   }
 }
 
@@ -1812,12 +1851,20 @@ void csf_expand_all(torch::Tensor storage, torch::Tensor gdesc, std::vector<int6
 static unsigned long long* g_prof = nullptr;
 static const bool* g_pad = nullptr;
 void set_pad(torch::Tensor t) { TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kBool); g_pad = t.data_ptr<bool>(); }
+// Rows 0..15: accumulators [acquire wait, dependency wait, run, count] per job type (row 15: consumer loop total);
+// rows 16..31: phase marks (PROF_PHASES, absolute globaltimer ns, "first" columns decoded, 0 = not recorded).
 torch::Tensor prof_read() {
-  auto out = torch::zeros({16, 4}, torch::kInt64);
+  auto out = torch::zeros({32, 4}, torch::kInt64);
   if (!g_prof) return out;
   TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
-  TORCH_CHECK(cudaMemcpy(out.data_ptr<int64_t>(), g_prof, 16 * 4 * 8, cudaMemcpyDeviceToHost) == cudaSuccess);
-  TORCH_CHECK(cudaMemset(g_prof, 0, 16 * 4 * 8) == cudaSuccess);
+  TORCH_CHECK(cudaMemcpy(out.data_ptr<int64_t>(), g_prof, (PROF_ACC + PROF_PHASES) * 8, cudaMemcpyDeviceToHost) == cudaSuccess);
+  TORCH_CHECK(cudaMemset(g_prof, 0, (PROF_ACC + PROF_PHASES) * 8) == cudaSuccess);
+  auto* v = reinterpret_cast<unsigned long long*>(out.data_ptr<int64_t>()) + PROF_ACC;
+  auto decode = [&](int row, int col) { unsigned long long& x = v[row * 4 + col]; x = x ? ~x : 0; };
+  for (int t = 0; t < J_END; ++t) { decode(t, 0); decode(t, 1); }
+  decode(PH_FIN, 0);
+  decode(PH_KERNEL, 0);
+  decode(PH_KERNEL, 2);
   return out;
 }
 
@@ -2011,7 +2058,10 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   const c10::cuda::CUDAGuard guard(resid0.device());
   Params p{};
   static const bool prof_on = getenv("DS41_FUSED_PROF") && atoi(getenv("DS41_FUSED_PROF"));
-  if (prof_on && !g_prof) { TORCH_CHECK(cudaMalloc(&g_prof, 16 * 4 * 8) == cudaSuccess); TORCH_CHECK(cudaMemset(g_prof, 0, 16 * 4 * 8) == cudaSuccess); }
+  if (prof_on && !g_prof) {
+    TORCH_CHECK(cudaMalloc(&g_prof, (PROF_ACC + PROF_PHASES) * 8) == cudaSuccess);
+    TORCH_CHECK(cudaMemset(g_prof, 0, (PROF_ACC + PROF_PHASES) * 8) == cudaSuccess);
+  }
   p.prof = prof_on ? g_prof : nullptr;
   p.pad = g_pad;
   static const int test_mode = getenv("DS41_FUSED_TEST") ? atoi(getenv("DS41_FUSED_TEST")) : 0;
