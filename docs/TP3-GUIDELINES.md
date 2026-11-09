@@ -368,7 +368,14 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 6. **One compose command at a time.** `down` racing `up` leaves "removal already in progress" and a hung start.
 7. **vLLM prompt logprobs one request at a time**; MMLU-style evals need 2,048 output tokens (20% of replies reason
    first; 207 answers were unparsed with an 8-token cap).
-8. **No `flare models gc` during an export.**
+8. **No `flare models gc` during an export.** 
+9. **Check free space on the package store before every export.** A GLM-5.3-Flash TP3 variant writes about 73 GB of new
+   blobs (experts in a new layout share nothing), a DeepSeek re-export about 4 GB. Version files are hardlinks into the
+   shared blob store, so `models list` shows almost nothing reclaimable per version; space comes back only through
+   `flare models remove` plus `flare models gc` (never during an export). Archive first with `rsync -aH` of the whole
+   store to the archive drive, check the archive lists every version, then remove and gc. *Incident (11-08):* the boot
+   drive reached 100 % and a GLM export failed while writing its package ("No space left on device", reported by the
+   other ranks as a broken pipe); gc of orphans from failed exports freed 93 GB, archiving 19 non-default versions 250 GB.
 12. **`/tmp` is a 126 GB tmpfs: it is RAM.** Never point a large or long-running log, download, clone or checkpoint
     at `/tmp`; use `~/ds41-tp3/` or `/m2-2/`. `aria2c --log` writes at debug level unless `--log-level=warn` is given.
     *Incident (11-08):* a 30 GB aria2c debug log in `/tmp` starved the vLLM TP3 image of pinned host RAM (driver
