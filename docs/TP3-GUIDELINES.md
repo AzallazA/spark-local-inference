@@ -98,8 +98,8 @@ the non-default switches in the export progress and records every switch in `tp3
 never absolute). Everything downstream receives the `TP3Config` instance; new switches are fields there, not new
 `os.environ` reads. `FLARE_DS41_VISION_STAGE=1` implies `FLARE_DS41_VISION_HOST=1` (staging reads from the parked
 copy; `VISION_HOST=0` alone keeps the tower in VRAM only when staging is off too). Export and serving cannot overlap
-(VRAM). Mini export for kernel/wiring checks: `./mini-exp.sh "<brrr layers>" <label>` (6-layer model,
-~10 min, then `tp3-tools/consistency.py`).
+(VRAM). Mini export for kernel/wiring checks: `SNAP=<truncated view> LAYERS=<brrr layers> tp3-tools/mini-export.sh`
+(export, serve, `tp3-tools/consistency.py`, stop; ~10 min; refuses to start next to a running server).
 
 ### A.6 GPU tests and traces
 
@@ -202,7 +202,7 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    fields from result JSON. Scripts must write to `QUAL_OUT`/run dirs.
 3. Every number quoted in README/EXPORT/MEASUREMENTS must point at a log or `results/` file with its power, cap and
    PCM. Package/model name in docs = `ds41-1017-engram-mxfp4`.
-4. Commit as AzallazA. Push only when the user has said so (public pushes need an explicit OK each time).
+4. Commit with the identity configured in the checkout. Push only with the maintainer's explicit OK (each public push).
 
 ### B.4 Code review of the fork
 
@@ -217,7 +217,7 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 1. Validate the state (B.1/B.2), commit on `ds41-tp3-v3`, push to Gitea.
 2. Tag it `flare-tp3-YYYYMMDD` (annotated: settings and measurements in the message), push branch and tag to `public`,
    and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
-3. The recipes folder is dated by the day the change was made (user rule, 2026-11-08): a new
+3. The recipes folder is dated by the day the change was made (release convention): a new
    `DeepSeek-V4.1-Flash Flare-tp3-YYYYMMDD` folder per release day, copied from the previous one and edited; earlier
    folders stay as published. Its README describes the changes **since the previous folder** (not since the first
    one): intro list, "Coming from <previous>" migration notes, headline table labelled with the builds it holds; the
@@ -354,7 +354,7 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 ### D.2 Exporting and serving
 
 1. **Mini export first only for risky kernel or wiring changes**; settings and placement changes go straight to a
-   full export (user policy). A mini run catches compile/trace/wiring failures, not speed.
+   full export (working policy). A mini run catches compile/trace/wiring failures, not speed.
 2. **Warm the tuning cache before an H342 export.** A cold tuning cache runs out of VRAM at HOT=342; export HOT=300
    first. Needed again after every tuning version or draft-count change.
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
@@ -436,8 +436,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    `git ls-files -s | md5sum`. Quote the correct file count.
 5. **Every number traces to a log or `results/` file**, with power, cap and PCM; say when it came from the pre-rebase
    fork.
-6. **Git identity `AzallazA <54420448+AzallazA@users.noreply.github.com>`.** Commit and push only when asked; public
-   pushes need an explicit OK; history rewrites need an explicit OK and a force-push warning.
+6. **Commit with the checkout's configured identity** (agent memory notes hold it). Commit and push only when asked;
+   public pushes need an explicit OK; history rewrites need an explicit OK and a force-push warning.
 
 ### D.5 Reviews
 
