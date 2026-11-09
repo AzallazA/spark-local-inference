@@ -96,7 +96,9 @@ def _profile_widths(*, rank, group, device, ext, layer, rows_sweep, paths, posit
 
     mixes = tuple(float(x) for x in os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE_MIX", "0,0.7").split(",") if x.strip())
     prof = os.environ.get("DS41_FUSED_PROF", "0") not in ("", "0")
-    flush = torch.empty(256 << 20, dtype=torch.uint8, device=device)  # > 128 MiB L2
+    # Zeroed once and flushed by reading: a per-launch zero_() left L2 full of dirty lines whose write-backs inflated
+    # the kernel's first reads (WOA 18.4 vs 7.0 us per job unflushed).
+    flush = torch.zeros(256 << 20, dtype=torch.uint8, device=device)  # > 128 MiB L2
     start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     seed = 50_000 + 1000 * layer
     for m in rows_sweep:
@@ -111,9 +113,12 @@ def _profile_widths(*, rank, group, device, ext, layer, rows_sweep, paths, posit
             for _ in range(iters):
                 if route_counts is not None:
                     route_counts.zero_()
-                flush.zero_()
+                flush.sum(dtype=torch.int64)
                 torch.cuda.synchronize(device)
                 dist.barrier(group=group)
+                # Keep the GPU busy while the host enqueues the eager custom op (~30 us of argument checks and launch),
+                # so the events time the kernel, as a CUDA graph replay does in production.
+                torch.cuda._sleep(200_000)
                 start.record()
                 tail(brrr_rows.attention.attended)
                 stop.record()
