@@ -139,16 +139,17 @@ class TP3Config:
     brrr_sparse: bool = False
     """Main-layer decode/verify attention through BRRR's one-launch sparse decode kernel (tabled: measured level)."""
     brrr_split_tail: int = 0
-    """Kernel (item 6c, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    """Kernel (item 6c, experimental, default off; NOT adopted 2026-11-09: layer A/B slower at N = 2/48/96/192):
     the last N expert-down (R2) jobs in job order, and every shared-down (SH2) job after the first of them, run as two
     K halves so the final wave of the layer is shorter; 0 = off. N > 0 selects the BRRR_SPLIT_TAIL=1 build (one build for
     every N; N is an engine setting)."""
     brrr_fast_route: bool = False
-    """Kernel (item 6f, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    """Kernel (item 6f, experimental, default off; NOT adopted 2026-11-09: layer A/B -0.5/-1.9/-2.0 us/layer at
+    m = 1/6/12, but end to end level, c1 1.004x / c4 0.989x / c8 0.998x):
     ROUTE jobs load the bias, input id and bank slots before the gate wait and reserve their route entries with one
     64-bit atomic; bit-identical routing. Compile-time define BRRR_FAST_ROUTE."""
     brrr_counter_parity: bool = False
-    """Kernel (item 6d, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    """Kernel (item 6d, experimental, default off; NOT adopted 2026-11-09: layer A/B no gain):
     two counter sets by launch parity, each CTA clears the previous launch's set at start, so the last CTA no longer
     zeroes 7662 counters on the critical path. Compile-time define BRRR_COUNTER_PARITY; the export zeroes both sets
     (brrr.Engine.zero_ranges, for deterministic package bytes)."""

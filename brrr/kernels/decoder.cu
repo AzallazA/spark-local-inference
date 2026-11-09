@@ -1069,8 +1069,8 @@ __device__ __forceinline__ void select_topk(const float (&score)[PER], float (&k
 }
 
 #if BRRR_FAST_ROUTE
-// BRRR_FAST_ROUTE (TP3Config.brrr_fast_route; experimental, default off, verdict pending the GPU A/B in
-// analysis brrr-item6-impl-20261108): the same routing arithmetic as job_route, reordered. Before the gate wait it loads
+// BRRR_FAST_ROUTE (TP3Config.brrr_fast_route; experimental, default off; 2026-11-09: layer A/B faster by 0.5-2 us/layer
+// but end to end level, not adopted): the same routing arithmetic as job_route, reordered. Before the gate wait it loads
 // everything the gate does not produce: the input id (a graph input; ROUTE runs after the consumer's pdl_wait), the bias
 // row it selects and the bank slots of this lane's 3 experts; the chosen experts' slots then travel by shuffle instead of
 // a dependent hot_map load. Entry reservation: one 64-bit atomic on {NHOT:NCOLD} per ROUTE job (lane 0, counts from

@@ -59,7 +59,7 @@ the split tail the FP64 bound counts the extra half-sum roundings (TailReference
 kernel's own split layout (split_tail_layout) against the CPU mirror in test_deepseek41_brrr_item6.py.
 resident-/parked-item6-equivalence compare fast_route and counter_parity with the plain build on the same inputs:
 every route's (bank slot, FP32 weight bits) exactly (route_state), against the plain build's launch-to-launch noise,
-plus the outputs bitwise, with split_tail as the negative control (_equivalence). The full file is 14 cases and 5
+plus the outputs bitwise; split_tail's output difference is reported only (_equivalence). The full file is 14 cases and 5
 extension builds, about 60-70 minutes.
 Opt-in A/B timing: FLARE_DS41_BRRR_TEST_AB="split_tail:96,fast_route,counter_parity" (variants joined by "+" combine)
 times each variant against the build with all three off, alternating, at FLARE_DS41_BRRR_TEST_AB_ROWS (default 1,6,12;
@@ -254,8 +254,10 @@ def _equivalence(*, rank, rows_sweep, group, device, storage, layer, weights, co
 
     Same inputs through: plain three times (the noise floor: the FP32 red.add order of WOA/WOB and the expert sums is
     timing-dependent, so two plain launches can differ in a few BF16 elements and, through the gate input, in the route
-    weights), fast_route, counter_parity, and split_tail over every down job (negative control: it changes the summation
-    of whole down projections and must be seen to differ). Primary check, per launch: every route's (bank slot, FP32
+    weights), fast_route, counter_parity, and split_tail over every down job (reported only: it changes the summation
+    of whole down projections, but measured 2026-11-09 its 4-22K differing output elements sit inside the plain build's
+    own run-to-run floor of 10-24K, so it cannot serve as a negative control; fast_route and counter_parity passed within
+    the floor). Primary check, per launch: every route's (bank slot, FP32
     weight bits) read back from the kernel (route_state) must equal the plain launch's; launches where the plain repeats
     already disagree count as noise, and a variant may not mismatch more often than 2 x the noise. Secondary: the five
     outputs bitwise. counter_parity keeps the job layout, so its output difference must stay within 2 x floor + 8 per
@@ -316,8 +318,6 @@ def _equivalence(*, rank, rows_sweep, group, device, storage, layer, weights, co
     allowed = 2 * floor + 8 * launches
     if diff["counter_parity"] > allowed:
         failures.append((rank, "equivalence", "counter_parity", f"{diff['counter_parity']} output elements differ (allowed {allowed})"))
-    if diff["split_tail"] <= floor:
-        failures.append((rank, "equivalence", "split_tail", f"negative control not detected: {diff['split_tail']} <= floor {floor}"))
     gathered = [None] * WORLD
     dist.all_gather_object(gathered, (report, failures), group=group)
     if rank == 0:
@@ -864,7 +864,7 @@ CASES = {
     "resident-item6": dict(parked=False, per_chunk="1", broken=False, item6=ITEM6_ALL),
     "parked-item6": dict(parked=True, per_chunk="1", broken=False, item6=ITEM6_ALL),
     "resident-item6-break-rope": dict(parked=False, per_chunk="1", broken=True, item6=ITEM6_ALL),
-    # Bit-exact check of fast_route / counter_parity against the plain build (split_tail as its negative control).
+    # Bit-exact check of fast_route / counter_parity against the plain build (split_tail's difference reported only).
     "resident-item6-equivalence": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_TEST_EQUIV": "1", **TRAP}),
     # parked: hot_map slots, cold entries (the low NCOLD half of fast_route's 64-bit atomic) and the slot shuffle
     "parked-item6-equivalence": dict(parked=True, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_TEST_EQUIV": "1", **TRAP}),
