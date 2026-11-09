@@ -1336,7 +1336,16 @@ __device__ __forceinline__ void routed(Ctx& c, const Span& en, int ks, int kw, S
     mma_fp4(q, lo4(a), hi4(a), frag(stage, q * 4 + rt, c.lane), __byte_perm(b.x.x, b.x.y, 0x6420), __byte_perm(b.x.x, b.x.y, 0x7531), sa, b.s);
   };
   auto load = [&](int tt, int k) { return load_q(c, ks, kw, tt, k); };
-  if (csf) gemm<8>(c, en, ks, acc, load, step, [&](const uint8_t* stage, int s) { expand_csf(c, *csf, stage, halves, r0, descs[s], dbg0 + s * 256, dbg1 + s * 256); });
+  // descs[] stays in registers: the stage index s is a runtime loop variable in gemm(), and indexing descs[s] directly
+  // turned the array into a local-memory stack slot (one LDL per routed stage). Select it with constant indices instead.
+  auto desc_at = [&](int s) {
+    unsigned d = descs[0];
+#pragma unroll
+    for (int i = 1; i < 6; ++i)
+      if (s == i) d = descs[i];
+    return d;
+  };
+  if (csf) gemm<8>(c, en, ks, acc, load, step, [&](const uint8_t* stage, int s) { expand_csf(c, *csf, stage, halves, r0, desc_at(s), dbg0 + s * 256, dbg1 + s * 256); });
   else if (c.p.test == 1) gemm<8>(c, en, ks, acc, load, step, [&](const uint8_t* stage, int) { volatile unsigned sink = stage_words(stage)[c.tid]; (void)sink; c.sync(); });
   else gemm<8>(c, en, ks, acc, load, step);
   stores(c, en, acc, [&](int rt, int tt, const float (&a)[8]) {
