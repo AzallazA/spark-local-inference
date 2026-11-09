@@ -48,7 +48,7 @@ CONTRIBUTING.md requires `git commit -s` (DCO sign-off) on every commit.
 
 | Order | Proposal | Repository | Size | Blocking need |
 |---|---|---|---|---|
-| 1 | [05 small fixes](05-small-generic-fixes.md), tiny-decode `swiglu_limit` guard | flashinfer | 1 file | Reproducer for the corruption the fork attributes to flare#193 |
+| 1 | [05 small fixes](05-small-generic-fixes.md), tiny-decode `swiglu_limit` guard | flashinfer | 1 file | Standalone reproducer (TP1-3 shapes; independent of flare#193, which was checkpoint behaviour) |
 | 2 | 05, world-size-3 DCP all-to-all tables | flashinfer | 2 files | A b12x test at world 3 |
 | 3 | [03 vocabulary-parallel world sizes](03-vocabulary-parallel-world-sizes.md) | flare | small | Order 2 merged; TP4 regression run we cannot do |
 | 4 | [04 shared all-reduce sizing](04-chunked-all-reduce-sizing.md) | flare | small | Confirm the DMA all-reduce divisibility constraint in b12x; prefill measurements |

@@ -12,9 +12,21 @@ Problem. `_w4a8_mx_micro_supported` in
 selects the tiny-decode kernel from token count, shapes, activation name, and
 determinism only. `_tiny_decode_supports` (main line 13032) checks
 `activation == "silu"`. The kernel implements plain SiLU-GLU; DeepSeek V4.1
-sets `swiglu_limit = 10`, so a decode step routed to it runs unclamped. The
-fork's comment attributes a decode corruption to this and cites flare#193; the
-submitter must reproduce it, as this document does not establish that link.
+sets `swiglu_limit = 10`, so a decode step routed to it runs unclamped.
+
+Effect seen in the fork (TP3, DeepSeek V4.1 Flash): experts whose activations
+exceed the clamp (for example layer 39 expert 313 on rank 0) blow up the last
+layer's MoE output 16-600x and produce one junk decode token, after which the
+reply recovers. Same package A/B with the guard: 10 to 0 true corruptions in 20
+`verify_fix` runs. The tiny kernel is chosen when the per-rank expert width is a
+multiple of 128 (TP1/2/3: 2304/1152/768); TP4 (576) takes the compact micro
+kernel, which clamps.
+
+This is not the cause of flare#193. That issue (TP4) was traced upstream to the
+checkpoint itself: DeepSeek's own API and the #118 CPU reference give the same
+flat next-token distribution at the same positions (thread, 2026-11-06/07).
+Fork comments that cite flare#193 date from before that conclusion; they mean
+the same symptom (one junk token mid-reply), not the same cause.
 
 Fork patch: `tp3-patches/flashinfer-tiny-decode-swiglu.patch` adds
 `swiglu_limit`, `swiglu_alpha`, `swiglu_beta` parameters and requires all three
