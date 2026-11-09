@@ -138,6 +138,23 @@ class TP3Config:
     Environment: unset = on; a set value is read like C ``atoi`` ("" and non-numbers = off), as the kernel did."""
     brrr_sparse: bool = False
     """Main-layer decode/verify attention through BRRR's one-launch sparse decode kernel (tabled: measured level)."""
+    brrr_split_tail: int = 0
+    """Kernel (item 6c, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    the last N expert-down (R2) jobs in job order, and every shared-down (SH2) job after the first of them, run as two
+    K halves so the final wave of the layer is shorter; 0 = off. N > 0 selects the BRRR_SPLIT_TAIL=1 build (one build for
+    every N; N is an engine setting)."""
+    brrr_fast_route: bool = False
+    """Kernel (item 6f, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    ROUTE jobs load the bias, input id and bank slots before the gate wait and reserve their route entries with one
+    64-bit atomic; bit-identical routing. Compile-time define BRRR_FAST_ROUTE."""
+    brrr_counter_parity: bool = False
+    """Kernel (item 6d, experimental, default off; verdict pending the GPU A/B chain brrr-item6-chain.sh, 2026-11-08):
+    two counter sets by launch parity, each CTA clears the previous launch's set at start, so the last CTA no longer
+    zeroes 7662 counters on the critical path. Compile-time define BRRR_COUNTER_PARITY; the export zeroes both sets
+    (brrr.Engine.zero_ranges, for deterministic package bytes)."""
+    brrr_spin_trap: bool = False
+    """Test builds only: a BRRR protocol wait that has not finished after ~2^25 polls prints and traps instead of hanging
+    the GPUs (compile-time define BRRR_SPIN_TRAP; never for timing or export)."""
     # --- other opt-in kernels (attention.py) ---
     fused_qkv_norm: bool = False
     """qkv_a's 4-way split-K reduction fused into the MLA norm + MXFP8 encode (tabled: bit-identical, measured level)."""
@@ -156,13 +173,15 @@ class TP3Config:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value))
-        for name in ("hot_experts", "global_cold", "ar_rows", "brrr_parked_max_rows", "engram_chunk_rows"):
+        for name in ("hot_experts", "global_cold", "ar_rows", "brrr_parked_max_rows", "brrr_split_tail",
+                     "engram_chunk_rows"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"TP3 config: {name} must be a non-negative integer, not {value!r}")
         for name in ("merged_bank", "embed_host", "vision_host", "vision_stage", "tp3_vocab_parallel",
                      "brrr_native_scales", "brrr_dense_native", "brrr_csf_check", "brrr_log", "fused_attn_per_chunk",
-                     "brrr_sparse", "fused_qkv_norm", "mini", "no_engram", "probe", "share_engram_residual"):
+                     "brrr_sparse", "brrr_fast_route", "brrr_counter_parity", "brrr_spin_trap", "fused_qkv_norm", "mini", "no_engram",
+                     "probe", "share_engram_residual"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"TP3 config: {name} must be a boolean")
         if any(type(layer) is not int or layer < 0 for layer in (*self.host_expert_layers, *self.brrr_layers)):
@@ -183,7 +202,8 @@ class TP3Config:
             raise ValueError("TP3 config: brrr_parked_max_rows needs brrr_layers")
         if self.brrr_layers and self.brrr_ckpt is None:
             raise ValueError("TP3 config: brrr_layers needs brrr_ckpt (the checkpoint view BRRR reads its dense copies from)")
-        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break"):
+        for name in ("brrr_native_scales", "brrr_csf_check", "brrr_break", "brrr_split_tail", "brrr_fast_route",
+                     "brrr_counter_parity", "brrr_spin_trap"):
             if getattr(self, name) and not self.brrr_layers:
                 raise ValueError(f"TP3 config: {name} needs brrr_layers")
         if not self.brrr_dense_native and not self.brrr_layers:
@@ -272,6 +292,10 @@ class TP3Config:
             brrr_break=get("BRRR_BREAK") or None,
             fused_attn_per_chunk=per_chunk is None or _atoi(per_chunk) != 0,
             brrr_sparse=flag("BRRR_SPARSE"),
+            brrr_split_tail=integer("BRRR_SPLIT_TAIL"),
+            brrr_fast_route=flag("BRRR_FAST_ROUTE"),
+            brrr_counter_parity=flag("BRRR_COUNTER_PARITY"),
+            brrr_spin_trap=flag("BRRR_SPIN_TRAP"),
             fused_qkv_norm=flag("FUSED_QKV_NORM"),
             mini=flag("MINI"),
             no_engram=truthy("NO_ENGRAM"),

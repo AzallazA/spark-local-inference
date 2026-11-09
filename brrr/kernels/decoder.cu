@@ -95,6 +95,59 @@ static_assert(OTOK * KS_WOA * 64 <= BT && OTOK * KS_WOB * 32 <= BT && OTOK * KS_
 static_assert(SPAN * KS_INTER * 32 <= BT && SPAN * (SLICES / R1_PARTS) * 32 <= BT, "routed jobs stage up to SPAN rows");
 static_assert((OTOK > SPAN ? OTOK : SPAN) * KW_INTER * 4 <= BS && OTOK * (KS_WOB / 4) * 4 <= BS, "scale staging");
 
+// TP3 item-6 experiments (handbook D.5.3: unadopted until the GPU A/B says otherwise; verdicts go into the TP3Config
+// docstrings brrr_split_tail / brrr_fast_route / brrr_counter_parity and the analysis brrr-item6-impl-20261108).
+// Compile-time switches: TP3Config -> brrr.kernel_defines -> -D flags, one extension build per combination. All 0 = the
+// kernel as before: every switch's code sits behind #if, so the default build's SASS is unchanged (cuobjdump, modulo
+// the per-compile anonymous-namespace hash in the symbol names).
+#ifndef BRRR_SPLIT_TAIL
+#define BRRR_SPLIT_TAIL 0  // 1: split-tail build; N (Params::split_tail, per engine) = the last N R2 jobs run as two K halves
+#endif
+#ifndef BRRR_FAST_ROUTE
+#define BRRR_FAST_ROUTE 0  // 1: ROUTE loads bias/ids/hot_map before the gate wait; one 64-bit entry atomic per job
+#endif
+#ifndef BRRR_COUNTER_PARITY
+#define BRRR_COUNTER_PARITY 0  // 1: two counter sets by launch parity; CTAs clear the other set at start, no last-CTA reset
+#endif
+#ifndef BRRR_SPIN_TRAP
+#define BRRR_SPIN_TRAP 0  // test builds only (TP3Config.brrr_spin_trap): a protocol wait that never ends prints and traps
+#endif
+constexpr int SPLIT_TAIL = BRRR_SPLIT_TAIL;
+constexpr int FAST_ROUTE = BRRR_FAST_ROUTE;
+constexpr int COUNTER_PARITY = BRRR_COUNTER_PARITY;
+constexpr int SPIN_TRAP = BRRR_SPIN_TRAP;
+static_assert((SPLIT_TAIL == 0 || SPLIT_TAIL == 1) && (FAST_ROUTE == 0 || FAST_ROUTE == 1) && (COUNTER_PARITY == 0 || COUNTER_PARITY == 1) &&
+                  (SPIN_TRAP == 0 || SPIN_TRAP == 1),
+              "BRRR switch values");
+#if BRRR_SPLIT_TAIL
+// A K half of an expert-down (R2) or shared-down (SH2) job: 768 / 2 = 384 K = 12 k32 slices = 3 whole stages, with the
+// activation scale words (KW_INTER, 4 k32 scales per word) and the weight scale stage (s * 4 of SH2_LD) split at stage 3.
+constexpr int HALF_STAGES = INTER_STAGES / 2, HALF_KS = KS_INTER / 2, HALF_KW = KW_INTER / 2;
+static_assert(INTER_STAGES % 2 == 0 && HALF_KS == HALF_STAGES * 4 && HALF_KW * 4 == HALF_KS && KS_INTER * 32 == INTER && HQ_LD == KS_INTER &&
+                  SH2_LD == KS_INTER && INTER % 128 == 0,
+              "split tail: the down projections' K must split into two whole 128-K stage halves");
+
+// The one place that says where a K half starts: half h (0 = whole job, 1, 2) of an R2/SH2 job covers weight stages
+// [stage0, stage0 + stages) = k32 slices [k0, k0 + ks) with kw activation scale words; producer (issue) and consumer
+// (job_r2 / job_sh2) both read it.
+struct KHalf {
+  int stage0, ks, kw, k0;
+};
+
+__host__ __device__ __forceinline__ KHalf khalf(int h) {
+  return h == 0 ? KHalf{0, KS_INTER, KW_INTER, 0} : KHalf{h == 2 ? HALF_STAGES : 0, HALF_KS, HALF_KW, h == 2 ? HALF_KS : 0};
+}
+#endif
+
+#if BRRR_SPIN_TRAP
+constexpr long long SPIN_TRAP_POLLS = 1ll << 25;  // >= 6 s of 200 ns sleeps; every legitimate wait is microseconds
+
+__device__ __noinline__ void spin_trap(const char* where, int index, unsigned target, unsigned seen) {
+  printf("[brrr spin trap] block %d thread %d: %s index %d target %u seen %u\n", blockIdx.x, threadIdx.x, where, index, target, seen);
+  __trap();
+}
+#endif
+
 __host__ __device__ __forceinline__ int tiles_of(int m) { return cdiv(m, TILE); }
 
 __host__ __device__ __forceinline__ int token_groups(int m) { return cdiv(m, OTOK); }
@@ -156,6 +209,9 @@ enum : int { J_WOA, J_AMIX, J_WOB, J_XA, J_OWNA, J_XNORM, J_GATE, J_ROUTE, J_SH1
 
 struct Job {
   int type, a, b, c, stages, e, f, n;
+#if BRRR_SPLIT_TAIL
+  int h;  // 0 = whole job, 1 / 2 = first / second K half of a split R2 or SH2 job
+#endif
 };
 
 struct Slot {
@@ -177,7 +233,75 @@ __device__ __forceinline__ Slot lagged(int r, int per) {
 
 __host__ __device__ __forceinline__ Job blocked(int type, int r, int parts, int tg, int stages) { return {type, r / (parts * tg), r / tg % parts, r % tg, stages}; }
 
+#if BRRR_SPLIT_TAIL
+// Split tail (split N = Params::split_tail). The chunk section (r = j - L.routed - n * R1_JOBS) is per chunk k: 2 tg
+// SH2 items, then n R2 items (per = 2 tg + n), laid out by lagged(): chunks k < lag contiguous, then blocks of per items
+// + XF(k - lag), then the final XF(CHUNKS - lag .. CHUNKS - 1). The window starts at the N-th R2 item from the end
+// (chunk kc, item i0): from there every SH2/R2 item becomes two consecutive jobs (K halves h = 1, 2) and XF jobs keep
+// their order, so jobs still depend only on earlier jobs. The split is a pure function of (tg, n, grid, N): the same on
+// every rank, never timing-dependent. split_items(k) = items of chunk k that run as halves = extra C_SF arrivals XF(k)
+// waits for. Host-callable so the extension can export the layout for the layer test (split_tail_layout).
+struct Tail {
+  int per, lag, kc, i0, w0;
+};
+
+__host__ __device__ __forceinline__ Tail tail_of(int tg, int n, int split, int grid) {
+  Tail t;
+  t.per = 2 * tg + n;
+  const int lag = cdiv(grid, t.per);  // exchange_lag(per) with an explicit grid
+  t.lag = lag < 1 ? 1 : lag > CHUNKS ? CHUNKS : lag;
+  if (split > n * CHUNKS) split = n * CHUNKS;
+  if (n <= 0 || split <= 0) {
+    t.kc = CHUNKS, t.i0 = 0, t.w0 = CHUNKS * (t.per + 1);  // no window
+    return t;
+  }
+  t.kc = CHUNKS - 1 - (split - 1) / n;
+  t.i0 = t.per - 1 - (split - 1) % n;  // an R2 item (i0 >= 2 tg)
+  t.w0 = t.kc < t.lag ? t.kc * t.per + t.i0 : t.lag * t.per + (t.kc - t.lag) * (t.per + 1) + t.i0;
+  return t;
+}
+
+__device__ __forceinline__ Tail tail_of(const Layout& L, int n, int split) { return tail_of(L.tg, n, split, int(gridDim.x)); }
+
+__host__ __device__ __forceinline__ int split_items(const Tail& t, int k) { return k > t.kc ? t.per : k == t.kc ? t.per - t.i0 : 0; }
+
+__host__ __device__ __forceinline__ int split_jobs(const Tail& t) { return t.kc >= CHUNKS ? 0 : (t.per - t.i0) + (CHUNKS - 1 - t.kc) * t.per; }
+
+// Chunk-section job at offset r of the split layout (r >= t.w0; below w0 the layout is lagged() unchanged).
+// Returns {chunk, item, half}; item == per marks XF(chunk); chunk == CHUNKS marks past the end.
+struct TailSlot {
+  int chunk, item, half;
+};
+
+__host__ __device__ __forceinline__ TailSlot tail_slot(const Tail& t, int r) {
+  const int per = t.per, lag = t.lag;
+  r -= t.w0;
+  const int first = 2 * (per - t.i0);
+  if (r < first) return {t.kc, t.i0 + r / 2, 1 + r % 2};
+  r -= first;
+  if (t.kc >= lag) {
+    if (r == 0) return {t.kc - lag, per, 0};
+    r -= 1;
+  }
+  const int k0 = t.kc + 1;
+  const int lim = lag < CHUNKS ? lag : CHUNKS, plain = lim - k0 > 0 ? lim - k0 : 0;  // split chunks before lag: 2 per halves, no XF
+  if (r < plain * 2 * per) return {k0 + r / (2 * per), r % (2 * per) / 2, 1 + r % 2};
+  r -= plain * 2 * per;
+  const int kb = k0 > lag ? k0 : lag, blocks = CHUNKS - kb;  // split chunks from lag on: 2 per halves, then XF(k - lag)
+  if (r < blocks * (2 * per + 1)) {
+    const int k = kb + r / (2 * per + 1), off = r % (2 * per + 1);
+    return off == 2 * per ? TailSlot{k - lag, per, 0} : TailSlot{k, off / 2, 1 + off % 2};
+  }
+  r -= blocks * (2 * per + 1);
+  return r < lag ? TailSlot{CHUNKS - lag + r, per, 0} : TailSlot{CHUNKS, 0, 0};
+}
+#endif
+
+#if BRRR_SPLIT_TAIL
+__device__ __forceinline__ Job decode(const Layout& L, int n, int j, const Tail& t) {  // t = tail_of(L, n, split N)
+#else
 __device__ __forceinline__ Job decode(const Layout& L, int n, int j) {
+#endif
   if (j < L.amix) return blocked(J_WOA, j, OAK / 32 / woa_ks(L.m), L.tg, woa_ks(L.m) / 4);
   if (j < L.wob) return {J_AMIX, j - L.amix, 0, 0, 1};
   if (j < L.owna) {
@@ -196,6 +320,16 @@ __device__ __forceinline__ Job decode(const Layout& L, int n, int j) {
   int r = j - L.routed;
   if (r < n * R1_JOBS) return {J_R1, r / R1_JOBS, r / R1_PARTS % R1_BLOCKS, r % R1_PARTS, 4};
   r -= n * R1_JOBS;
+#if BRRR_SPLIT_TAIL
+  if (r >= t.w0) {
+    const TailSlot ts = tail_slot(t, r);
+    const int shared = 2 * L.tg;
+    if (ts.chunk >= CHUNKS) return {J_END, 0, 0, 0, 1};
+    if (ts.item == t.per) return {J_XF, ts.chunk, 0, 0, 1};
+    if (ts.item < shared) return {J_SH2, 2 * ts.chunk + ts.item / L.tg, 0, ts.item % L.tg, khalf(ts.half).ks / 4, 0, 0, 0, ts.half};
+    return {J_R2, ts.item - shared, ts.chunk, 0, khalf(ts.half).ks / 4, 0, 0, 0, ts.half};
+  }
+#endif
   if (r < CHUNKS * chunk_jobs(L, n)) {
     const int shared = 2 * L.tg;
     const Slot sl = lagged(r, shared + n);
@@ -227,10 +361,29 @@ constexpr int C_R1D = C_R1A + ENTRIES * R1_BLOCKS;
 // Cold-first routed jobs: route entries (expert slot, 16-route chunk) are kept in one table of ENTRIES, cold slots
 // (slot >= Weights::hot_rows, host RAM over PCIe) filling it from the front and hot slots from the back, so job index
 // a < ncold is cold. Their sum is bounded by ENTRIES (each slot adds at most ceil(count / SPAN) entries).
+#if BRRR_FAST_ROUTE
+// One 64-bit word {NHOT (high) : NCOLD (low)}: each ROUTE job reserves all its new entries with one atomic.
+constexpr int C_NCOLD = C_R1D + ENTRIES;
+constexpr int C_NHOT = C_NCOLD + 1;
+constexpr int C_ECOUNT = C_NHOT + 1;
+static_assert(C_NCOLD % 2 == 0, "the {NHOT:NCOLD} word must be 8-byte aligned");
+#else
 constexpr int C_NHOT = C_R1D + ENTRIES;
 constexpr int C_NCOLD = C_NHOT + 1;
 constexpr int C_ECOUNT = C_NCOLD + 1;
+#endif
 constexpr int COUNTERS = C_ECOUNT + EXPERTS;
+#if BRRR_COUNTER_PARITY
+// Two counter sets [2][COUNTERS] plus the generation word C_GEN (launches completed on this engine) in one allocation.
+// A launch uses set gen & 1 and clears set (gen & 1) ^ 1 (the previous launch's) after pdl_wait; its last CTA only bumps
+// gen and the epoch. The parity lives beside the counters (not in the flag-page epoch) so a state where the epoch was
+// reset but the counters were not still selects the clean set; export zeroes the whole allocation (Engine.zero_ranges).
+constexpr int C_GEN = 2 * COUNTERS;
+constexpr int COUNTER_WORDS = 2 * COUNTERS + 2;
+static_assert(!FAST_ROUTE || COUNTERS % 2 == 0, "set 1 must keep the 64-bit {NHOT:NCOLD} word 8-byte aligned");
+#else
+constexpr int COUNTER_WORDS = COUNTERS;
+#endif
 
 struct Peers {
   __nv_bfloat16* pub[RANKS];
@@ -324,6 +477,9 @@ struct Params {
                              // then PROF_PHASES phase-mark rows (see prof_mark / prof_read)
   int test;  // TP3 debug: 1 = add CSF-style per-stage barriers on the raw path; 2 = CSF expands into sm.sx instead of in place
   int attn_per_chunk_flags;  // TP3: one-shot (m < TWO_SHOT_MIN) attention exchange posts a flag per chunk like the FFN exchange (0 = one flag for all chunks)
+#if BRRR_SPLIT_TAIL
+  int split_tail;  // split N: the last N R2 jobs (+ the SH2 jobs after the first of them) run as two K halves (engine setting)
+#endif
   Peers peers;
   Scratch s;
   Weights w;
@@ -361,6 +517,9 @@ struct Smem {
   float cand_key[GW * TOPK];
   float cand_score[GW * TOPK];
   int cand_expert[GW * TOPK];
+#if BRRR_FAST_ROUTE
+  int cand_slot[GW * TOPK];  // bank slot of each per-warp candidate (prefetched hot_map)
+#endif
   int flag;
   int last;
   int ready;
@@ -479,6 +638,11 @@ __device__ __forceinline__ float swiglu(float gate, float up) {
   return gate / (1.0f + expf(-gate)) * up;
 }
 
+#if BRRR_COUNTER_PARITY
+// This launch's counter set (call after pdl_wait: the previous launch's gen bump must be visible).
+__device__ __forceinline__ unsigned* counter_set(const Params& p) { return p.s.counters + (ld_volatile(p.s.counters + C_GEN) & 1u) * COUNTERS; }
+#endif
+
 struct Ctx {
   const Params& p;
   Smem& sm;
@@ -488,15 +652,27 @@ struct Ctx {
   int tid;
   int it;
   unsigned epoch;
+#if BRRR_COUNTER_PARITY
+  unsigned* ctrs;  // counter_set(p), set right after the consumer's pdl_wait
+  __device__ __forceinline__ unsigned* ctr() const { return ctrs; }
+#else
+  __device__ __forceinline__ unsigned* ctr() const { return p.s.counters; }
+#endif
 
   __device__ __forceinline__ void sync() const { asm volatile("bar.sync 1, %0;" ::"n"(GT) : "memory"); }
 
   __device__ void wait(int index, unsigned target) {
     if (tid == 0 && (index >= CACHED || sm.seen[index] < target)) {
-      unsigned seen = ld_acquire_gpu(p.s.counters + index);
+      unsigned seen = ld_acquire_gpu(ctr() + index);
+#if BRRR_SPIN_TRAP
+      long long polls = 0;
+#endif
       while (seen < target) {
         __nanosleep(SPIN_NS);
-        seen = ld_acquire_gpu(p.s.counters + index);
+        seen = ld_acquire_gpu(ctr() + index);
+#if BRRR_SPIN_TRAP
+        if (++polls == SPIN_TRAP_POLLS) spin_trap("counter wait", index, target, seen);
+#endif
       }
       if (index < CACHED) sm.seen[index] = seen;
     }
@@ -506,14 +682,14 @@ struct Ctx {
   __device__ void signal(int index) {
     sync();
     if (tid == 0) {
-      red_release(p.s.counters + index, 1u);
+      red_release(ctr() + index, 1u);
     }
   }
 
   __device__ bool arrive(int index, unsigned target) {
     sync();
     if (tid == 0) {
-      sm.flag = atom_add_acq_rel(p.s.counters + index, 1u) == target - 1;
+      sm.flag = atom_add_acq_rel(ctr() + index, 1u) == target - 1;
     }
     sync();
     return sm.flag;
@@ -597,7 +773,15 @@ __device__ void post(Ctx& c, int which, int stage, int g, unsigned target, unsig
 __device__ void await(Ctx& c, int which, int stage, int g, unsigned epoch, unsigned mask) {
   if (c.tid < RANKS && (mask >> c.tid & 1)) {
     const unsigned* flag = c.p.peers.flags[c.p.rank] + flag_index(which, stage, c.tid, g);
+#if BRRR_SPIN_TRAP
+    long long polls = 0;
+    while (before(ld_acquire_sys(flag), epoch)) {
+      __nanosleep(SPIN_NS);
+      if (++polls == SPIN_TRAP_POLLS) spin_trap("peer flag (rank = index)", c.tid, epoch, ld_acquire_sys(flag));
+    }
+#else
     while (before(ld_acquire_sys(flag), epoch)) __nanosleep(SPIN_NS);
+#endif
   }
   c.sync();
 }
@@ -884,6 +1068,109 @@ __device__ __forceinline__ void select_topk(const float (&score)[PER], float (&k
   }
 }
 
+#if BRRR_FAST_ROUTE
+// BRRR_FAST_ROUTE (TP3Config.brrr_fast_route; experimental, default off, verdict pending the GPU A/B in
+// analysis brrr-item6-impl-20261108): the same routing arithmetic as job_route, reordered. Before the gate wait it loads
+// everything the gate does not produce: the input id (a graph input; ROUTE runs after the consumer's pdl_wait), the bias
+// row it selects and the bank slots of this lane's 3 experts; the chosen experts' slots then travel by shuffle instead of
+// a dependent hot_map load. Entry reservation: one 64-bit atomic on {NHOT:NCOLD} per ROUTE job (lane 0, counts from
+// two ballots) instead of one 32-bit atomic per chunk-head lane on two words. Scores, keys, top-k, weights and the
+// route/entry sets are bit-identical; only the order of entries reserved by one job differs (lane order, which only
+// moves the FP32 red order downstream, already nondeterministic). The __threadfence before the signal is kept as in
+// job_route. Timing side effect: the C_G wait moved out of deps(), so the producer may claim the next job while ROUTE
+// still waits on the gate (no deadlock: ROUTE depends only on earlier GATE jobs and its one stage is already released).
+__device__ void job_route_fast(Ctx& c, int tok) {
+  const Params& p = c.p;
+  constexpr int EW = EXPERTS / GW, PER = EW / 32;
+  c.release();
+  const long id = !p.input_ids ? -1 : p.ids64 ? __ldg(static_cast<const long*>(p.input_ids) + tok) : long(__ldg(static_cast<const int*>(p.input_ids) + tok));
+  const float* bias = p.w.bias_vl && id >= p.image_lo && id < p.image_lo + 5 ? p.w.bias_vl : p.w.gate_b;
+  float score[PER], key[PER], bv[PER];
+  int expert[PER], slot[PER];
+#pragma unroll
+  for (int i = 0; i < PER; ++i) {
+    expert[i] = c.warp * EW + c.lane + 32 * i;
+    bv[i] = __ldg(bias + expert[i]);
+    slot[i] = p.w.hot_map ? __ldg(p.w.hot_map + expert[i]) : expert[i];
+  }
+  c.wait(C_G + tok / OTOK, GATE_BLOCKS * KP_GATE);
+#pragma unroll
+  for (int i = 0; i < PER; ++i) {
+    long long* a = p.s.gacc + tok * EXPERTS + expert[i];
+    const float v = __ll2float_rn(__ldcg(a)) / FIXED;
+    __stcg(a, 0LL);
+    score[i] = sqrtf(v > 20.0f ? v : logf(1.0f + expf(v)));
+    key[i] = score[i] + bv[i];
+    if (key[i] != key[i]) key[i] = -1e30f;
+  }
+  float kk = -INFINITY, ks = 0.0f;
+  int ke = 0;
+  select_topk(score, key, expert, c.lane, kk, ks, ke);
+  // Slot of this lane's candidate ke (lanes < TOPK): lane (ke - warp * EW) % 32 holds it at index (ke - warp * EW) / 32.
+  const int rel = ke - c.warp * EW;
+  int kslot = 0;
+#pragma unroll
+  for (int i = 0; i < PER; ++i) {
+    const int v = __shfl_sync(0xffffffffu, slot[i], rel & 31);
+    if ((rel >> 5) == i) kslot = v;
+  }
+  if (c.lane < TOPK) {
+    c.sm.cand_key[c.warp * TOPK + c.lane] = kk;
+    c.sm.cand_score[c.warp * TOPK + c.lane] = ks;
+    c.sm.cand_expert[c.warp * TOPK + c.lane] = ke;
+    c.sm.cand_slot[c.warp * TOPK + c.lane] = kslot;
+  }
+  c.sync();
+  if (c.warp == 0) {
+    const bool live = c.lane < GW * TOPK;
+    const float cand[1] = {live ? c.sm.cand_score[c.lane] : 0.0f};
+    float ckeys[1] = {live ? c.sm.cand_key[c.lane] : -INFINITY};
+    const int cexp[1] = {live ? c.sm.cand_expert[c.lane] : EXPERTS + c.lane};
+    const int cslot = live ? c.sm.cand_slot[c.lane] : 0;
+    float k2 = -INFINITY, s2 = 0.0f;
+    int e2 = 0;
+    select_topk(cand, ckeys, cexp, c.lane, k2, s2, e2);
+    float total = 0.0f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) total += __shfl_sync(0xffffffffu, s2, k);
+    // Slot of e2 for lane k < TOPK: the candidate lane whose expert is e2 (candidates are distinct experts).
+    int slot2 = 0;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+      const int ek = __shfl_sync(0xffffffffu, e2, k);
+      const unsigned owner = __ffs(__ballot_sync(0xffffffffu, cexp[0] == ek)) - 1;
+      const int v = __shfl_sync(0xffffffffu, cslot, owner & 31);
+      if (c.lane == k) slot2 = v;
+    }
+    Table* tb = p.s.table;
+    int pos = 0;
+    bool head = false, cold = false;
+    if (c.lane < TOPK) {
+      const int r = tok * TOPK + c.lane;
+      p.s.topk_w[r] = s2 * (ROUTE_SCALE / (total > 0.0f ? total : 1.0f));
+      pos = int(atomicAdd(c.ctr() + C_ECOUNT + slot2, 1u));
+      if (p.w.route_counts && !(p.pad && p.pad[tok])) atomicAdd(p.w.route_counts + e2, 1u);  // skip CUDA-graph padding rows
+      tb->routes[slot2 * MAXM + pos] = r;
+      head = pos % SPAN == 0;
+      cold = slot2 >= p.w.hot_rows;
+    }
+    const unsigned hc = __ballot_sync(0xffffffffu, head && cold), hh = __ballot_sync(0xffffffffu, head && !cold);
+    unsigned long long base = 0;
+    if (c.lane == 0 && (hc | hh))
+      base = atomicAdd(reinterpret_cast<unsigned long long*>(c.ctr() + C_NCOLD), (unsigned long long)__popc(hc) | (unsigned long long)__popc(hh) << 32);
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (head) {
+      const unsigned below = (1u << c.lane) - 1u;
+      const int ent = cold ? int(unsigned(base)) + __popc(hc & below) : ENTRIES - 1 - (int(base >> 32) + __popc(hh & below));
+      tb->expert[ent] = slot2;
+      tb->chunk[ent] = pos / SPAN;
+    }
+  }
+  __threadfence();  // as job_route: the fence stays, so the A/B measures the reordering alone
+  c.signal(C_ROUTE);
+}
+#endif
+
 __device__ void job_route(Ctx& c, int tok) {
   const Params& p = c.p;
   constexpr int EW = EXPERTS / GW, PER = EW / 32;
@@ -928,7 +1215,7 @@ __device__ void job_route(Ctx& c, int tok) {
       Table* tb = p.s.table;
       // Flare merged bank: routing and bias use the global ID; weights, scales and CSF records live at the bank slot.
       const int slot = p.w.hot_map ? __ldg(p.w.hot_map + e2) : e2;
-      const int pos = int(atomicAdd(p.s.counters + C_ECOUNT + slot, 1u));
+      const int pos = int(atomicAdd(c.ctr() + C_ECOUNT + slot, 1u));
       if (p.w.route_counts && !(p.pad && p.pad[tok])) atomicAdd(p.w.route_counts + e2, 1u);  // skip CUDA-graph padding rows
       tb->routes[slot * MAXM + pos] = r;
       if (pos % SPAN == 0) {
@@ -936,7 +1223,7 @@ __device__ void job_route(Ctx& c, int tok) {
         // producer issues cold R1/R2 jobs (PCIe reads) before hot ones. Accumulation targets (hacc/yracc) are
         // reached through red.global.add already, so the order of experts changes only the atomic summation order.
         const bool cold = slot >= p.w.hot_rows;
-        const int ent = cold ? int(atomicAdd(p.s.counters + C_NCOLD, 1u)) : ENTRIES - 1 - int(atomicAdd(p.s.counters + C_NHOT, 1u));
+        const int ent = cold ? int(atomicAdd(c.ctr() + C_NCOLD, 1u)) : ENTRIES - 1 - int(atomicAdd(c.ctr() + C_NHOT, 1u));
         tb->expert[ent] = slot;
         tb->chunk[ent] = pos / SPAN;
       }
@@ -1256,6 +1543,20 @@ __device__ void job_sh1(Ctx& c, int b, int kp, int tg) {
   if (c.arrive(C_SA + b * GROUPS + tg, KP_SH1)) finish_sh1(c, b, tg);
 }
 
+#if BRRR_SPLIT_TAIL
+// Split-tail half h (1, 2) of a shared-down job: K slices [(h - 1) * HALF_KS, h * HALF_KS), red-added into shacc like
+// the whole job; each half signals C_SF once (XF's target counts split items twice).
+__device__ void job_sh2(Ctx& c, int rb, int tg, int h) {
+  const Params& p = c.p;
+  const Span sp = group_of(p.m, tg);
+  const KHalf kh = khalf(h);
+  fill_q(
+      c, sp.count, kh.ks, kh.kw, [&](int tok) { return p.s.hsq + long(sp.first + tok) * INTER + kh.k0 * 32; },
+      [&](int tok) { return p.s.hse + (sp.first + tok) * HQ_LD + kh.k0; });
+  dense_q(c, sp, kh.ks, kh.kw, [&](int rt, int tt, const float (&a)[4]) { scatter(p.s.shacc, HID, rb * 64 + rt * 16, sp, tt, a, c.lane); });
+  c.signal(C_SF + rb / 2);
+}
+#else
 __device__ void job_sh2(Ctx& c, int rb, int tg) {
   const Params& p = c.p;
   const Span sp = group_of(p.m, tg);
@@ -1264,6 +1565,7 @@ __device__ void job_sh2(Ctx& c, int rb, int tg) {
   dense_q(c, sp, KS_INTER, KW_INTER, [&](int rt, int tt, const float (&a)[4]) { scatter(p.s.shacc, HID, rb * 64 + rt * 16, sp, tt, a, c.lane); });
   c.signal(C_SF + rb / 2);
 }
+#endif
 
 __device__ __forceinline__ float mix_reduce(const float* mixp, int tok, int lane) {
   constexpr int ROWS = SLICES / 4, BATCH = 10;
@@ -1412,6 +1714,27 @@ __device__ void job_r1(Ctx& c, const Job& job) {
   if (c.arrive(C_R1A + ei * R1_BLOCKS + bb, R1_PARTS)) finish_r1(c, ei, bb, en);
 }
 
+#if BRRR_SPLIT_TAIL
+// Split-tail half job.h (1, 2) of an expert-down job: K slices [(h - 1) * HALF_KS, h * HALF_KS) of the 768-wide
+// intermediate (activations, activation scale words, CSF column groups / sfb k-tiles all start at stage HALF_STAGES for
+// h = 2); both halves red-add w * partial into yracc and signal C_SF + rb once each.
+__device__ void job_r2(Ctx& c, const Job& job) {
+  const Params& p = c.p;
+  const int rb = job.b;
+  const KHalf kh = khalf(job.h);
+  const int s0 = kh.stage0;  // CSF column group / sfb k-tile / debug offset of the first stage
+  const Span en = entry(c, job);
+  fill_q(
+      c, en.count, kh.ks, kh.kw, [&](int i) { return p.s.hq + long(c.sm.routes[i]) * INTER + kh.k0 * 32; },
+      [&](int i) { return p.s.hqe + c.sm.routes[i] * HQ_LD + kh.k0; });
+  routed(c, en, kh.ks, kh.kw, [&](int route, int r, float4 v) {
+    const float w = __ldcg(p.s.topk_w + route);
+    red4(p.s.yracc + long(route / TOPK) * HID + rb * 128 + r, make_float4(w * v.x, w * v.y, w * v.z, w * v.w));
+  }, p.w.csf2.storage ? &p.w.csf2 : nullptr, 1, 0, ((long(job.e) * (HID / 256) + rb / 2) * (INTER / 128) + s0) * 256 + (rb % 2) * 128, 0,
+         job.e, job.e, rb * p.w.csf2.column_groups + s0);
+  c.signal(C_SF + rb);
+}
+#else
 __device__ void job_r2(Ctx& c, const Job& job) {
   const Params& p = c.p;
   const int rb = job.b;
@@ -1425,6 +1748,7 @@ __device__ void job_r2(Ctx& c, const Job& job) {
          job.e, job.e, rb * p.w.csf2.column_groups);
   c.signal(C_SF + rb);
 }
+#endif
 
 __device__ void job_xf(Ctx& c, int k) {
   const Params& p = c.p;
@@ -1472,7 +1796,11 @@ __device__ void deps(Ctx& c, const Job& job) {
       if (!split_norm(p.m))
         for (int t = 0; t < tiles_of(p.m); ++t) c.wait(C_A + t, SLICES);
       return;
+#if BRRR_FAST_ROUTE
+    case J_ROUTE: return;  // job_route_fast waits for C_G itself, after its gate-independent loads
+#else
     case J_ROUTE: return c.wait(C_G + job.a / OTOK, GATE_BLOCKS * KP_GATE);
+#endif
     case J_SH1: {
       const int k0 = job.b * KS_SH1 * 32;
       const unsigned target = split_norm(p.m) ? group_of(p.m, job.c).tiles : 512 / (KS_GATE * 16);
@@ -1482,7 +1810,24 @@ __device__ void deps(Ctx& c, const Job& job) {
     case J_SH2: return c.wait(C_HS + job.c, SH1_BLOCKS);
     case J_MIX: return c.wait(C_A + job.a * GW / TILE, SLICES);
     case J_R2: return c.wait(C_R1D + job.a, R1_BLOCKS);
-    case J_XF: return c.wait(C_SF + job.a, __ldcg(p.s.counters + C_NHOT) + __ldcg(p.s.counters + C_NCOLD) + 2 * c.L.tg);
+#if BRRR_FAST_ROUTE || BRRR_SPLIT_TAIL
+    case J_XF: {
+#if BRRR_FAST_ROUTE
+      const unsigned long long both = __ldcg(reinterpret_cast<const unsigned long long*>(c.ctr() + C_NCOLD));
+      const int n = int(unsigned(both)) + int(both >> 32);
+#else
+      const int n = int(__ldcg(c.ctr() + C_NHOT) + __ldcg(c.ctr() + C_NCOLD));
+#endif
+#if BRRR_SPLIT_TAIL
+      // split halves arrive twice on C_SF + chunk
+      return c.wait(C_SF + job.a, unsigned(n + 2 * c.L.tg + split_items(tail_of(c.L, n, p.split_tail), job.a)));
+#else
+      return c.wait(C_SF + job.a, unsigned(n + 2 * c.L.tg));
+#endif
+    }
+#else
+    case J_XF: return c.wait(C_SF + job.a, __ldcg(c.ctr() + C_NHOT) + __ldcg(c.ctr() + C_NCOLD) + 2 * c.L.tg);
+#endif
     default: return;
   }
 }
@@ -1496,9 +1841,17 @@ __device__ void run_job(Ctx& c, const Job& job) {
     case J_OWNA: return job_owna(c, job.a, job.b);
     case J_XNORM: return job_xnorm(c, job.a, job.b);
     case J_GATE: return job_gate(c, job.a, job.b, job.c);
+#if BRRR_FAST_ROUTE
+    case J_ROUTE: return job_route_fast(c, job.a);
+#else
     case J_ROUTE: return job_route(c, job.a);
+#endif
     case J_SH1: return job_sh1(c, job.a, job.b, job.c);
+#if BRRR_SPLIT_TAIL
+    case J_SH2: return job_sh2(c, job.a, job.c, job.h);
+#else
     case J_SH2: return job_sh2(c, job.a, job.c);
+#endif
     case J_MIX: return job_mix(c, job.a);
     case J_R1: return job_r1(c, job);
     case J_R2: return job_r2(c, job);
@@ -1507,12 +1860,23 @@ __device__ void run_job(Ctx& c, const Job& job) {
 }
 
 // Total route entries (hot + cold) once every J_ROUTE job has signalled; ncold = how many fill the table from the front.
-__device__ int route_table(const Params& p, int lane, int& ncold) {
+__device__ int route_table(const Params& p, const unsigned* ctrs, int lane, int& ncold) {
   int n = 0, cold = 0;
   if (lane == 0) {
-    while (ld_acquire_gpu(p.s.counters + C_ROUTE) < unsigned(p.m)) __nanosleep(SPIN_NS);
-    cold = int(__ldcg(p.s.counters + C_NCOLD));
-    n = cold + int(__ldcg(p.s.counters + C_NHOT));
+#if BRRR_SPIN_TRAP
+    for (long long polls = 0; ld_acquire_gpu(ctrs + C_ROUTE) < unsigned(p.m); __nanosleep(SPIN_NS))
+      if (++polls == SPIN_TRAP_POLLS) spin_trap("route table", C_ROUTE, unsigned(p.m), ld_acquire_gpu(ctrs + C_ROUTE));
+#else
+    while (ld_acquire_gpu(ctrs + C_ROUTE) < unsigned(p.m)) __nanosleep(SPIN_NS);
+#endif
+#if BRRR_FAST_ROUTE
+    const unsigned long long both = __ldcg(reinterpret_cast<const unsigned long long*>(ctrs + C_NCOLD));
+    cold = int(unsigned(both));
+    n = cold + int(both >> 32);
+#else
+    cold = int(__ldcg(ctrs + C_NCOLD));
+    n = cold + int(__ldcg(ctrs + C_NHOT));
+#endif
   }
   ncold = __shfl_sync(0xffffffffu, cold, 0);
   return __shfl_sync(0xffffffffu, n, 0);
@@ -1606,11 +1970,17 @@ __device__ void issue(const Params& p, const Job& job, int s, const Issue& is) {
       is.scales(w.sh13_s + long(job.a * 2) * SLICES + kg * 4, SLICES);
       return;
     }
-    case J_SH2:
-      if (w.dense_native) is.native(w.sh2, w.sh2_ld, job.a * 64, long(s) * 128);
-      else is.block(w.sh2 + (long(job.a) * INTER_STAGES + s) * FRAGS * FRAG);
-      is.scales(w.sh2_s + long(job.a * 2) * SH2_LD + s * 4, SH2_LD);
+    case J_SH2: {
+#if BRRR_SPLIT_TAIL
+      const int ks = s + khalf(job.h).stage0;  // the second K half starts at stage HALF_STAGES
+#else
+      const int ks = s;
+#endif
+      if (w.dense_native) is.native(w.sh2, w.sh2_ld, job.a * 64, long(ks) * 128);
+      else is.block(w.sh2 + (long(job.a) * INTER_STAGES + ks) * FRAGS * FRAG);
+      is.scales(w.sh2_s + long(job.a * 2) * SH2_LD + ks * 4, SH2_LD);
       return;
+    }
     case J_OWNA:
       for (int i = is.lane; i < (s ? MIX - OWNA_ROWS : OWNA_ROWS) * HC * 8; i += 32) {
         const int piece = s * OWNA_ROWS * HC + i / 8, part = i % 8, r = piece / HC, hc = piece % HC;
@@ -1641,8 +2011,13 @@ __device__ void issue(const Params& p, const Job& job, int s, const Issue& is) {
       return;
     }
     case J_R2: {
-      const int e = job.e, kq = s == INTER / 128 ? (INTER % 128) / 32 : 4;
-      const int nt = job.b, kt = s, nt256 = nt / 2;
+#if BRRR_SPLIT_TAIL
+      const int ks = s + khalf(job.h).stage0;  // the second K half starts at k-tile HALF_STAGES
+#else
+      const int ks = s;
+#endif
+      const int e = job.e, kq = ks == INTER / 128 ? (INTER % 128) / 32 : 4;
+      const int nt = job.b, kt = ks, nt256 = nt / 2;
       const uint4* tile = w.w2 + e * w.w2_stride + (long(nt256) * (INTER / 128) + kt) * 1024;
       for (int q = 0; q < kq; ++q)
 #pragma unroll
@@ -1665,16 +2040,34 @@ __device__ void producer(const Params& p, Smem& sm) {
   const unsigned long long policy = evict_first_policy();
   const volatile int* ready = &sm.ready;
   int n = -1, ncold = 0, it = 0, j = int(blockIdx.x);
+#if BRRR_COUNTER_PARITY
+  unsigned* ctrs = nullptr;  // this launch's counter set, chosen after pdl_wait (first used by the seq-0 claim below)
+#else
+  unsigned* const ctrs = p.s.counters;
+#endif
+#if BRRR_SPLIT_TAIL
+  int total = 0;  // job count including the split halves, fixed once the route table is known
+  Tail tail{};
+#endif
   for (int seq = 0;; ++seq) {
-    if (n < 0 && j >= L.routed) n = route_table(p, lane, ncold);
+#if BRRR_SPLIT_TAIL
+    if (n < 0 && j >= L.routed) {
+      n = route_table(p, ctrs, lane, ncold);
+      tail = tail_of(L, n, p.split_tail);
+      total = total_jobs(L, n) + split_jobs(tail);
+    }
+    Job job = n < 0 || j < total ? decode(L, n, j, tail) : Job{J_END, 0, 0, 0, 1};
+#else
+    if (n < 0 && j >= L.routed) n = route_table(p, ctrs, lane, ncold);
     Job job = n < 0 || j < total_jobs(L, n) ? decode(L, n, j) : Job{J_END, 0, 0, 0, 1};
+#endif
     if (job.type == J_R1 || job.type == J_R2) {
       // job.a stays the dense entry id (R1 arrive/done counters); the table row is cold-first permuted.
       const int row = entry_row(job.a, ncold);
       const int e = __ldcg(p.s.table->expert + row), ch = __ldcg(p.s.table->chunk + row);
       job.e = e;
       job.f = e * MAXM + ch * SPAN;
-      job.n = min(SPAN, int(__ldcg(p.s.counters + C_ECOUNT + e)) - ch * SPAN);
+      job.n = min(SPAN, int(__ldcg(ctrs + C_ECOUNT + e)) - ch * SPAN);
     }
     bool claimed = false;
     unsigned next = 0;
@@ -1687,16 +2080,23 @@ __device__ void producer(const Params& p, Smem& sm) {
       if (lane == 0) {
         mbar_arrive(&sm.full[slot]);
         if (!claimed && seq > 0 && job.type != J_END && *ready >= seq) {
-          next = atomicAdd(p.s.counters + C_CLAIM, 1u);
+          next = atomicAdd(ctrs + C_CLAIM, 1u);
           claimed = true;
         }
       }
     }
     if (job.type == J_END) return;
+#if BRRR_COUNTER_PARITY
+    if (seq == 0) {
+      pdl_wait();
+      ctrs = counter_set(p);
+    }
+#else
     if (seq == 0) pdl_wait();
+#endif
     if (lane == 0 && !claimed) {
       while (*ready < seq) __nanosleep(32);
-      next = atomicAdd(p.s.counters + C_CLAIM, 1u);
+      next = atomicAdd(ctrs + C_CLAIM, 1u);
     }
     j = int(gridDim.x) + int(__shfl_sync(0xffffffffu, next, 0));
   }
@@ -1705,6 +2105,9 @@ __device__ void producer(const Params& p, Smem& sm) {
 __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   extern __shared__ __align__(128) uint8_t raw[];
   Smem& sm = *reinterpret_cast<Smem*>(raw);
+#if BRRR_COUNTER_PARITY
+  unsigned* fin = nullptr;  // this launch's C_FIN (thread 0 = consumer tid 0 sets it after pdl_wait)
+#endif
   for (int i = threadIdx.x; i < CACHED; i += THREADS) sm.seen[i] = 0;
   if (threadIdx.x == 0) {
     sm.ready = -1;
@@ -1727,6 +2130,16 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
     }
     pdl_wait();
     c.epoch = ld_volatile(p.s.epoch) + 1;
+#if BRRR_COUNTER_PARITY
+    // The previous launch (complete: layer kernels never trigger dependents early, so pdl_wait returns after it and
+    // every kernel between has finished) left its counter set dirty; clear it for the next launch, spread over all CTAs.
+    c.ctrs = counter_set(p);
+    {
+      unsigned* other = p.s.counters + (c.ctrs == p.s.counters ? COUNTERS : 0);
+      for (int i = int(blockIdx.x) * GT + tid; i < COUNTERS; i += int(gridDim.x) * GT) other[i] = 0;
+    }
+    if (tid == 0) fin = c.ctrs + C_FIN;
+#endif
     unsigned long long t_begin = 0, t0 = 0, t1 = 0, t2 = 0;
     if (p.prof && tid == 0) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_begin));
     for (int seq = 0;; ++seq) {
@@ -1763,6 +2176,24 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
   __syncthreads();
   // No pdl_launch_dependents() here: an early trigger at this point measured ~2% slower at c4/c8 (2026-11-08 bisect,
   // 3 alternating rounds). No kernel in this file triggers dependents early.
+#if BRRR_COUNTER_PARITY
+  // No reset pass: the next launch clears this launch's set at its start. The last CTA bumps the generation (selects
+  // the other, already cleared set) and the epoch; every CTA read both before its own C_FIN arrival.
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const bool last = atomicAdd(fin, 1u) == gridDim.x - 1;
+    if (p.prof) {
+      const unsigned long long t_fin = globaltimer();
+      prof_first(p.prof, PH_FIN, 0, t_fin);
+      prof_last(p.prof, PH_FIN, 1, t_fin);
+    }
+    if (last) {
+      atomicAdd(p.s.counters + C_GEN, 1u);
+      atomicAdd(p.s.epoch, 1u);
+      if (p.prof) prof_last(p.prof, PH_FIN, 2, globaltimer());
+    }
+  }
+#else
   if (threadIdx.x == 0) {
     __threadfence();
     sm.last = atomicAdd(p.s.counters + C_FIN, 1u) == gridDim.x - 1;
@@ -1783,6 +2214,7 @@ __global__ void __launch_bounds__(THREADS, PER_SM) layer_kernel(Params p) {
     __threadfence();
     if (p.prof) prof_last(p.prof, PH_FIN, 2, globaltimer());
   }
+#endif
 }
 
 struct Layer {
@@ -1797,6 +2229,7 @@ struct Engine {
   int rank;
   int ctas;
   int attn_per_chunk_flags;  // TP3: one-shot attention exchange posts a flag per chunk (TP3Config.fused_attn_per_chunk)
+  int split_tail;            // TP3Config.brrr_split_tail (split builds only; 0 elsewhere)
   std::vector<Layer> layers;
 };
 
@@ -1870,12 +2303,72 @@ torch::Tensor prof_read() {
 
 int64_t flag_bytes() { return FLAG_BYTES; }
 
+// TP3 test hook (host only): the last launch's routing state of an engine. topk_w [ROUTES] fp32 route weights (route
+// r = token * TOPK + k) and routes [EXPERTS, MAXM] (bank slot s, position -> route r, -1 = unused when cleared before
+// the launch with clear_routes). Lets the layer test compare two builds' (slot, weight) per route bit for bit.
+std::vector<torch::Tensor> route_state(int64_t handle) {
+  const auto& e = engines.at(handle);
+  TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  auto w = torch::empty({ROUTES}, torch::kFloat32), r = torch::empty({EXPERTS, MAXM}, torch::kInt32);
+  TORCH_CHECK(cudaMemcpy(w.data_ptr<float>(), e.s.topk_w, ROUTES * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess);
+  TORCH_CHECK(cudaMemcpy(r.data_ptr<int>(), e.s.table->routes, sizeof(Table::routes), cudaMemcpyDeviceToHost) == cudaSuccess);
+  return {w, r};
+}
+
+void clear_routes(int64_t handle) {
+  const auto& e = engines.at(handle);
+  TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  TORCH_CHECK(cudaMemset(e.s.table->routes, 0xff, sizeof(Table::routes)) == cudaSuccess);
+  TORCH_CHECK(cudaMemset(e.s.topk_w, 0, ROUTES * sizeof(float)) == cudaSuccess);
+  TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+}
+
+#if BRRR_SPLIT_TAIL
+// TP3 test hook (host only): the split-tail chunk-section layout the kernel decodes, from the kernel's own functions:
+// one (chunk, item, half) row per job, item == 2 tg + n marks XF(chunk); plus per-chunk split_items (the XF targets'
+// extra arrivals). The layer test checks its properties and compares it with the CPU mirror.
+std::vector<torch::Tensor> split_tail_layout(int64_t tg, int64_t n, int64_t split, int64_t grid) {
+  const Tail t = tail_of(int(tg), int(n), int(split), int(grid));
+  const int total = CHUNKS * (t.per + 1) + split_jobs(t);
+  auto rows = torch::empty({total, 3}, torch::kInt32);
+  auto items = torch::empty({CHUNKS}, torch::kInt32);
+  int* out = rows.data_ptr<int>();
+  for (int r = 0; r < total; ++r) {
+    if (r >= t.w0) {
+      const TailSlot s = tail_slot(t, r);
+      out[3 * r] = s.chunk, out[3 * r + 1] = s.item, out[3 * r + 2] = s.half;
+    } else {  // lagged() with an explicit grid (its device version reads gridDim)
+      const int per = t.per, lag = t.lag;
+      int k, i, q = r;
+      if (q < lag * per) k = q / per, i = q % per;
+      else if ((q -= lag * per) < (CHUNKS - lag) * (per + 1)) {
+        k = lag + q / (per + 1), i = q % (per + 1);
+        if (i == per) k -= lag;
+      } else k = CHUNKS - lag + q - (CHUNKS - lag) * (per + 1), i = per;
+      out[3 * r] = k, out[3 * r + 1] = i, out[3 * r + 2] = 0;
+    }
+  }
+  for (int k = 0; k < CHUNKS; ++k) items.data_ptr<int>()[k] = split_items(t, k);
+  return {rows, items};
+}
+#endif
+
+// Device address and size of an engine's counter allocation (BRRR_COUNTER_PARITY: both sets + the generation word),
+// for the export's zero ranges: a package must start with every set and the generation at zero.
+std::vector<int64_t> counters_range(int64_t handle) {
+  const auto& e = engines.at(handle);
+  return {reinterpret_cast<int64_t>(e.s.counters), int64_t(COUNTER_WORDS) * int64_t(sizeof(unsigned))};
+}
+
 int64_t inbox_bytes() { return 2L * 2 * 2 * PUB_SLOT * sizeof(__nv_bfloat16); }
 
-int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, int64_t attn_per_chunk_flags) {
+int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, int64_t attn_per_chunk_flags, int64_t split_tail) {
   TORCH_CHECK(buffers.size() == RANKS);
+  TORCH_CHECK(split_tail >= 0 && split_tail <= (int64_t(1) << 30), "split_tail must be in [0, 2^30]");
+  TORCH_CHECK(split_tail == 0 || SPLIT_TAIL, "split_tail > 0 needs the BRRR_SPLIT_TAIL build");
   Engine e{};
   e.attn_per_chunk_flags = int(attn_per_chunk_flags);
+  e.split_tail = int(split_tail);
   for (int r = 0; r < RANKS; ++r) {
     e.peers.flags[r] = reinterpret_cast<unsigned*>(buffers[r]);
     e.peers.pub[r] = reinterpret_cast<__nv_bfloat16*>(buffers[r] + FLAG_BYTES);
@@ -1883,7 +2376,7 @@ int64_t create(std::vector<int64_t> buffers, int64_t rank, int64_t epoch_addr, i
   e.rank = int(rank);
   // Flare port: the epoch may live in the rank's own (exported, reset-to-zero) flag page, so flags and epoch restart together.
   e.s.epoch = epoch_addr ? reinterpret_cast<unsigned*>(epoch_addr) : zeroed<unsigned>(1);
-  e.s.counters = zeroed<unsigned>(COUNTERS);
+  e.s.counters = zeroed<unsigned>(COUNTER_WORDS);
   e.s.table = zeroed<Table>(1);
   e.s.zacc = zeroed<float>(long(MAXM) * OA);
   e.s.zq = zeroed<uint8_t>(long(MAXM) * OA);
@@ -2068,6 +2561,12 @@ void run(int64_t handle, int64_t layer, torch::Tensor o, torch::Tensor positions
   p.test = test_mode;
   // 0 restores the legacy single attention flag for m < TWO_SHOT_MIN (A/B toggle, TP3Config.fused_attn_per_chunk via create()).
   p.attn_per_chunk_flags = e.attn_per_chunk_flags;
+#if BRRR_SPLIT_TAIL
+  p.split_tail = e.split_tail;
+#endif
+  // The producer's seq-0 job (blockIdx.x) must lie before the routed section: it is decoded before pdl_wait, and the
+  // route table / counter set may only be read after it (counter-parity builds have no counter set before then).
+  TORCH_CHECK(layout(m).routed >= e.ctas, "BRRR tail: ", e.ctas, " CTAs exceed the ", layout(m).routed, " pre-route jobs at m=", m);
   p.peers = e.peers;
   p.s = e.s;
   p.w = l.w;
@@ -2113,6 +2612,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("HC_EPS") = double(HC_EPS);
   m.attr("NORM_EPS") = double(NORM_EPS);
   m.attr("TWO_SHOT_MIN") = TWO_SHOT_MIN;
+  // Compile-time item-6 switches of this build (brrr.kernel_defines); Engine checks them against its TP3Config.
+  m.attr("SPLIT_TAIL") = SPLIT_TAIL;
+  m.attr("FAST_ROUTE") = FAST_ROUTE;
+  m.attr("COUNTER_PARITY") = COUNTER_PARITY;
+  m.attr("SPIN_TRAP") = SPIN_TRAP;
+  m.def("counters_range", &counters_range);
+  m.def("route_state", &route_state);
+  m.def("clear_routes", &clear_routes);
+#if BRRR_SPLIT_TAIL
+  m.def("split_tail_layout", &split_tail_layout);
+#endif
   m.def("flag_bytes", &flag_bytes);
   m.def("prof_read", &prof_read);
   m.def("set_pad", &set_pad);
@@ -2120,7 +2630,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("inbox_bytes", &inbox_bytes);
   m.def("alloc_ipc", &alloc_ipc);
   m.def("open_ipc", &open_ipc);
-  m.def("create", &create, py::arg("buffers"), py::arg("rank"), py::arg("epoch_addr") = 0, py::arg("attn_per_chunk_flags") = 1);
+  m.def("create", &create, py::arg("buffers"), py::arg("rank"), py::arg("epoch_addr") = 0, py::arg("attn_per_chunk_flags") = 1,
+        py::arg("split_tail") = 0);
   m.def("add_layer", &add_layer, py::arg("handle"), py::arg("woa"), py::arg("woa_s"), py::arg("wob"), py::arg("wob_s"), py::arg("gate"), py::arg("gate_b"),
         py::arg("bias_vl"), py::arg("sh13"), py::arg("sh13_s"), py::arg("sh2"), py::arg("sh2_s"), py::arg("w13"), py::arg("s13"), py::arg("w2"), py::arg("s2"),
         py::arg("fn"), py::arg("hc_scale"), py::arg("hc_base"), py::arg("norm"), py::arg("image_lo"), py::arg("csf13_storage") = py::none(),

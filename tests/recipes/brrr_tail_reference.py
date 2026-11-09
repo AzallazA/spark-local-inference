@@ -284,8 +284,12 @@ class TailReference:
     """
 
     def __init__(self, *, layer, rank, world, group, device, checkpoint, text, frequencies, oa, inter,
-                 gate, gate_bias, fn, hc_scale, hc_base, norm):
+                 gate, gate_bias, fn, hc_scale, hc_base, norm, down_halves=False):
         self.layer, self.rank, self.world, self.group, self.device = layer, rank, world, group, device
+        # BRRR_SPLIT_TAIL builds: some expert-down / shared-down jobs run as two K halves, each red-added on its own
+        # (one more FP32 rounding per half sum, w * partial rounded per half). Which jobs are split depends on the
+        # runtime entry order, so the bound treats every down sum as split (a superset of both cases).
+        self.down_halves = bool(down_halves)
         self.checkpoint, self.prefix = checkpoint, f"layers.{layer}"
         self.oa, self.inter, self.groups = int(oa), int(inter), int(oa) // GROUP_WIDTH
         self.experts, self.top_k = int(text["n_routed_experts"]), int(text["num_experts_per_tok"])
@@ -491,9 +495,15 @@ class TailReference:
             weight, delta_weight = w[tokens, slots, None], delta_w[tokens, slots, None]
             routed.index_add_(0, tokens, weight * y)
             bound_routed.index_add_(0, tokens, weight.abs() * err_y.bound + delta_weight * y.abs())
-            magnitude.index_add_(0, tokens, (weight * y).abs())
+            if self.down_halves:  # the FP32 adds see |w y_lo| + |w y_hi| >= |w y|
+                half = self.inter // 2
+                parts = (hq[:, :half] @ w2[:, :half].T).abs() + (hq[:, half:] @ w2[:, half:].T).abs()
+                magnitude.index_add_(0, tokens, weight.abs() * parts)
+            else:
+                magnitude.index_add_(0, tokens, (weight * y).abs())
             del w1, w3, w2
-        bound_routed = bound_routed + gamma(self.top_k + 1) * magnitude  # w * v products and 6 FP32 route adds
+        # w * v products and 6 FP32 route adds (split halves: 12 products and adds)
+        bound_routed = bound_routed + gamma((2 if self.down_halves else 1) * self.top_k + 1) * magnitude
         dense = self.dense
         gate, err_gate = dot(xq, slack_xq, dense["w1"], n=n_up)
         up, err_up = dot(xq, slack_xq, dense["w3"], n=n_up)
@@ -502,7 +512,7 @@ class TailReference:
         act, err_act = swiglu_bound(gate, up, Err(slack_gate), Err(slack_up), self.limit)
         act, slack_act = round_bf16(act, err_act)
         hs, slack_hs = quantize_e4m3(act, slack_act)
-        shared, err_shared = dot(hs, slack_hs, dense["w2"], n=n_down)
+        shared, err_shared = dot(hs, slack_hs, dense["w2"], n=n_down + (1 if self.down_halves else 0))  # + the halves' add
         partial = routed + shared
         bound_partial = (bound_routed + 0.5 * bf16_ulp(routed.abs() + bound_routed)
                          + err_shared.bound + 0.5 * bf16_ulp(shared.abs() + err_shared.bound) + U * partial.abs())

@@ -31,14 +31,48 @@ from .tp3_config import TP3Config
 _ROOT = Path(__file__).resolve().parents[3]
 
 
-@cache
-def extension():
+def _cuext():
     os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(_ROOT / ".brrr-ext"))
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
     from brrr import cuext
 
-    return cuext.extension("decoder")
+    return cuext
+
+
+# Item-6 kernel switches: (TP3Config field, compile-time define, extension attribute). The split tail is a build switch
+# (BRRR_SPLIT_TAIL=1) plus a per-engine count N (create(split_tail=N)), so one build serves every N.
+SWITCHES = (("brrr_split_tail", "BRRR_SPLIT_TAIL", "SPLIT_TAIL"), ("brrr_fast_route", "BRRR_FAST_ROUTE", "FAST_ROUTE"),
+            ("brrr_counter_parity", "BRRR_COUNTER_PARITY", "COUNTER_PARITY"), ("brrr_spin_trap", "BRRR_SPIN_TRAP", "SPIN_TRAP"))
+
+
+def kernel_defines(tp3: TP3Config) -> tuple[str, ...]:
+    """Compile-time defines of the layer kernel for this config (item-6 switches; all off = the plain build)."""
+    return tuple(f"{define}=1" for field, define, _ in SWITCHES if getattr(tp3, field))
+
+
+def engine_key(tp3: TP3Config):
+    """What makes two engines differ: the build plus the per-engine split count."""
+    return kernel_defines(tp3), int(tp3.brrr_split_tail)
+
+
+@cache
+def extension(defines: tuple[str, ...] = ()):
+    """The layer kernel extension; ``defines`` (from kernel_defines) selects a compile-time variant."""
+    return _cuext().extension("decoder", tuple(defines))
+
+
+def check_switches(ext, tp3: TP3Config):
+    """Contract check: the loaded build's compile-time switches are the ones the config asked for."""
+    want = {attr: int(bool(getattr(tp3, field))) for field, _, attr in SWITCHES}
+    got = {attr: int(getattr(ext, attr, -1)) for attr in want}
+    if got != want:
+        raise RuntimeError(f"BRRR kernel build switches {got} do not match the TP3 config {want}")
+
+
+# Engines by global handle (the custom op's `handle`): (extension module, the module's own engine handle). Several
+# engines (one per compile-time variant) can coexist in one process (the layer test's A/B pass); serving has one.
+_RUNNERS = []
 
 
 def _stages(w):
@@ -112,11 +146,18 @@ class Engine:
     def __init__(self, group, device, ipc, tp3: TP3Config):
         if tp3.brrr_ckpt is None:
             raise ValueError("TP3 config: BRRR needs brrr_ckpt (the checkpoint view it reads dense copies from)")
-        self.ext = ext = extension()
+        self.ext = ext = extension(kernel_defines(tp3))
+        check_switches(ext, tp3)
         self.group, self.device, self.ipc, self.tp3 = group, device, ipc, tp3
         self.rank, world = dist.get_rank(group=group), dist.get_world_size(group=group)
         if world != ext.RANKS:
             raise ValueError(f"BRRR kernel is built for {ext.RANKS} ranks, group has {world}")
+        # Same kernel build on every rank (handbook D.3.4); the item-6 switches only change rank-local work, but a
+        # mixed build is a configuration error that would also invalidate any timing.
+        builds = [None] * world
+        dist.all_gather_object(builds, engine_key(tp3), group=group)
+        if any(b != builds[0] for b in builds):
+            raise RuntimeError(f"BRRR kernel switches (build, split count) differ between ranks: {builds}")
         nbytes = ext.flag_bytes() + ext.inbox_bytes()
         own = ipc.cudaMalloc(nbytes)
         ipc.storage.cuda.call("cuMemsetD8_v2", C.c_uint64(own), C.c_ubyte(0), C.c_size_t(nbytes))
@@ -126,13 +167,28 @@ class Engine:
         buffers = [own if r == self.rank else ipc.cudaIpcOpenMemHandleBytes(handles[r]) for r in range(world)]
         # The epoch counter sits in the unused tail of this rank's flag page (flags use 2*2*RANKS*CHUNKS words).
         # fused_attn_per_chunk is a per-engine kernel setting (every rank must agree: it shapes the flag protocol).
-        self.handle = ext.create(buffers, self.rank, epoch_addr=own + ext.flag_bytes() - 64,
-                                 attn_per_chunk_flags=int(tp3.fused_attn_per_chunk))
+        local = ext.create(buffers, self.rank, epoch_addr=own + ext.flag_bytes() - 64,
+                           attn_per_chunk_flags=int(tp3.fused_attn_per_chunk), split_tail=int(tp3.brrr_split_tail))
+        self.handle = len(_RUNNERS)  # global handle (the custom op argument); serving has one engine, handle 0
+        _RUNNERS.append((ext, local))
+        self.local_handle = local
         dist.barrier(group=group)
         self.checkpoint = Checkpoint(tp3.brrr_ckpt)
         self.frequencies = None
         self.slots = {}
         self.keep = []
+
+    def zero_ranges(self):
+        """(address, bytes) ranges the export zeroes (export_zero_ranges). With brrr_counter_parity the counter
+        allocation (both sets + the generation word) keeps the last launch's set; that state is consistent (the
+        generation selects the clean set, independent of the flag-page epoch), so zeroing is not needed for
+        correctness. It makes the package bytes independent of how many launches preparation ran and starts serving
+        from both sets and the generation at zero. The plain build's counters are zero after every launch: nothing is
+        added (package unchanged)."""
+        if not self.tp3.brrr_counter_parity:
+            return ()
+        address, nbytes = self.ext.counters_range(self.local_handle)
+        return ((int(address), int(nbytes)),)
 
     def raw(self, name, rows=slice(None), cols=slice(None)):
         return self.checkpoint.get(name, rows, cols).to(self.device)
@@ -239,7 +295,7 @@ class Engine:
             if kwargs[name].data_ptr() != getattr(rep, {"w13": "w13_rp", "s13": "w13_sfb", "w2": "w2_rp", "s2": "w2_sfb"}[name]).data_ptr():
                 raise RuntimeError(f"BRRR layer {index}: {name} is not b12x's resident plane")
         self.keep.append(kwargs)  # the kernel holds raw pointers to these tensors
-        self.slots[index] = ext.add_layer(self.handle, **kwargs)
+        self.slots[index] = ext.add_layer(self.local_handle, **kwargs)
         if tp3.brrr_log:
             print(f"[brrr] rank {r} layer {index} -> slot {self.slots[index]} (w13 {tuple(rep.w13_rp.shape)}, "
                   f"sfb {tuple(rep.w13_sfb.shape)}, layout {rep.w13_layout})", flush=True)
@@ -297,8 +353,9 @@ def brrr_layer_tail(handle: int, slot: int, o: torch.Tensor, positions: torch.Te
                     resid0: torch.Tensor, attn_post: torch.Tensor, attn_comb: torch.Tensor, attn_pre: torch.Tensor,
                     y: torch.Tensor, resid1: torch.Tensor, post1: torch.Tensor, comb1: torch.Tensor,
                     pre1: torch.Tensor) -> None:
-    extension().run(handle, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre,
-                    y, resid1, post1, comb1, pre1)
+    ext, local = _RUNNERS[handle]
+    ext.run(local, slot, o, positions, None, frequencies, resid0, attn_post, attn_comb, attn_pre,
+            y, resid1, post1, comb1, pre1)
 
 
 @brrr_layer_tail.register_fake
@@ -309,10 +366,7 @@ def _fake_brrr_layer_tail(handle, slot, o, positions, frequencies, resid0, attn_
 
 @cache
 def sparse_extension():
-    extension()  # same TORCH_EXTENSIONS_DIR / sys.path setup
-    from brrr import cuext
-
-    return cuext.extension("flare_sparse_decode")
+    return _cuext().extension("flare_sparse_decode")
 
 
 @torch.library.custom_op("flare::brrr_sparse_decode", mutates_args=("out", "partial", "stats", "counters"))
@@ -378,8 +432,8 @@ class PreparedBRRRSparse:
 class PreparedBRRRTail:
     """Layer tail through the BRRR kernel. Reads s.attended (pre-inverse-RoPE attention output)."""
 
-    def __init__(self, index, weights, scratch, positions, frequencies, config=None, tp3=None):
-        e = engine()
+    def __init__(self, index, weights, scratch, positions, frequencies, config=None, tp3=None, engine_=None):
+        e = engine() if engine_ is None else engine_  # engine_: an explicit engine (test A/B of kernel variants)
         if e is None:
             raise RuntimeError("BRRR engine was not created")
         tp3 = e.tp3 if tp3 is None else tp3

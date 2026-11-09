@@ -307,6 +307,21 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
     return confidence
 
 
+def _brrr_zero_ranges(tp3):
+    """TP3 BRRR: device ranges the export zeroes for the fused kernel (brrr.Engine.zero_ranges; empty unless
+    tp3.brrr_counter_parity, so the default package is unchanged)."""
+    if not tp3.brrr_layers:
+        return ()
+    from ignition.recipes.deepseek41.brrr import engine
+
+    e = engine()
+    if e is None:
+        if tp3.brrr_counter_parity:
+            raise RuntimeError("TP3 config: brrr_counter_parity is set but no BRRR engine was created")
+        return ()
+    return e.zero_ranges()
+
+
 def _collective_runtimes(config, group, device, *, coordinator, package_storage, verification_samples):
     """Share one RoCE channel across ordered graph collectives on separate hosts."""
     tokens = max(config.prefill_chunk_size, config.decode_tokens, config.request_capacity * config.draft_tokens)
@@ -747,7 +762,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                           *storage_ranges(disposable), *completion.zero_ranges()),
+                           *storage_ranges(disposable), *completion.zero_ranges(), *_brrr_zero_ranges(tp3)),
         export_events=tables.events(),
         embedding_catalog=tables.resident_catalog(),
         package_data=tables if rank == 0 else None,

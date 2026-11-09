@@ -104,7 +104,8 @@ copy; `VISION_HOST=0` alone keeps the tower in VRAM only when staging is off too
 ### A.6 GPU tests and traces
 
 ```bash
-# BRRR layer tail vs stock path, 3 GPUs, ~15 min (all widths 1..48, resident+parked, per-chunk on/off, negative control)
+# BRRR layer tail vs stock path, 3 GPUs (all widths 1..48, resident+parked, per-chunk on/off, negative control): the 5 base
+# cases ~15 min (-k "perchunk or break-rope and not item6"); the item-6 switch cases (-k "item6 or split or fastroute or parity") add ~45-55 min
 # CUDA 13.1 must be first on PATH: /usr/bin/nvcc is 12.4 and fails with "Unsupported gpu architecture 'compute_120a'"
 export CUDA_HOME=/usr/local/cuda-13.1 PATH=/usr/local/cuda-13.1/bin:$PATH
 cd ~/flare-up-v3 && CUDA_VISIBLE_DEVICES=0,1,2 FLARE_RUN_CUDA_TESTS=1 FLARE_DS41_SNAPSHOT=/m2-2/flare-ckpt/ds41-mini8 \

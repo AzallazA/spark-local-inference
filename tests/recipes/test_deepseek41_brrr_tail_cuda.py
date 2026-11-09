@@ -48,6 +48,23 @@ FP64 routed/shared experts (checkpoint MXFP4 and MXFP8 bytes decoded in FP64) wi
 all-reduce. The cosine statistics above remain as the secondary report. After the width sweep one held-out random
 input runs through a freshly constructed PreparedBRRRTail (new scratch, positions and object) under the same bounds.
 The rope negative control fails on the ffn_residual bound.
+
+Item-6 kernel switches (TP3Config brrr_split_tail / brrr_fast_route / brrr_counter_parity, compile-time variants of the
+kernel, each its own extension build; the split count N is an engine setting of the one split build): the *-split2 /
+-splitall / -fastroute / -parity cases run each switch alone through the same sweep, bounds and held-out input,
+resident-item6 / parked-item6 all three together, and resident-item6-break-rope is the rope negative control on the
+all-switches build. These cases use spin-trap builds (TP3Config.brrr_spin_trap: a wait that never ends traps instead
+of hanging), and every case is bounded by FLARE_DS41_BRRR_TEST_TIMEOUT (default 3600 s; the ranks are killed). With
+the split tail the FP64 bound counts the extra half-sum roundings (TailReference down_halves), and rank 0 checks the
+kernel's own split layout (split_tail_layout) against the CPU mirror in test_deepseek41_brrr_item6.py.
+resident-/parked-item6-equivalence compare fast_route and counter_parity with the plain build on the same inputs:
+every route's (bank slot, FP32 weight bits) exactly (route_state), against the plain build's launch-to-launch noise,
+plus the outputs bitwise, with split_tail as the negative control (_equivalence). The full file is 14 cases and 5
+extension builds, about 60-70 minutes.
+Opt-in A/B timing: FLARE_DS41_BRRR_TEST_AB="split_tail:96,fast_route,counter_parity" (variants joined by "+" combine)
+times each variant against the build with all three off, alternating, at FLARE_DS41_BRRR_TEST_AB_ROWS (default 1,6,12;
+must be in FLARE_DS41_BRRR_TEST_ROWS) x FLARE_DS41_BRRR_TEST_PROFILE_MIX (default 0.6,0.7), see _ab_profile; JSON
+lines go to FLARE_DS41_BRRR_TEST_AB_OUT. Typically with -k resident-perchunk1.
 """
 
 import json
@@ -153,6 +170,262 @@ def _profile_widths(*, rank, group, device, ext, layer, rows_sweep, paths, posit
                              f" (marks are absolute; {int(ph[15, 0] > 0)} = recorded)")
                 print(line, flush=True)
             dist.barrier(group=group)
+
+
+# --- item-6 kernel variants (TP3Config brrr_split_tail / brrr_fast_route / brrr_counter_parity) ---
+ITEM6_OFF = dict(brrr_split_tail=0, brrr_fast_route=False, brrr_counter_parity=False)
+
+
+def _observe_routes(ext, route_counts):
+    """Make every add_layer of this extension build pass route_counts (idempotent per module). False = unsupported."""
+    if getattr(ext, "_route_counts_patched", False):
+        return True
+    add_layer = ext.add_layer
+    if "route_counts" not in (add_layer.__doc__ or ""):
+        return False
+    ext.add_layer = lambda handle, **kwargs: add_layer(handle, route_counts=route_counts, **kwargs)
+    ext._route_counts_patched = True
+    return True
+
+
+def _parse_switches(spec):
+    """"split_tail:96+fast_route" -> TP3Config field overrides (one A/B variant)."""
+    switches = {}
+    for part in filter(None, (p.strip() for p in spec.split("+"))):
+        name, _, value = part.partition(":")
+        if name == "split_tail":
+            switches["brrr_split_tail"] = int(value or 0)
+        elif name in ("fast_route", "counter_parity") and not value:
+            switches["brrr_" + name] = True
+        else:
+            raise ValueError(f"unknown BRRR A/B switch {part!r} (split_tail:N, fast_route, counter_parity; join with +)")
+    if not any(switches.values()):
+        raise ValueError(f"A/B variant {spec!r} switches nothing on")
+    return switches
+
+
+def _variant_tails(tp3, *, group, device, storage, layer, weights, config, frequencies, paths, positions, route_counts,
+                   base_tp3, base_tails):
+    """(engine, PreparedBRRRTails per width on the sweep's scratch rows) for a kernel variant; the base engine and its
+    tails when the variant is what the base config already runs (same build and split count). Collective (engine
+    creation): call in the same order on every rank."""
+    from ignition.recipes.deepseek41.brrr import Engine, PreparedBRRRTail, engine, engine_key
+
+    if engine_key(tp3) == engine_key(base_tp3):
+        return engine(), base_tails
+    variant = Engine(group, device, storage.peer_storage, tp3)
+    if route_counts is not None:
+        _observe_routes(variant.ext, route_counts)
+    return variant, {m: PreparedBRRRTail(layer, weights, paths[m][1], positions[:m], frequencies, config=config, tp3=tp3,
+                                         engine_=variant) for m in paths}
+
+
+def _timed(tail, rows, *, flush, device, group, start, stop, route_counts):
+    if route_counts is not None:
+        route_counts.zero_()
+    flush.sum(dtype=torch.int64)
+    torch.cuda.synchronize(device)
+    dist.barrier(group=group)
+    torch.cuda._sleep(200_000)  # hide the eager op's host launch time (see _profile_widths)
+    start.record()
+    tail(rows.attention.attended)
+    stop.record()
+    torch.cuda.synchronize(device)
+    return start.elapsed_time(stop) * 1e3
+
+
+def _bits(t):
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+
+
+def _route_state(engine, m):
+    """(bank slot, weight bits) of the last launch's routes 0 .. m * TOPK - 1 (routes cleared before the launch)."""
+    weights, routes = engine.ext.route_state(engine.local_handle)
+    slots = torch.full((weights.numel(),), -1, dtype=torch.int32)
+    valid = routes >= 0
+    slots[routes[valid].long()] = valid.nonzero()[:, 0].to(torch.int32)
+    n = m * engine.ext.TOPK
+    return torch.stack((slots[:n], weights[:n].view(torch.int32)))
+
+
+def _equivalence(*, rank, rows_sweep, group, device, storage, layer, weights, config, frequencies, paths, positions,
+                 route_counts, tp3):
+    """Bit-exact check (FLARE_DS41_BRRR_TEST_EQUIV=1): fast_route and counter_parity must route exactly like the plain build.
+
+    Same inputs through: plain three times (the noise floor: the FP32 red.add order of WOA/WOB and the expert sums is
+    timing-dependent, so two plain launches can differ in a few BF16 elements and, through the gate input, in the route
+    weights), fast_route, counter_parity, and split_tail over every down job (negative control: it changes the summation
+    of whole down projections and must be seen to differ). Primary check, per launch: every route's (bank slot, FP32
+    weight bits) read back from the kernel (route_state) must equal the plain launch's; launches where the plain repeats
+    already disagree count as noise, and a variant may not mismatch more often than 2 x the noise. Secondary: the five
+    outputs bitwise. counter_parity keeps the job layout, so its output difference must stay within 2 x floor + 8 per
+    launch; fast_route reserves one ROUTE job's entries in lane order (a different FP32 red order downstream), so its
+    output difference is reported only. Returns failures (every rank decides on the same gathered data)."""
+    from dataclasses import replace
+
+    base = replace(tp3, **ITEM6_OFF)
+    shared = dict(group=group, device=device, storage=storage, layer=layer, weights=weights, config=config,
+                  frequencies=frequencies, paths=paths, positions=positions, route_counts=route_counts, base_tp3=tp3,
+                  base_tails={m: paths[m][3] for m in paths})
+    names = ("plain", "plain2", "plain3", "fast_route", "counter_parity", "split_tail")
+    configs = dict(plain=base, plain2=base, plain3=base, fast_route=replace(base, brrr_fast_route=True),
+                   counter_parity=replace(base, brrr_counter_parity=True), split_tail=replace(base, brrr_split_tail=1 << 20))
+    from ignition.recipes.deepseek41.brrr import engine_key
+
+    built, runs = {}, {}
+    for name in names:  # one engine per distinct (build, split count), created in the same order on every rank
+        key = engine_key(configs[name])
+        if key not in built:
+            built[key] = _variant_tails(configs[name], **shared)
+        runs[name] = built[key]
+    diff = {name: 0 for name in names}
+    state_bad = {name: 0 for name in names}
+    launches = 0
+    seed = 77_000 + 1000 * layer
+    for m in rows_sweep:
+        brrr_rows = paths[m][1]
+        for profile in ("random", "uniform"):
+            seed += 1
+            p0 = _fill_inputs(brrr_rows, m, seed=seed, rank=rank, profile=profile, resid_scale=1.0, device=device)
+            positions[:m].copy_(p0)
+            got = {}
+            for name in names:
+                engine, tails = runs[name]
+                engine.ext.clear_routes(engine.local_handle)
+                torch.cuda.synchronize(device)
+                dist.barrier(group=group)
+                tails[m](brrr_rows.attention.attended)
+                torch.cuda.synchronize(device)
+                got[name] = ({k: _bits(v).clone() for k, v in _outputs(brrr_rows, m).items()}, _route_state(engine, m))
+            launches += 1
+            ref, ref_state = got["plain"]
+            for name in names[1:]:
+                out, state = got[name]
+                diff[name] += sum(int((out[k] != ref[k]).sum()) for k in COMPARED)
+                state_bad[name] += int(not torch.equal(state, ref_state))
+    floor = max(diff["plain2"], diff["plain3"])
+    state_floor = max(state_bad["plain2"], state_bad["plain3"])
+    report = dict(launches=launches, output_floor=floor, route_state_floor=state_floor,
+                  **{f"output_diff_{k}": v for k, v in diff.items() if k != "plain"},
+                  **{f"route_state_mismatch_{k}": v for k, v in state_bad.items() if k not in ("plain", "split_tail")})
+    failures = []
+    for name in ("fast_route", "counter_parity"):
+        if state_bad[name] > 2 * state_floor:
+            failures.append((rank, "equivalence", name, f"route (slot, weight) state differs from the plain build in "
+                             f"{state_bad[name]} of {launches} launches (plain repeats: {state_floor})"))
+    allowed = 2 * floor + 8 * launches
+    if diff["counter_parity"] > allowed:
+        failures.append((rank, "equivalence", "counter_parity", f"{diff['counter_parity']} output elements differ (allowed {allowed})"))
+    if diff["split_tail"] <= floor:
+        failures.append((rank, "equivalence", "split_tail", f"negative control not detected: {diff['split_tail']} <= floor {floor}"))
+    gathered = [None] * WORLD
+    dist.all_gather_object(gathered, (report, failures), group=group)
+    if rank == 0:
+        for r, (rep_, fail) in enumerate(gathered):
+            print(f"[brrr-equiv] layer {layer} rank {r}: {rep_}" + (f" | FAIL {fail}" if fail else " | ok"), flush=True)
+    return failures
+
+
+def _split_layout_check(ext, ctas):
+    """The split build's own layout (split_tail_layout, the kernel's tail_of / tail_slot / split_items compiled for the
+    host) must satisfy the CPU mirror's properties and equal the mirror row for row. Returns failures."""
+    try:
+        import test_deepseek41_brrr_item6 as mirror
+    except ImportError:  # pragma: no cover
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_deepseek41_brrr_item6 as mirror
+    failures, checked = [], 0
+    for grid in (ctas, 40, 1000):
+        for tg in (1, 2, 3, 8):
+            for n in (1, 6, 13, 21, 33, 200):
+                for split in mirror.split_values(n):
+                    rows, items = ext.split_tail_layout(tg, n, split, grid)
+                    jobs = [tuple(r) for r in rows.tolist()]
+                    t, want = mirror._chunk_jobs(tg, n, split, grid)
+                    try:
+                        assert jobs == want, "kernel layout differs from the CPU mirror"
+                        assert items.tolist() == [mirror._split_items(t, k) for k in range(40)], "split_items differ"
+                        mirror.check_split_layout(tg, n, split, grid, jobs, items.tolist())
+                    except AssertionError as exc:
+                        failures.append(("split-layout", grid, tg, n, split, str(exc)[:200]))
+                    checked += 1
+    print(f"[brrr-split-layout] {checked} (grid, tg, n, N) layouts checked, {len(failures)} failures", flush=True)
+    return failures
+
+
+def _ab_profile(*, rank, spec, rows_sweep, group, device, storage, layer, weights, config, frequencies, paths, positions,
+                route_counts, tp3):
+    """Alternating off/on timing of item-6 variants (FLARE_DS41_BRRR_TEST_AB, e.g. "split_tail:96,fast_route,counter_parity";
+    join switches with + for a combined variant). "off" is this config with the three switches cleared. Per variant,
+    width (FLARE_DS41_BRRR_TEST_AB_ROWS, default 1,6,12; must be in the sweep) and mix (FLARE_DS41_BRRR_TEST_PROFILE_MIX,
+    default 0.6,0.7): FLARE_DS41_BRRR_TEST_AB_REPEATS (default 6, >= 5) repeats in ABBA order, each the median of
+    FLARE_DS41_BRRR_TEST_AB_ITERS (default 20) launches with L2 flushed (read) and the host launch hidden; the reported
+    time per variant is the median over repeats on the rank with the lowest median (min over ranks, as _profile_widths).
+    Rank 0 prints one [brrr-ab] line per cell and appends JSON lines to FLARE_DS41_BRRR_TEST_AB_OUT if set."""
+    import json
+    import statistics
+    from dataclasses import replace
+
+    variants = [(item, _parse_switches(item)) for item in filter(None, (p.strip() for p in spec.split(",")))]
+    rows = tuple(int(x) for x in os.environ.get("FLARE_DS41_BRRR_TEST_AB_ROWS", "1,6,12").split(",") if x.strip())
+    missing = [m for m in rows if m not in paths]
+    if missing:
+        raise ValueError(f"A/B widths {missing} are not in FLARE_DS41_BRRR_TEST_ROWS {rows_sweep}")
+    mixes = tuple(float(x) for x in os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE_MIX", "0.6,0.7").split(",") if x.strip())
+    repeats = max(5, int(os.environ.get("FLARE_DS41_BRRR_TEST_AB_REPEATS", "6")))
+    iters = int(os.environ.get("FLARE_DS41_BRRR_TEST_AB_ITERS", "20"))
+    out_path = os.environ.get("FLARE_DS41_BRRR_TEST_AB_OUT")
+    base_tails = {m: paths[m][3] for m in paths}
+    shared = dict(group=group, device=device, storage=storage, layer=layer, weights=weights, config=config,
+                  frequencies=frequencies, paths=paths, positions=positions, route_counts=route_counts, base_tp3=tp3,
+                  base_tails=base_tails)
+    off_tp3 = replace(tp3, **ITEM6_OFF)
+    _, off_tails = _variant_tails(off_tp3, **shared)
+    flush = torch.zeros(256 << 20, dtype=torch.uint8, device=device)
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    timing = dict(flush=flush, device=device, group=group, start=start, stop=stop, route_counts=route_counts)
+    for item, switches in variants:
+        _, on_tails = _variant_tails(replace(off_tp3, **switches), **shared)
+        seed = 90_000 + 1000 * layer
+        for m in rows:
+            brrr_rows = paths[m][1]
+            for mix in mixes:
+                seed += 1
+                p0 = _fill_inputs(brrr_rows, m, seed=seed, rank=rank, profile="random", resid_scale=1.0, device=device)
+                for t in (brrr_rows.attention.attended, brrr_rows.attention_hc.residual):
+                    t[:m].copy_(((1 - mix) * t[:m].float() + mix * t[:1].float()).to(t.dtype))
+                positions[:m].copy_(p0)
+                reps = {"off": [], "on": []}
+                distinct = []
+                for rep in range(repeats):
+                    for name in (("off", "on") if rep % 2 == 0 else ("on", "off")):
+                        tail = (off_tails if name == "off" else on_tails)[m]
+                        times = [_timed(tail, brrr_rows, **timing) for _ in range(iters)]
+                        reps[name].append(statistics.median(times))
+                        if route_counts is not None and name == "off":
+                            distinct.append(int((route_counts > 0).sum()))
+                mine = {name: statistics.median(v) for name, v in reps.items()}
+                wins = sum(on < off for on, off in zip(reps["on"], reps["off"]))
+                gathered = [None] * WORLD
+                dist.all_gather_object(gathered, (mine, wins, reps), group=group)
+                if rank == 0:
+                    off = min(g[0]["off"] for g in gathered)
+                    on = min(g[0]["on"] for g in gathered)
+                    record = dict(variant=item, layer=layer, m=m, mix=mix, off_us=round(off, 2), on_us=round(on, 2),
+                                  delta_us=round(on - off, 2), repeats=repeats, iters=iters,
+                                  on_faster_repeats=[g[1] for g in gathered],
+                                  rank_delta_us=[round(g[0]["on"] - g[0]["off"], 2) for g in gathered],
+                                  distinct_experts=statistics.median(distinct) if distinct else None)
+                    print(f"[brrr-ab] {item} layer {layer} m={m} mix={mix}: off {off:.1f} us, on {on:.1f} us, "
+                          f"delta {on - off:+.2f} us/layer (median of {repeats} ABBA repeats x {iters} launches, min over "
+                          f"ranks; per-rank deltas {record['rank_delta_us']}, on faster in {record['on_faster_repeats']} "
+                          f"repeats), distinct experts {record['distinct_experts']}", flush=True)
+                    if out_path:
+                        with open(out_path, "a") as f:
+                            f.write(json.dumps(record) + "\n")
+                dist.barrier(group=group)
 
 
 def _rows():
@@ -350,7 +623,7 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.deepseek41.attention import Rotary
-    from ignition.recipes.deepseek41.brrr import PreparedBRRRTail, create_engine, extension
+    from ignition.recipes.deepseek41.brrr import PreparedBRRRTail, create_engine, extension, kernel_defines
     from ignition.recipes.deepseek41.decoder import Scratch
     from ignition.recipes.deepseek41.tp3_config import TP3Config
     from ignition.recipes.deepseek41.weights import DeepSeekWeightLoader, host_expert_layers
@@ -376,14 +649,12 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                 assert weights.experts.hot_map is None, "resident layer unexpectedly remapped"
             engine = create_engine(group, device, storage.peer_storage, tp3)
             assert engine is not None
-            ext = extension()
+            ext = engine.ext  # the build this config selects (item-6 switches are compile-time variants)
+            assert ext is extension(kernel_defines(tp3))
             assert ext.RANKS == WORLD and capacity <= ext.MAXM
             # Observe the kernel's routing: per-global-expert route counters (optional add_layer argument).
             route_counts = torch.zeros((ext.EXPERTS,), dtype=torch.int32, device=device)
-            add_layer = ext.add_layer
-            if "route_counts" in (add_layer.__doc__ or ""):
-                ext.add_layer = lambda handle, **kwargs: add_layer(handle, route_counts=route_counts, **kwargs)
-            else:
+            if not _observe_routes(ext, route_counts):
                 route_counts = None
             tail_kwargs = {"config": config, "tp3": tp3}
             compressed = bool(config.text["compress_ratios"][layer])
@@ -429,7 +700,8 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                     text=config.text, frequencies=frequencies, oa=ext.OA, inter=ext.INTER,
                     gate=weights.experts.router, gate_bias=weights.experts.correction,
                     fn=weights.residual["hc_ffn_fn"], hc_scale=weights.residual["hc_ffn_scale"],
-                    hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"])
+                    hc_base=weights.residual["hc_ffn_base"], norm=weights.residual["ffn_norm.weight"],
+                    down_halves=bool(tp3.brrr_split_tail))
 
                 def kernel_inputs(rows, m):
                     # Taken before the launches: the stock path rotates its own attended in place, the kernel reads o as is.
@@ -502,6 +774,16 @@ def _rank(rank, rendezvous, snapshot, env, layer, expect_failure):
                 if iters > 0 and not expect_failure:
                     _profile_widths(rank=rank, group=group, device=device, ext=ext, layer=layer, rows_sweep=rows_sweep,
                                     paths=paths, positions=positions, route_counts=route_counts, iters=iters)
+                variants = dict(group=group, device=device, storage=storage, layer=layer, weights=weights, config=config,
+                                frequencies=frequencies, paths=paths, positions=positions, route_counts=route_counts,
+                                tp3=tp3)
+                if tp3.brrr_split_tail and rank == 0:
+                    failures.extend(_split_layout_check(ext, 2 * torch.cuda.get_device_properties(device).multi_processor_count))
+                if os.environ.get("FLARE_DS41_BRRR_TEST_EQUIV") == "1" and not expect_failure:
+                    failures.extend(_equivalence(rank=rank, rows_sweep=rows_sweep, **variants))
+                ab = os.environ.get("FLARE_DS41_BRRR_TEST_AB", "")
+                if ab and not expect_failure:
+                    _ab_profile(rank=rank, spec=ab, rows_sweep=rows_sweep, **variants)
                 gathered = [None] * WORLD
                 dist.all_gather_object(gathered, failures, group=group)
                 every = [f for part in gathered for f in part]
@@ -535,6 +817,16 @@ def _base_env(snapshot, layer):
         "FLARE_DS41_MERGED_BANK": None,
         "FLARE_DS41_BRRR_PARKED_MAX_ROWS": None,
         "DS41_FUSED_TEST": None,
+        # Item-6 kernel switches: off unless the case sets them (CASES "item6").
+        "FLARE_DS41_BRRR_SPLIT_TAIL": None,
+        "FLARE_DS41_BRRR_FAST_ROUTE": None,
+        "FLARE_DS41_BRRR_COUNTER_PARITY": None,
+        "FLARE_DS41_BRRR_TEST_EQUIV": None,
+        "FLARE_DS41_BRRR_SPIN_TRAP": None,
+        # Item-6 A/B timing pass (see _ab_profile) passes through from the caller's environment.
+        **{key: os.environ.get(key) for key in ("FLARE_DS41_BRRR_TEST_AB", "FLARE_DS41_BRRR_TEST_AB_ROWS",
+                                                 "FLARE_DS41_BRRR_TEST_AB_REPEATS", "FLARE_DS41_BRRR_TEST_AB_ITERS",
+                                                 "FLARE_DS41_BRRR_TEST_AB_OUT")},
         # Timing pass and kernel profiling pass through from the caller's environment (see _profile_widths).
         "FLARE_DS41_BRRR_TEST_PROFILE": os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE"),
         "FLARE_DS41_BRRR_TEST_PROFILE_MIX": os.environ.get("FLARE_DS41_BRRR_TEST_PROFILE_MIX"),
@@ -552,12 +844,30 @@ def _parked_env(tmp_path, layer):
             "FLARE_DS41_EXPERT_COUNTS_DIR": str(counts)}
 
 
+# Item-6 switch sets (compile-time kernel variants). SPLIT_TAIL 2 keeps the window inside the last chunk; 96 crosses
+# chunks at small widths and stays in the lagged block region at wide ones; 1 << 20 splits every down job.
+# The item-6 cases run spin-trap builds (FLARE_DS41_BRRR_SPIN_TRAP): a protocol wait that never ends traps after a
+# few seconds instead of wedging the GPUs (the timing pass and exports never use them).
+TRAP = {"FLARE_DS41_BRRR_SPIN_TRAP": "1"}
+ITEM6_ALL = {"FLARE_DS41_BRRR_SPLIT_TAIL": "96", "FLARE_DS41_BRRR_FAST_ROUTE": "1", "FLARE_DS41_BRRR_COUNTER_PARITY": "1", **TRAP}
+
 CASES = {
     "resident-perchunk1": dict(parked=False, per_chunk="1", broken=False),
     "resident-perchunk0": dict(parked=False, per_chunk="0", broken=False),
     "parked-perchunk1": dict(parked=True, per_chunk="1", broken=False),
     "parked-perchunk0": dict(parked=True, per_chunk="0", broken=False),
     "resident-break-rope": dict(parked=False, per_chunk="1", broken=True),
+    "resident-split2": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_SPLIT_TAIL": "2", **TRAP}),
+    "resident-splitall": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_SPLIT_TAIL": str(1 << 20), **TRAP}),
+    "resident-fastroute": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_FAST_ROUTE": "1", **TRAP}),
+    "resident-parity": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_COUNTER_PARITY": "1", **TRAP}),
+    "resident-item6": dict(parked=False, per_chunk="1", broken=False, item6=ITEM6_ALL),
+    "parked-item6": dict(parked=True, per_chunk="1", broken=False, item6=ITEM6_ALL),
+    "resident-item6-break-rope": dict(parked=False, per_chunk="1", broken=True, item6=ITEM6_ALL),
+    # Bit-exact check of fast_route / counter_parity against the plain build (split_tail as its negative control).
+    "resident-item6-equivalence": dict(parked=False, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_TEST_EQUIV": "1", **TRAP}),
+    # parked: hot_map slots, cold entries (the low NCOLD half of fast_route's 64-bit atomic) and the slot shuffle
+    "parked-item6-equivalence": dict(parked=True, per_chunk="1", broken=False, item6={"FLARE_DS41_BRRR_TEST_EQUIV": "1", **TRAP}),
 }
 
 
@@ -575,5 +885,17 @@ def test_brrr_tail_matches_flare_layer_path(tmp_path, case):
         env.update(_parked_env(tmp_path, layer))
     if options["broken"]:
         env["FLARE_DS41_BRRR_BREAK"] = "rope"
-    mp.spawn(_rank, args=((tmp_path / f"rendezvous-{case}").as_uri(), snapshot, env, layer, options["broken"]),
-             nprocs=WORLD, join=True)
+    env.update(options.get("item6", {}))
+    context = mp.spawn(_rank, args=((tmp_path / f"rendezvous-{case}").as_uri(), snapshot, env, layer, options["broken"]),
+                       nprocs=WORLD, join=False)
+    # A protocol bug hangs the kernel rather than failing it: bound the case (FLARE_DS41_BRRR_TEST_TIMEOUT seconds,
+    # default 3600) and kill the ranks so the GPUs come free.
+    import time
+
+    deadline = time.monotonic() + float(os.environ.get("FLARE_DS41_BRRR_TEST_TIMEOUT", "3600"))
+    while not context.join(timeout=10):
+        if time.monotonic() > deadline:
+            for process in context.processes:
+                if process.is_alive():
+                    process.kill()
+            pytest.fail(f"{case}: ranks did not finish within FLARE_DS41_BRRR_TEST_TIMEOUT; killed (kernel hang?)")
