@@ -91,7 +91,10 @@ cd ~/flare-up-v3 && CKPT=/m2-2/flare-ckpt/ds41-1017-engram-mxfp4 HOT=342 tp3-too
 ```
 
 Full export ≈ 25-40 min with a warm tuning cache; writes a new `gb202-tp3-<timestamp>` package. Knobs are env vars
-(`HOT`, `PREFILL`, `DRAFTS`, `FLARE_DS41_VISION_HOST`, plus the `FLARE_DS41_*` set in `export.sh`). The recipe reads
+(`HOT`, `PREFILL`, `DRAFTS`, `MAXC`, `FLARE_DS41_VISION_HOST`, plus the `FLARE_DS41_*` set in `export.sh`). `MAXC`
+sets `--max-concurrency` (default 8; `MAXC=16` = the c16 package, warm its tuning cache first, D.2.2). Graph scratch
+is on by default (`FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1`; set both to 0 for the
+previous layout). The recipe reads
 them once, in `TP3Config.from_environment()` (`ignition/recipes/deepseek41/tp3_config.py`), validates them, prints
 the non-default switches in the export progress and records every switch in `tp3-config.json` beside the package's
 `model.safetensors` (and in each rank's memory report as `tp3_config`; paths appear as basename + fingerprint,
@@ -157,11 +160,14 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | Engram: `FLARE_ENGRAM_RAM_TABLES=0` vs `--embedding-table-storage disk` | disk = -90 GiB RAM, -3-4% decode; MXFP4 vs FP8 tables: wiki ppl +2.6%, benchmarks within noise |
 | `FLARE_DS41_EMBED_HOST=1`, `FLARE_DS41_VISION_HOST=1` | embeddings/vision in host RAM; images ~3 s slower each |
 | `FLARE_DS41_AR_ROWS=1024` | chunked all-reduce sizing for prefill |
-| `FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1` | graph-scratch savings, default off (branch `ds41-graph-scratch`): Engram projection/reduce/mix in 1024-row chunks (-300 MiB/rank) and `engram_residual` on `ffn_hc.residual` (-165 MiB/rank); CPU model -465 MiB/rank ≈ +0.55M KV; GPU A/B pending |
+| `FLARE_DS41_ENGRAM_CHUNK_ROWS=1024`, `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1` | graph scratch, default on in `export.sh`: Engram projection/reduce/mix in 1024-row chunks (-300 MiB/rank) and `engram_residual` on `ffn_hc.residual` (-165 MiB/rank); KV 2.46M -> 3.01M at HOT 342, decode level |
+| `MAXC` (`--max-concurrency` at export) | 8 default; 16 = c16 package: its graphs cost ~650K KV vs c8 (dry run) |
+| BRRR item 6: `FLARE_DS41_BRRR_SPLIT_TAIL`, `_FAST_ROUTE`, `_COUNTER_PARITY` | default off, not adopted (11-09): split tail and counter parity slower in the layer A/B; fast route -0.5/-1.9/-2.0 µs/layer at m 1/6/12 but end to end level (c1 1.004x, c4 0.989x, c8 0.998x) |
 
 Ideas already closed (do not re-run without a new angle): FP8 LM head, fused layer L2 prefetch, EP all-reduce over
 b12x, CPU-side expert compute, DCP3, dynamic expert cache (0.40% cold routes at H342), route reuse, sparse decode at
-FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra PDL trigger in the layer kernel. Details in `~/.claude/.../memory/` notes and MEASUREMENTS.md.
+FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra PDL trigger in the layer kernel, BRRR item 6
+(split tail, fast route, counter parity). Details in `~/.claude/.../memory/` notes and MEASUREMENTS.md.
 
 ---
 
@@ -296,6 +302,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     exact on the five DeepSeek-V4.1-Flash TP3 loads it was calibrated on; 0.4 % low (TP3) and 1.3 % low (TP2) on
     GLM-5.3-Flash, which was not in the calibration, so read it as a slightly conservative estimate for other models.
     `--dry-run-free-memory` replaces the assumed free memory (driver total minus 606 MiB) when a GPU is shared.
+    Dry runs are cheap, so answer KV questions with them before an export: c16 graphs cost ~650K KV against c8, and
+    a serve-time verification budget below the export's drops the unused verify graphs.
 14. **Hide the GPUs from CPU test runs** while anything serves or benchmarks: prefix `CUDA_VISIBLE_DEVICES=`. Some
     `*_cuda` tests run whenever a GPU is visible, not only with `FLARE_RUN_CUDA_TESTS=1`. *Incident (11-08):* a CPU
     test pass put a CUDA test onto the GPUs for a few seconds in the middle of a benchmark sweep.
@@ -314,6 +322,13 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     steps/s from 112 to 76, i.e. -16 % tok/s; alpha 0.6 reached 2.49 tokens per step at level tok/s.
 18. **One Flare binary serves packages from other branches** when their Rust is unchanged: check
     `git diff --stat <base> HEAD -- flare helios heliopause` before building a second binary.
+19. **Chain wait-conditions and failure watchers.** Never wait for the default-restart script to exit: it stays
+    alive as the server's parent; wait for `/v1/models` instead. Failure watchers must pre-seed the log's existing
+    lines (old failures re-trigger otherwise) and match failure words only, not words such as "skipped" that normal
+    verdict lines contain.
+20. **Profiling Flare** (one process, CUDA graphs, no NVTX ranges): start the server under `nsys launch` with
+    collection off, then `nsys start` / `nsys stop` around a steady decode window; trace kernels only, with
+    per-node CUDA graph tracing (`--cuda-graph-trace=node`), or the graph shows up as one opaque launch.
 
 ---
 
@@ -358,7 +373,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 1. **Mini export first only for risky kernel or wiring changes**; settings and placement changes go straight to a
    full export (working policy). A mini run catches compile/trace/wiring failures, not speed.
 2. **Warm the tuning cache before an H342 export.** A cold tuning cache runs out of VRAM at HOT=342; export HOT=300
-   first. Needed again after every tuning version or draft-count change.
+   first. Needed again after every tuning version or draft-count change, and for a new `MAXC`: the c16 package's
+   new verify shapes ran out of memory in tuning at HOT=342 until a HOT=300 c16 export had warmed the cache.
 3. **The GPUs are exclusive.** Stop the server before tests, traces or exports and wait for memory.used < 1000 MiB.
 4. **Never `pgrep -f`/`pkill -f` a pattern that appears in your own command line.** It killed the working shell
    three times. Use `ps -eo pid,args | awk '$2=="./flare/target/release/flare" && $3=="run"'`, or kill by PID.
@@ -382,6 +398,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     at `/tmp`; use `~/ds41-tp3/` or `/m2-2/`. `aria2c --log` writes at debug level unless `--log-level=warn` is given.
     *Incident (11-08):* a 30 GB aria2c debug log in `/tmp` starved the vLLM TP3 image of pinned host RAM (driver
     "out of memory" while pinning the Engram tables, kernel OOM kills, a restart loop) during the .11/.12 check.
+13. **A package exported into a separate `--config` package store is signed with that store's development key.**
+    Serve it with `--publisher-keys <store>/development-publisher.json`; the first use also asks for explicit key
+    approval and the checkpoint license acceptance. Copying the default store's signing key into the other store
+    before exporting avoids both.
 11. **Exports from a worktree must put the worktree first on the import path.** The shared venv's `ignition` console
     script imports the editable install, which points at `~/flare-up-v3`, whatever the current directory is; pytest
     imports from the cwd, so tests look right while exports silently build the main checkout's code. Run
@@ -418,7 +438,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
    first pass, one legacy branch in the second).
 7. **No `data_ptr()` or registry work inside Dynamo-traced code**; use a custom op or a binding finalizer.
 8. **Every "identical" claim needs a bit-exact test; every equivalence test needs a negative control** shown to fail
-   (`FLARE_DS41_BRRR_BREAK=rope`, `TP3Config.brrr_break`).
+   (`FLARE_DS41_BRRR_BREAK=rope`, `TP3Config.brrr_break`). The control's difference must clear the build's own
+   run-to-run floor: the BRRR split-tail control (4-22K differing elements) did not clear the plain build's 10-24K
+   and is report-only.
 9. **Env-var-driven behaviour stays in the recipe and the CLI shim** (upstream rule, D/C.11). In the fork the only
    reader is `TP3Config.from_environment()`; components take the config object (`tp3=`), tests build it from their
    own environment.
@@ -433,6 +455,9 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
     the kernel. Swaps chain across rows, so compare per row, not as a multiset.
 12. **Rebuild and re-serve after Helios changes**: a Rust edit is not live until `cargo build --release` and a server
     restart; a recipe or kernel edit is not live until a new export.
+13. **Several compile-time kernel variants in one process need `-fno-gnu-unique`** (or no function-local static
+    guards in inline templates). GCC makes such guards GNU-unique symbols shared by every loaded `.so`, so only the
+    first variant set its shared-memory attribute; the others failed with "layer kernel fits 0 CTAs per SM".
 
 ### D.4 Release folder
 
