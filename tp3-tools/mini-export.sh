@@ -7,6 +7,8 @@
 #   LABEL   label for the log directory (default: mini)
 #   OUT     log directory (default: ./mini-<label>-<MMDD-HHMM>)
 #   GPUS    default 0,1,2; PORT is fixed at 15015 (consistency.py's URL)
+#   FLARE_BIN  server binary (default: this checkout's flare/target/release/flare; worktrees without a Rust build
+#              point it at the serving checkout's binary)
 # Further FLARE_DS41_* settings pass through from the environment (e.g. FLARE_DS41_FUSED_QKV_NORM=1). Run from any
 # worktree: the export imports this checkout (PYTHONPATH), and the log records which ignition it imported.
 # The GPUs must be idle: stop any server first; this script refuses to start next to one and starts none afterwards.
@@ -35,7 +37,7 @@ if [ "$rc" != 0 ]; then
 fi
 P=$(grep -o "[^ ]*/packages/models/[^ ]*" "$OUT/export.log" | tail -1)
 echo "package $P" | tee -a "$OUT/SUMMARY.txt"
-./flare/target/release/flare run "$P" --gpus "${GPUS:-0,1,2}" --port 15015 --host 127.0.0.1 \
+"${FLARE_BIN:-$ROOT/flare/target/release/flare}" run "$P" --gpus "${GPUS:-0,1,2}" --port 15015 --host 127.0.0.1 \
   --served-model-name DeepSeek-V4.1-Flash --mtp-draft-tokens 5 > "$OUT/serve.log" 2>&1 &
 ready=0
 for _ in $(seq 1 120); do
