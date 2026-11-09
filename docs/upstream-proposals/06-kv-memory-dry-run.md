@@ -30,7 +30,7 @@ weights; the driver is initialized only to read each GPU's total
   row arithmetic (the planner cannot drift from `Allocate cache`).
 - `flare/src/cli.rs`: `--dry-run` (conflicts with `--hosts`, `--rank`,
   `--rendezvous`, `--stage-only`) and `--dry-run-free-memory SIZE[,SIZE...]`.
-- Fork commits: 8d8a1e33 (feature), b0107c48 (calibration against the driver total).
+- Fork commits: db9dea41 (feature), 34716793 (calibration against the driver total).
 
 Plan per rank: (1) assumed free memory = driver total minus 606 MiB, or
 `--dry-run-free-memory`; (2) fixed device allocations exactly (weights,
