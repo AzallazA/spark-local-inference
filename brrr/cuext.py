@@ -28,7 +28,9 @@ def extension(name: str, defines: tuple[str, ...] = ()) -> ModuleType:
         name=f"{name}_{digest}{variant}",
         sources=[str(source)],
         extra_cflags=None if cuda else ["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a", *(["-lineinfo"] if os.environ.get("BRRR_LINEINFO") else []),
+        # -fno-gnu-unique: static locals of templates such as host.cuh opt_in_smem<layer_kernel> are otherwise GNU-unique
+        # symbols shared by every loaded variant, so a second variant in one process skipped its smem opt-in ("fits 0 CTAs").
+        extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a", "-Xcompiler", "-fno-gnu-unique", *(["-lineinfo"] if os.environ.get("BRRR_LINEINFO") else []),
                            *(f"-D{d}" for d in defines)] if cuda else None,
         extra_ldflags=LIBRARIES.get(name),
         verbose=False,
