@@ -691,6 +691,8 @@ pub struct RequestScheduler {
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
     admissions: u64,
+    /// Rounds left before the TTFT guard forces the overdue request again.
+    ttft_interleave: u32,
 }
 
 fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
@@ -781,6 +783,7 @@ impl RequestScheduler {
             evictions: Vec::new(),
             evictions_lost: false,
             admissions: 0,
+            ttft_interleave: 0,
         })
     }
 
@@ -2231,6 +2234,7 @@ impl RequestScheduler {
                 self.cache.mark_used(prefix, fence)?;
             }
         }
+        self.note_ttft_round(step);
         self.submitted = fence;
         self.refresh.commit(origin, fence, step);
         self.costs.record_attempt(key);

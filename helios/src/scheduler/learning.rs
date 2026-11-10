@@ -16,7 +16,7 @@ impl RequestScheduler {
         values: &[LaneValue; REQUEST_LANES], age_price: f64) -> Option<Candidate> {
         let mut candidates = Vec::new();
         self.packed_round_candidates(&mut candidates, values, age_price, true);
-        self.mixed_candidates(&mut candidates, values, age_price, true);
+        self.mixed_candidates(&mut candidates, values, age_price, true, None);
         let count = self.prune_padding(&mut candidates);
         // Round lengths depend only on the candidate, so each is estimated once.
         let widths = |candidate: Candidate, optimistic: bool| -> [usize; REQUEST_LANES] {

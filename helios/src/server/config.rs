@@ -316,17 +316,33 @@ impl Bootstrap {
             None => crate::scheduler::PolicyConfig::default(),
             Some(Value::String(value)) if value == "balanced" => crate::scheduler::PolicyConfig::default(),
             Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
-            Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
+            Some(Value::String(value)) if value == "interactive" => crate::scheduler::PolicyConfig::interactive(),
+            Some(_) => return Err("scheduler_policy must be balanced, throughput or interactive".into()),
         };
-        for (name, coefficient) in [
-            ("scheduler_terminal_value", &mut scheduling_policy.terminal_value),
-            ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price),
+        for (name, coefficient, positive) in [
+            ("scheduler_terminal_value", &mut scheduling_policy.terminal_value, false),
+            ("scheduler_terminal_age_price", &mut scheduling_policy.terminal_age_price, false),
+            ("scheduler_output_token_value", &mut scheduling_policy.output_token_value, true),
+            ("scheduler_token_fairness", &mut scheduling_policy.token_fairness, false),
+            ("scheduler_delivery_fairness", &mut scheduling_policy.delivery_fairness, false),
+            ("scheduler_decode_age_price", &mut scheduling_policy.decode_age_price, false),
+            ("scheduler_adaptation_ms", &mut scheduling_policy.adaptation_ms, true),
+            ("scheduler_ttft_target_ms", &mut scheduling_policy.ttft_target_ms, false),
         ] {
             if let Some(value) = object.get(name) {
                 *coefficient = value.as_f64()
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-                    .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
+                    .filter(|value| value.is_finite() && *value >= 0.0 && (!positive || *value > 0.0))
+                    .ok_or_else(|| if positive { format!("{name} must be finite and positive") }
+                        else { format!("{name} must be finite and nonnegative") })?;
             }
+        }
+        if let Some(value) = object.get("scheduler_ttft_max_chunk") {
+            scheduling_policy.ttft_max_chunk = value.as_u64().and_then(|v| usize::try_from(v).ok())
+                .ok_or("scheduler_ttft_max_chunk must be a nonnegative integer")?;
+        }
+        if let Some(value) = object.get("scheduler_ttft_decode_interleave") {
+            scheduling_policy.ttft_decode_interleave = value.as_u64().and_then(|v| u32::try_from(v).ok())
+                .ok_or("scheduler_ttft_decode_interleave must be a nonnegative 32-bit integer")?;
         }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
@@ -711,6 +727,12 @@ mod tests {
         let loaded = Bootstrap::load(&legacy.to_string(), &manifest).unwrap();
         assert_eq!(loaded.frontend.prompt_encoder(), PromptEncoder::Jinja);
         assert_eq!(loaded.server.scheduling_policy.adaptive_verification_alpha, 1.0);
+        let mut interactive = legacy.clone();
+        interactive["scheduler_policy"] = "interactive".into();
+        let policy = Bootstrap::load(&interactive.to_string(), &manifest).unwrap().server.scheduling_policy;
+        assert_eq!((policy.ttft_target_ms, policy.delivery_fairness, policy.decode_age_price), (50.0, 4.0, 0.1));
+        interactive["scheduler_policy"] = "latency".into();
+        assert!(Bootstrap::load(&interactive.to_string(), &manifest).err().unwrap().to_string().contains("interactive"));
         for preference in ["balanced", "throughput"] {
             let mut configured = legacy.clone();
             configured["scheduler_policy"] = preference.into();
@@ -732,6 +754,48 @@ mod tests {
                     overrides[key] = invalid;
                     assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
                         .to_string().contains(key));
+                }
+            }
+            let defaults = defaults.server.scheduling_policy;
+            for (key, positive) in [("scheduler_output_token_value", true), ("scheduler_token_fairness", false),
+                ("scheduler_delivery_fairness", false), ("scheduler_decode_age_price", false),
+                ("scheduler_adaptation_ms", true), ("scheduler_ttft_target_ms", false)] {
+                let mut expected = defaults;
+                *match key {
+                    "scheduler_output_token_value" => &mut expected.output_token_value,
+                    "scheduler_token_fairness" => &mut expected.token_fairness,
+                    "scheduler_delivery_fairness" => &mut expected.delivery_fairness,
+                    "scheduler_decode_age_price" => &mut expected.decode_age_price,
+                    "scheduler_adaptation_ms" => &mut expected.adaptation_ms,
+                    _ => &mut expected.ttft_target_ms,
+                } = 25.5;
+                let mut overrides = configured.clone();
+                overrides[key] = 25.5.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap().server.scheduling_policy;
+                assert_eq!(format!("{loaded:?}"), format!("{expected:?}"), "{key}");
+                overrides[key] = 0.into();
+                assert_eq!(Bootstrap::load(&overrides.to_string(), &manifest).is_ok(), !positive);
+                for invalid in [json!(-1), json!("NaN"), json!(null)] {
+                    overrides[key] = invalid;
+                    assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                        .to_string().contains(key));
+                }
+            }
+            assert_eq!((defaults.ttft_target_ms, defaults.ttft_max_chunk, defaults.ttft_decode_interleave), (0.0, 0, 1));
+            for (key, valid) in [("scheduler_ttft_max_chunk", 2048u64), ("scheduler_ttft_decode_interleave", 3)] {
+                let mut overrides = configured.clone();
+                overrides[key] = valid.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap().server.scheduling_policy;
+                assert_eq!(if key == "scheduler_ttft_max_chunk" { loaded.ttft_max_chunk as u64 }
+                    else { u64::from(loaded.ttft_decode_interleave) }, valid);
+                for invalid in [json!(-1), json!(1.5), json!("4"), json!(null), json!(1u64 << 33)] {
+                    overrides[key] = invalid.clone();
+                    let result = Bootstrap::load(&overrides.to_string(), &manifest);
+                    if key == "scheduler_ttft_max_chunk" && invalid == json!(1u64 << 33) {
+                        assert!(result.is_ok());
+                    } else {
+                        assert!(result.err().unwrap().to_string().contains(key));
+                    }
                 }
             }
             configured["mtp_adaptive_verification_alpha"] = 0.5.into();
