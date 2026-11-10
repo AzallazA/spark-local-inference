@@ -329,6 +329,22 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 20. **Profiling Flare** (one process, CUDA graphs, no NVTX ranges): start the server under `nsys launch` with
     collection off, then `nsys start` / `nsys stop` around a steady decode window; trace kernels only, with
     per-node CUDA graph tracing (`--cuda-graph-trace=node`), or the graph shows up as one opaque launch.
+21. **Shell environment traps.** `~/.local/bin/env` (uv's sourced-only script) sits first on `PATH` and shadows
+    `/usr/bin/env`, so `env VAR=x cmd` silently runs nothing: write `VAR=x cmd` or `/usr/bin/env VAR=x cmd`. The login
+    shell also exports `IMG=<another vLLM image>`: a chain variable named `IMG` (`${IMG:-default}`) silently picks it up
+    (2026-11-09: the vLLM A/B began pulling the wrong image). Give script variables specific names.
+22. **One GPU queue, not parallel chains.** Queue GPU jobs through `/tmp/gpuq-runner.sh` (log `~/bench-results/gpuq.log`):
+    an item runs only after `/tmp/gpuq/ready-<name>` exists, which is touched after its prep is reviewed; `done-<name>` is
+    written after it ran; moving `ready-*` into `/tmp/gpuq/held/` pauses the queue. Edit the runner only while it is idle
+    (kill it, edit, relaunch): bash reads a running script incrementally.
+23. **Upstream reproductions need a pristine tree.** The fork venv carries `tp3-patches/` (including the tiny-decode
+    clamp), so a bug check on upstream needs its own clone and venv (`uv sync --locked --extra prepare --extra test`).
+    For correctness-only exports use `--autotune-effort off --no-mtp` (minutes instead of hours; without MTP every
+    decode step is a 1-row launch). DeepSeek-V4 (`deepseek4`) rejects `--language-model-only` (no separable vision
+    encoder), and on main 8c2e782 its export needs `engram` dropped from its `LayerWeights` entry in
+    `ignition/components/weights.py` (hyperflare#249 notes it).
+24. **DeepSeek request options.** The DeepSeek frontends accept `chat_template_kwargs` `enable_thinking`/`thinking_mode`,
+    not `thinking` (HTTP 400 "unsupported DeepSeek prompt option").
 
 ---
 
