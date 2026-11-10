@@ -22,6 +22,13 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    /// Wait since arrival after which a request still awaiting its first token takes the next
+    /// round; zero disables the guard.
+    pub ttft_target_ms: f64,
+    /// Largest prefill chunk a guarded round may use; zero allows the largest prepared one.
+    pub ttft_max_chunk: usize,
+    /// Rounds other work may take between two guarded rounds of one overdue request.
+    pub ttft_decode_interleave: u32,
 }
 
 impl Default for PolicyConfig {
@@ -36,6 +43,9 @@ impl Default for PolicyConfig {
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
+            ttft_target_ms: 0.0,
+            ttft_max_chunk: 0,
+            ttft_decode_interleave: 1,
         }
     }
 }
@@ -45,6 +55,11 @@ impl PolicyConfig {
     /// the frequency of output bursts or their age separately.
     pub fn throughput() -> Self {
         Self { delivery_fairness: 0.0, decode_age_price: 0.0, ..Self::default() }
+    }
+
+    /// Balanced service, but a prompt waiting 50 ms for its first token takes the next round.
+    pub fn interactive() -> Self {
+        Self { ttft_target_ms: 50.0, ..Self::default() }
     }
 }
 
@@ -216,6 +231,7 @@ impl RequestScheduler {
                 policy.decode_age_price,
                 policy.terminal_value,
                 policy.terminal_age_price,
+                policy.ttft_target_ms,
             ]
             .into_iter()
             .any(|v| !v.is_finite() || v < 0.0)
@@ -933,7 +949,7 @@ impl RequestScheduler {
         age_price: f64,
     ) {
         output.clear();
-        self.mixed_candidates(output, values, age_price, false);
+        self.mixed_candidates(output, values, age_price, false, None);
         self.packed_round_candidates(output, values, age_price, false);
         for kind in [
             GraphKind::Prefill,
@@ -993,6 +1009,7 @@ impl RequestScheduler {
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
         optimistic: bool,
+        prompt_slot: Option<usize>,
     ) {
         let decode = if self.speculative_widths.is_empty() {
             GraphKind::Decode
@@ -1015,7 +1032,8 @@ impl RequestScheduler {
                 };
                 let kind = self.request_kind(r);
                 match kind {
-                    Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
+                    Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0
+                        && prompt_slot.is_none_or(|prompt| prompt == slot) => {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
                                 && self.prefill_work(r, smaller) == self.prefill_work(r, prefill)
@@ -1044,7 +1062,7 @@ impl RequestScheduler {
                     _ => {}
                 }
             }
-            for prompt in std::iter::once(None).chain(prompt.map(Some)) {
+            for prompt in std::iter::once(None).filter(|_| prompt_slot.is_none()).chain(prompt.map(Some)) {
                 if prompt.is_none() && duration_ns == 0
                     && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                         b == batch && w == width && smaller < prefill
@@ -1116,6 +1134,29 @@ impl RequestScheduler {
         if ordinary.rate.duration_ns == 0 {
             return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
         }
+        // An overdue first token outranks cost refresh and acceptance probes, not discovery.
+        if self.ttft_interleave == 0 && let Some(r) = self.ttft_overdue().filter(|r| self.eligible(r)) {
+            let slot = r.handle.slot as usize;
+            let chunk = if self.policy.ttft_max_chunk == 0 { usize::MAX } else { self.policy.ttft_max_chunk };
+            let mut forced = Vec::new();
+            self.ttft_candidates(&mut forced, r, &values, age_price);
+            let count = self.prune_padding(&mut forced);
+            // Prompt tokens the round advances; fewest chunks first, then value rate.
+            let progress = |c: &Candidate| {
+                if c.mask & (1 << slot) == 0 { return None; }
+                match c.kind {
+                    GraphKind::Prefill | GraphKind::ScoredPrefill => (c.capacity <= chunk).then_some(c.work),
+                    GraphKind::Mixed => (c.prefill_slot == Some(slot) && c.prefill_capacity <= chunk)
+                        .then(|| self.prefill_work(r, c.prefill_capacity)),
+                    _ => Some(0),
+                }
+            };
+            if let Some((_, forced)) = forced[..count].iter()
+                .filter_map(|c| progress(c).map(|work| (work, c)))
+                .max_by(|(x, a), (y, b)| x.cmp(y).then_with(|| compare(a, b))) {
+                return self.available_plan(*forced, log_scale, PlanOrigin::Ordinary);
+            }
+        }
         if self.refresh_ready() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
                 .map(|key| (self.costs.refresh_order(key), key)).collect();
@@ -1142,6 +1183,64 @@ impl RequestScheduler {
             }
         }
         self.available_plan(ordinary, log_scale, PlanOrigin::Ordinary)
+    }
+
+    /// Rounds that advance `r` itself: its prompt alone or as the mixed prompt row, or its
+    /// lifecycle step batched with peers in the same phase.
+    fn ttft_candidates(&self, output: &mut Vec<Candidate>, r: &LiveRequest,
+        values: &[LaneValue; REQUEST_LANES], age_price: f64) {
+        let slot = r.handle.slot as usize;
+        let Some(kind) = self.request_kind(r) else { return };
+        if kind.is_prefill() {
+            self.mixed_candidates(output, values, age_price, false, Some(slot));
+            for &capacity in self.prefill_catalog(kind) {
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+            }
+        } else if kind == GraphKind::Vision {
+            for &capacity in &self.capabilities.vision.patch_capacities {
+                self.add_candidate(output, kind, 1, capacity, 1 << slot, values, age_price);
+            }
+        } else {
+            let mask = self.slots.iter().enumerate()
+                .filter(|(_, entry)| entry.request.as_ref()
+                    .is_some_and(|peer| self.eligible(peer) && self.request_kind(peer) == Some(kind)))
+                .fold(0u64, |mask, (peer, _)| mask | 1 << peer);
+            for batch in crate::execution::BATCH_CAPACITIES.into_iter()
+                .take_while(|b| *b <= self.limits.max_active.next_power_of_two()) {
+                self.add_candidate(output, kind, batch, 1, mask, values, age_price);
+            }
+        }
+    }
+
+    /// The oldest request past the TTFT target that has not produced its first token.
+    pub(super) fn ttft_overdue(&self) -> Option<&LiveRequest> {
+        if self.policy.ttft_target_ms <= 0.0 {
+            return None;
+        }
+        let target = (self.policy.ttft_target_ms * 1e6) as u64;
+        self.slots.iter().filter_map(|s| s.request.as_ref())
+            .filter(|r| awaiting_first_token(r) && self.request_kind(r).is_some()
+                && self.now_ns.saturating_sub(r.accounting.arrival_ns) >= target)
+            .min_by_key(|r| (r.accounting.arrival_ns, r.admission_order))
+    }
+
+    /// Rounds other work may take before the overdue request is forced again: refilled by a
+    /// prompt or image chunk of it, kept by its lifecycle steps, spent by any other round, and
+    /// cleared when nothing is overdue.
+    pub(super) fn note_ttft_round(&mut self, step: &ScheduledStep) {
+        if self.policy.ttft_target_ms <= 0.0 {
+            return;
+        }
+        let Some(overdue) = self.ttft_overdue().map(|r| r.handle) else {
+            self.ttft_interleave = 0;
+            return;
+        };
+        let role = step.lanes.iter().position(|lane| lane.request == overdue).map(|row| step.lane_kind(row));
+        self.ttft_interleave = match role {
+            Some(kind) if kind.is_prefill() || kind == GraphKind::Vision => self.policy.ttft_decode_interleave,
+            Some(GraphKind::Decode | GraphKind::Speculative) | None => self.ttft_interleave.saturating_sub(1),
+            Some(_) => self.ttft_interleave,
+        };
     }
 
     fn available_plan(
@@ -1266,6 +1365,14 @@ impl RequestScheduler {
         let origin = if candidate.rate.duration_ns == 0 { PlanOrigin::Discovery } else { PlanOrigin::Ordinary };
         self.materialize(candidate, scale, origin)
     }
+}
+
+/// Admitted and still before its first output token, excluding terminal cleanup.
+pub(super) fn awaiting_first_token(request: &LiveRequest) -> bool {
+    request.generated_tokens == 0
+        && matches!(request.phase, RequestPhase::Initialize | RequestPhase::Restore | RequestPhase::Vision
+            | RequestPhase::Prefill | RequestPhase::Resume | RequestPhase::Snapshot)
+        && !terminal_cleanup(request)
 }
 
 pub(super) fn terminal_cleanup(request: &LiveRequest) -> bool {

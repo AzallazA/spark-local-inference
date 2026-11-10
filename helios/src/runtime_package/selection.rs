@@ -42,6 +42,8 @@ pub struct LoadOptions {
     pub prefix_cache: crate::offload::PrefixCacheOffload,
     /// For a package whose ranks run on separate hosts: the one rank this host loads.
     pub cluster_rank: Option<usize>,
+    /// Drop captured mixed prefill/decode graphs, serving prompts and decoding in separate rounds.
+    pub no_mixed_prefill: bool,
 }
 
 /// Which embedding tables one storage entry selects.
@@ -446,6 +448,7 @@ impl LoadOptions {
             }
             execution.graphs.retain(|graph| {
                 graph.batch_capacity <= active.next_power_of_two() as u64
+                    && !(self.no_mixed_prefill && graph.kind == "mixed")
                     && graph.speculation_enabled.is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
                     && (!(graph.kind == "speculative" || graph.kind == "mixed" && enabled)
@@ -1648,6 +1651,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn serve_time_mixed_opt_out_keeps_separate_rounds() {
+        for drafts in [0, 2] {
+            let mut p = mixed_package();
+            let mut c = config();
+            c["prefill_chunk_size"] = 512.into();
+            LoadOptions { mtp_draft_tokens: Some(drafts), no_mixed_prefill: true, ..Default::default() }
+                .select(std::slice::from_mut(&mut p), &mut c).unwrap();
+            let graphs = &p.execution.as_ref().unwrap().graphs;
+            assert!(graphs.iter().all(|g| g.kind != "mixed"));
+            assert!(graphs.iter().any(|g| g.kind == if drafts > 0 { "speculative" } else { "decode" }));
+        }
+        // Width-1 mixed rounds survive at zero drafts (the PR #211 review note).
+        let mut p = mixed_package();
+        let mut c = config();
+        c["prefill_chunk_size"] = 512.into();
+        LoadOptions { mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(std::slice::from_mut(&mut p), &mut c).unwrap();
+        assert!(p.execution.as_ref().unwrap().graphs.iter()
+            .any(|g| g.kind == "mixed" && g.token_capacity == 1 && g.speculation_enabled == Some(false)));
     }
 
     #[test]
