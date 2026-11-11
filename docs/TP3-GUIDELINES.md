@@ -27,9 +27,9 @@ claim, D.3 before any kernel edit, D.4 before any push.
 | KV capacity without a serve | `flare run <pkg> <serve flags> --dry-run` (per-rank memory plan + KV tokens + snapshot slots; exact on 5 recorded loads; `--dry-run-free-memory` overrides the assumed free VRAM) |
 | Full qualification suite | release folder `qualification/qual_all.sh` (eval tools lavd hotel retrieval longgen eos livebench stress); needs `~/llm-inference-bench`, `~/LiveBench` |
 | Checkpoints | full view `/m2-2/flare-ckpt/ds41-1017-engram-mxfp4` (built by `release/make_checkpoint_view.sh`; the release docs' `~/ds41-1017-engram-mxfp4` is an example path, not ours); truncated test models `/m2-2/flare-ckpt/ds41-mini6` (6 layers) and `ds41-mini8` (8 layers, has native scales, use for parking/BRRR tests) |
-| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; default `...202611070243`; each non-default package is ~4 GB on disk (shared blobs) |
-| Server scripts | `~/flare-up-v3/serve-best.sh` (defaults: pkg 070243, K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=balanced), restart via `/tmp/restart-default.sh` |
-| Release folder (public) | `~/rtx-recipes/DeepSeek-V4.1-Flash Flare-tp3-20261107/` (README, EXPORT, MEASUREMENTS, ENGRAM-PRECISION, export.sh, serve.sh, source.patch, qualification/) |
+| Exported packages | `~/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-<timestamp>/`; default `...202611090700` (graph scratch, c8); each non-default package is ~4 GB on disk (shared blobs) |
+| Server scripts | `~/flare-up-v3/serve-best.sh` (defaults: pkg 090700, K=5, ALPHA=0.8, BUDGET=24, PCM=32G, SCHED=interactive), restart via `/tmp/restart-default.sh` |
+| Release folder (public) | `~/rtx-recipes/DeepSeek-V4.1-Flash Hyperflare-tp3-YYYYMMDD/` from the Hyperflare release on (earlier: `... Flare-tp3-2026110x/`) (README, EXPORT, MEASUREMENTS, ENGRAM-PRECISION, export.sh, serve.sh, source.patch, qualification/) |
 | Upstream proposals | `docs/upstream-proposals/` in the fork (public with the branch, not submitted upstream); mirrored on the `proposals` branch of the private staging repo |
 | Scratch / logs / older vLLM-era work | `~/ds41-tp3/` (bench logs, eval_*.json, analyze_trace.py, compose files); `~/engram-eval/` (FP8 vs MXFP4 Engram perplexity eval) |
 | Archive of old builds | `/mnt/ai_a` (AI_A), cold storage `/mnt/ai_b` |
@@ -151,7 +151,8 @@ The fork tree is kept publication-clean at all times: no experiment scripts at t
 | `K` drafts | keep 5; coding acceptance is high; k7 was -3-6% at c4/c8 |
 | `ALPHA` 0.6/0.8/1.0, scheduler balanced/throughput | within noise; defaults 0.8 / balanced |
 | Power 350/450/600 W, core offset | 450 W ≈ +10-12% over 350 W; 600 W no gain; +100/+150 core no gain |
-| `FLARE_DS41_BRRR_PARKED_MAX_ROWS=12` | gate for BRRR in parked layers; ungated = c8 +1%, c1 level (tabled) |
+| `FLARE_DS41_BRRR_PARKED_MAX_ROWS` (`PARKED_ROWS` in `export.sh`, default 12) | gate for BRRR in parked layers; ungated = c8 +1%, c1 level (tabled); 24 on the c16 package = c16 +3.4%, c1-c8 level (11-09); c8 package: release-chain A/B |
+| `--scheduler-policy interactive` (TTFT guard: balanced + `--scheduler-ttft-target-ms 50`) | adopted 11-10: probe TTFT p50 0.36-0.38 s vs 2.0-4.0 s at c4/c8, agent c4 turns 519 vs 448, decode level; `SCHED=balanced` reverts |
 | `FLARE_DS41_BRRR_SPARSE`, `FLARE_DS41_FUSED_QKV_NORM` | opt-in experiments, measured level; default off, kept with their kernel tests (`TP3Config.brrr_sparse` / `fused_qkv_norm`) |
 | BRRR prologue, `FLARE_DS41_QB_ATOMIC` | measured level; REMOVED 2026-11-08 (`TP3Config.from_environment` rejects the variables) |
 | BRRR stage 2 (OTOK/SPAN 48 wide rows, worktree `~/flare-up-stage2`) | REGRESSION: c4 -5%, c1 -3% (11-08, real export); closed |
@@ -223,10 +224,10 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 ### B.5 Publishing a release
 
 1. Validate the state (B.1/B.2), commit on `ds41-tp3-v3`, push to Gitea.
-2. Tag it `flare-tp3-YYYYMMDD` (annotated: settings and measurements in the message), push branch and tag to `public`,
+2. Tag it `hyperflare-tp3-YYYYMMDD` (from the 2026-11 Hyperflare release on; the published `flare-tp3-*` tags stay) (annotated: settings and measurements in the message), push branch and tag to `public`,
    and write the GitHub Release note (what changed, measured numbers, what was not adopted, link to the recipes folder).
 3. The recipes folder is dated by the day the change was made (release convention): a new
-   `DeepSeek-V4.1-Flash Flare-tp3-YYYYMMDD` folder per release day, copied from the previous one and edited; earlier
+   `DeepSeek-V4.1-Flash Hyperflare-tp3-YYYYMMDD` folder per release day (earlier folders keep `Flare-tp3`), copied from the previous one and edited; earlier
    folders stay as published. Its README describes the changes **since the previous folder** (not since the first
    one): intro list, "Coming from <previous>" migration notes, headline table labelled with the builds it holds; the
    cumulative feature description stays as "What this build contains". *Incident:* the 20261108 folder shipped for an
@@ -299,7 +300,8 @@ FP8, k7 drafts, 8192 prefill chunks, BRRR wide-row restreaming (stage 2), extra 
 13. **Size KV with the dry run, not a load.** `flare run <pkg> <serve flags> --dry-run` prints each rank's memory plan,
     the KV tokens and snapshot slots in seconds, without a CUDA context, while the server keeps serving. Use it before
     a sweep, when choosing serve flags, and before crediting a build with a KV change (D.1 rule 4). Accuracy:
-    exact on the five DeepSeek-V4.1-Flash TP3 loads it was calibrated on; 0.4 % low (TP3) and 1.3 % low (TP2) on
+    exact on the five DeepSeek-V4.1-Flash TP3 loads it was calibrated on, but 0.2 % low on the later packages 081024 and
+    090700 (2,461,184 vs 2,467,200 and 3,007,360 vs 3,014,656 served: quote the served `Allocate cache` count); 0.4 % low (TP3) and 1.3 % low (TP2) on
     GLM-5.3-Flash, which was not in the calibration, so read it as a slightly conservative estimate for other models.
     `--dry-run-free-memory` replaces the assumed free memory (driver total minus 606 MiB) when a GPU is shared.
     Dry runs are cheap, so answer KV questions with them before an export: c16 graphs cost ~650K KV against c8, and

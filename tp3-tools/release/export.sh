@@ -2,25 +2,28 @@
 # Export the package from a checkpoint view (make_checkpoint_view.sh). Run it from the fork checkout with its .venv
 # (uv sync, ignition.patches, then re-apply tp3-patches/ to the installed FlashInfer).
 #   CKPT     checkpoint view directory (required)
-#   HOT      hot experts per parked layer (default 342 = 2.37M KV; each expert fewer adds ~92K KV tokens, see EXPORT.md)
+#   HOT      hot experts per parked layer (default 342 = 3.01M KV at serve cap 24 with graph scratch; each expert fewer adds ~92K KV tokens, see EXPORT.md)
 #   PREFILL  prefill chunk size (default 4096)
 #   DRAFTS   DSpark drafts (default 5); serve with the same DRAFTS (serve.sh)
 #   MAXC     maximum concurrent requests the package captures graphs for (default 8; 16 = the c16 package)
+#   PARKED_ROWS  widest graph (rows) in which the parked layers 20-33 use the BRRR fused tail (default 12; 24 = every
+#            graph the serve-time verification budget 24 keeps; measured +3.4% at c16 on the c16 package, c1-c8 level)
 #   FLARE_DS41_VISION_STAGE 1 (default) = vision tower parked in host RAM and its weights staged through VRAM slots per
 #            block (image 0.11 s instead of 1.70 s, no KV cost); 0 = no staging
 #   FLARE_DS41_ENGRAM_CHUNK_ROWS 1024 (default) + FLARE_DS41_SHARE_ENGRAM_RESIDUAL 1 (default) = graph scratch: chunked Engram
 #            projection and engram_residual on ffn_hc.residual (KV 2.46M -> 3.01M at HOT 342, decode level); 0/0 = previous layout
 #   FLARE_DS41_VISION_HOST  1 (default) = vision tower in host RAM (implied by VISION_STAGE=1); VISION_HOST=0 together
 #            with VISION_STAGE=0 keeps the tower in VRAM, which needs a lower HOT (unmeasured, no longer useful)
-# A cold tuning cache needs more free VRAM than serving. If tuning runs out of memory, export once with HOT=300,
-# then export the target. The second export reuses the shared tuning cache.
+# A tuning cache not yet warmed by this release's code (cold, or from 20261105) needs more free VRAM than serving:
+# for any HOT above ~300, export once with HOT=300 first, then export the target. The second export reuses the shared tuning cache.
+# A new MAXC (16) needs its own HOT=300 warm-up export.
 set -euo pipefail
 : "${CKPT:?set CKPT to the checkpoint view directory}"
 HERE=$(dirname "$(readlink -f "$0")")
 export FLARE_DS41_TP3_GRAPH_GIB=1 FLARE_DS41_HOST_EXPERT_LAYERS=20-33 FLARE_DS41_HOT_EXPERTS=${HOT:-342} \
        FLARE_DS41_MERGED_BANK=1 FLARE_DS41_TP3_VOCAB_PARALLEL=1 \
        FLARE_DS41_EXPERT_COUNTS_DIR=${COUNTS:-$HERE/expert-order} HF_HUB_OFFLINE=1 \
-       FLARE_DS41_BRRR_LAYERS=0-39 FLARE_DS41_BRRR_CKPT="$CKPT" FLARE_DS41_BRRR_PARKED_MAX_ROWS=12 \
+       FLARE_DS41_BRRR_LAYERS=0-39 FLARE_DS41_BRRR_CKPT="$CKPT" FLARE_DS41_BRRR_PARKED_MAX_ROWS=${PARKED_ROWS:-12} \
        FLARE_DS41_EMBED_HOST=1 FLARE_DS41_VISION_HOST="${FLARE_DS41_VISION_HOST:-1}" FLARE_DS41_VISION_STAGE="${FLARE_DS41_VISION_STAGE:-1}" \
        FLARE_DS41_AR_ROWS=1024 FLARE_DS41_ENGRAM_CHUNK_ROWS="${FLARE_DS41_ENGRAM_CHUNK_ROWS:-1024}" \
        FLARE_DS41_SHARE_ENGRAM_RESIDUAL="${FLARE_DS41_SHARE_ENGRAM_RESIDUAL:-1}"

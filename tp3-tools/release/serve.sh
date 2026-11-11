@@ -8,7 +8,8 @@
 #   BUDGET        max verification rows per step (default 24; 128 = no cap, ~1-2% slower at c8)
 #   DRAFTS        DSpark drafts (default 5); must equal the DRAFTS the package was exported with
 #   ALPHA         adaptive-verification alpha (default 0.8; 0.6 and 1.0 measured within noise)
-#   SCHEDULER     scheduler policy (default balanced; throughput measured within ~2%)
+#   SCHEDULER     scheduler policy (default interactive = balanced + a 50 ms first-token target: a new prompt waits
+#                 ~0.37 s instead of 2-4 s behind 3-7 decoding streams, decode speed level; balanced = the previous default)
 #   GPUS, PORT, HOST   default 0,1,2 / 15015 / 127.0.0.1
 set -euo pipefail
 FLARE=${FLARE:-flare/target/release/flare}
@@ -19,4 +20,4 @@ if [ "${ENGRAM_RAM:-1}" = 1 ]; then ENV=(FLARE_ENGRAM_RAM_TABLES=0); else STORAG
 exec /usr/bin/env "${ENV[@]}" "$FLARE" run "$PACKAGE" --gpus "${GPUS:-0,1,2}" --port "${PORT:-15015}" \
   --host "${HOST:-127.0.0.1}" --served-model-name DeepSeek-V4.1-Flash --prefix-cache-memory "${PREFIX_CACHE:-16G}" \
   --mtp-draft-tokens "${DRAFTS:-5}" --mtp-adaptive-verification --mtp-max-verification-token-budget "${BUDGET:-24}" \
-  --mtp-adaptive-verification-alpha "${ALPHA:-0.8}" --scheduler-policy "${SCHEDULER:-balanced}" "${STORAGE[@]}"
+  --mtp-adaptive-verification-alpha "${ALPHA:-0.8}" --scheduler-policy "${SCHEDULER:-interactive}" "${STORAGE[@]}"

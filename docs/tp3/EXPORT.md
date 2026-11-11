@@ -6,8 +6,8 @@
 > `expert-order/` counts are in `tp3-tools/release/` (`COUNTS=tp3-tools/release/expert-order`). The release folder's
 > copies are regenerated from this tree at tagging time (`docs/TP3-GUIDELINES.md`, B.5).
 
-
-This guide builds the Flare package in this folder from scratch. It covers the toolchain, the patched Flare fork,
+This guide builds the Hyperflare (formerly Flare; the binary is still `flare`) package in this folder from scratch.
+It covers the toolchain, the patched fork,
 the checkpoint, the export, and the checks to run before serving. Budget **about 2 hours of mostly unattended time**
 and **~900 GB of free disk**.
 
@@ -21,8 +21,8 @@ and **~900 GB of free disk**.
 | Driver | 615.71.09 | any driver supporting CUDA 13.1 |
 | CUDA toolkit | 13.1 (`/usr/local/cuda-13.1`) | nvcc 12.x is too old for SM120. The export also compiles the BRRR layer kernel with it |
 | Rust | 1.97 (rustup) | builds the `flare` binary and the Heliopause extension |
-| uv | 0.11 | Flare's Python environment (Python 3.12, managed by uv) |
-| Locked memory | `memlock unlimited` for your user | Flare pins host memory; for example `/etc/security/limits.d/90-memlock.conf`: `<user> - memlock unlimited`, then log in again |
+| uv | 0.11 | Hyperflare's Python environment (Python 3.12, managed by uv) |
+| Locked memory | `memlock unlimited` for your user | Hyperflare pins host memory; for example `/etc/security/limits.d/90-memlock.conf`: `<user> - memlock unlimited`, then log in again |
 
 ```bash
 export CUDA_HOME=/usr/local/cuda-13.1 PATH=/usr/local/cuda-13.1/bin:$PATH
@@ -40,18 +40,19 @@ Run it once the clone from step 2 exists and again after each step:
 The exact versions behind every number in this folder (driver, toolkit, torch, FlashInfer, benchmarks) are in
 [versions.txt](versions.txt). torch's `cu132` wheel next to the 13.1 toolkit is expected, not a mismatch.
 
-## 2. Build the Flare fork
+## 2. Build the Hyperflare fork
 
-The fork is upstream NVIDIA Flare at `972e28e4` plus `source.patch` from this folder.
+The fork is upstream NVIDIA Hyperflare at `972e28e4` (the commit predates the rename; the old
+`flare-local-inference` URL redirects) plus `source.patch` from this folder.
 
 ```bash
-git clone https://github.com/NVIDIA/flare-local-inference.git flare
+git clone https://github.com/NVIDIA/hyperflare-inference.git flare
 cd flare
 git checkout 972e28e44781d8d0c84d70ae434db92c36076a43
-git apply /path/to/this-folder/source.patch           # 86 files (45 new, including brrr/); applies cleanly to 972e28e4
+git apply /path/to/this-folder/source.patch           # 164 files (110 new, including brrr/ and tp3-tools/); applies cleanly to 972e28e4
 
 uv sync --locked --extra prepare --extra test         # Python environment in .venv (pulls FlashInfer @ 1f8ed8a3)
-uv run --locked --extra prepare python -m ignition.patches   # Flare's torch/Triton patches; re-run after every uv sync
+uv run --locked --extra prepare python -m ignition.patches   # Hyperflare's torch/Triton patches; re-run after every uv sync
 cargo build --release --manifest-path flare/Cargo.toml  # the flare binary: flare/target/release/flare
 ```
 
@@ -76,10 +77,27 @@ flare/target/release/flare --version
 .venv/bin/ignition export --help | head -3
 ```
 
+**Update 20261111 (Hyperflare-tp3).** `source.patch` is generated from fork tag `hyperflare-tp3-20261111`:
+graph scratch (`FLARE_DS41_ENGRAM_CHUNK_ROWS=1024` and `FLARE_DS41_SHARE_ENGRAM_RESIDUAL=1`, both `export.sh` defaults:
+~465 MiB per GPU of graph scratch freed, KV 2,467,200 → 3,014,656 tokens at cap 24 and 32G prefix cache), the Helios TTFT
+guard (`--scheduler-policy interactive`, the new `serve.sh` default, plus the `--scheduler-*` tuning flags and
+`--no-mixed-prefill`), the `MAXC` and `PARKED_ROWS` knobs in `export.sh`, BRRR kernel changes (CSF descriptors kept in
+registers, `-fno-gnu-unique` builds, three default-off experiments and an opt-in profile pass), and handbook updates.
+**Rebuild the `flare` binary** (step 2) and **export again** (step 4); a tuning cache warmed by a 20261108 export is
+enough (measured: one 36-minute export, no warm-up needed).
+
+**Update 2026-11-08.1.** `source.patch` is now generated from fork tag `flare-tp3-20261108.1`: the `TP3Config` object
+(the `FLARE_DS41_*` variables keep their names and defaults; invalid or removed names fail the export loudly; the
+resolved configuration is written as `tp3-config.json` beside `model.safetensors`), the BRRR prologue and QB_ATOMIC
+experiment paths removed, the FP64 per-operator layer test, and `tp3-tools/release/` (this folder's scripts and the
+expert order, kept in the fork as the single source). The exported package gains ~6K KV tokens from the removed
+prologue scratch buffers (2,467,200 at 32G prefix cache). Full c8 qualification of that package: see the README.
+
 **Update 2026-11-08.** `source.patch` now carries the BRRR kernel hygiene pass (cold-first parked jobs, per-chunk attention
 flags, a constants contract between kernel and config, a cross-rank agreement check), vision weight staging
 (`FLARE_DS41_VISION_STAGE=1`, the new `export.sh` default: 0.11 s per image instead of 1.70 s), one resolution point for
-Engram table storage in Helios, `flare run ... --dry-run` (KV capacity without a serve) and three GPU equivalence tests.
+Engram table storage in Helios, `flare run ... --dry-run` (KV capacity without a serve; no GPU memory or CUDA context,
+but it needs the NVIDIA driver and the GPUs visible) and three GPU equivalence tests.
 It was regenerated from the fork after its history was cleaned for publication (experiment scripts removed, tools
 under `tp3-tools/`), and verified to reproduce the fork tree exactly on a clean `972e28e4` checkout. Measurements in
 MEASUREMENTS.md ("2026-11-08").
@@ -120,19 +138,19 @@ Then assemble the view (symlinks only, no copies) with this folder's `config.jso
 # expect: "96085 tensors in 48 shards, missing 0; layer-1 Engram table U8 [384006168, 128]"
 ```
 
-**The directory name becomes the model name.** Flare names the exported model after the checkpoint directory: the
+**The directory name becomes the model name.** Hyperflare names the exported model after the checkpoint directory: the
 package lands in `~/.cache/flare/packages/models/<directory name>/gb202-tp3-<timestamp>`, `flare models list` shows
 it as `<directory name>`, and `flare run <directory name>` serves it. `serve.sh` defaults to
 `PACKAGE=ds41-1017-engram-mxfp4`, the name used here; if you name the view differently, serve with
 `PACKAGE=<your name>` (or the package path).
 
-The index in this folder is NVIDIA's mapping with a corrected `total_size`. Flare checks that field against the
+The index in this folder is NVIDIA's mapping with a corrected `total_size`. Hyperflare checks that field against the
 actual tensor bytes; the uncorrected value makes the export stop at "index total_size does not match".
 
 ## 4. Export
 
-From the fork checkout, with GPUs idle (stop any server first). **Export twice on a fresh machine:** with a cold
-kernel tuning cache, tuning at `HOT=342` runs out of VRAM. A `HOT=300` export first fills the shared cache, and the
+From the fork checkout, with GPUs idle (stop any server first). **Export twice on a fresh machine:** with a tuning
+cache not yet warmed by this release's code (cold, or from 20261105), tuning at any `HOT` above ~300 runs out of VRAM. A `HOT=300` export first fills the shared cache, and the
 second export reuses it:
 
 ```bash
@@ -152,14 +170,16 @@ CKPT=~/ds41-1017-engram-mxfp4 /path/to/this-folder/export.sh           # the rel
 | `FLARE_DS41_EXPERT_COUNTS_DIR` | `expert-order/` | route counts that decide which experts are hot |
 | `FLARE_DS41_BRRR_LAYERS` | `0-39` | layers that use the fused BRRR layer tail (compiled from `brrr/kernels/decoder.cu` at export) |
 | `FLARE_DS41_BRRR_CKPT` | `$CKPT` | checkpoint the BRRR tail reads its weight layout from |
-| `FLARE_DS41_BRRR_PARKED_MAX_ROWS` | `12` | parked layers use the BRRR tail only in graphs of ≤12 rows |
+| `FLARE_DS41_BRRR_PARKED_MAX_ROWS` (`PARKED_ROWS`) | `12` | parked layers use the BRRR tail only in graphs of at most this many rows (24 = every graph the serve-time verification budget 24 keeps; measured not consistently faster at c8 and slightly slower at 512K, MEASUREMENTS.md) |
 | `FLARE_DS41_EMBED_HOST`, `FLARE_DS41_VISION_HOST` | `1`, `1` | token embedding and vision tower in device-visible host RAM. `FLARE_DS41_VISION_HOST=0` in the environment keeps the vision tower in VRAM (pair it with a lower `HOT`; unmeasured, and unnecessary with staging) |
 | `FLARE_DS41_VISION_STAGE` | `1` | stage the host-parked vision tower's weights through two VRAM slots per block on a side stream (190 MiB from the activation pool, no KV change). Measured 2026-11-08: cold single image 0.11 s vs 1.70 s, 60-image accuracy unchanged. `0` = direct host-RAM reads. `FLARE_DS41_VISION_STAGE_COPY=kernel` swaps the memcpy for an elementwise copy if a driver mishandles memcpy from mapped host memory |
 | `FLARE_DS41_AR_ROWS` | `1024` | size the prefill all-reduce runtime for 1024 rows (~600 MiB/GPU less than 4096) |
+| `FLARE_DS41_ENGRAM_CHUNK_ROWS` | `1024` | graph scratch: the Engram projection, all-reduce and mix run in 1024-row chunks (~300 MiB/GPU less scratch); `0` = previous layout |
+| `FLARE_DS41_SHARE_ENGRAM_RESIDUAL` | `1` | graph scratch: `engram_residual` lives in the `ffn_hc.residual` buffer (~165 MiB/GPU); `0` = separate buffer |
 | `FLARE_DS41_TP3_VOCAB_PARALLEL` | `1` | vocabulary-parallel sampling at TP3 (fixes top_p at 1.0) |
 | `FLARE_DS41_TP3_GRAPH_GIB` | `1` | the planner's graph-memory estimate for TP3 |
 | `--prefill-chunk-size` (`PREFILL`) | `4096` | prefill chunk; 2048 gives more KV, less prefill speed |
-| `--max-concurrency` | `8` | request slots |
+| `--max-concurrency` (`MAXC`) | `8` | request slots the package captures graphs for (8 = the qualified package; 16 costs ~650K KV tokens and needs its own `HOT=300` warm-up) |
 | `--mtp-draft-tokens` (`DRAFTS`) | `5` | DSpark drafts, NVFP4 draft head, FP8 Markov head. 7 measured slower (MEASUREMENTS.md) |
 
 ### What to expect, and how long
@@ -195,11 +215,11 @@ stages and the final clean-up. Second-export log, `<home>` = your home directory
 Exported cache entry: <home>/.cache/flare/packages/models/ds41-1017-engram-mxfp4/gb202-tp3-202611070243
 ```
 
-When you then serve it (step 5), the server log should show this for `HOT=342` at the default `PREFIX_CACHE=16G`
-(2,461,184 tokens at `32G`; `HOT=300` gives 6,247,680):
+When you then serve it (step 5), the server log shows an `Allocate cache` line like this one, recorded for the release
+package `gb202-tp3-202611111227` (`HOT=342`, verification row cap 24, `PREFIX_CACHE=32G`; the same line as the first graph scratch package):
 
 ```text
-[    OK    ] Allocate cache.  6.3 GiB · 2373760 KV tokens · 225 shared snapshot slots · limited by memory  0.1s
+[    OK    ] Allocate cache.  7.9 GiB · 3014656 KV tokens · 285 shared snapshot slots · limited by memory  0.2s
 [    OK    ] Start server.  http://127.0.0.1:15015 · 1048576 tokens/request  0.3s
 ```
 
@@ -210,10 +230,10 @@ about **92K KV tokens**. Decode gets slower because more experts stream over PCI
 
 | `HOT` | KV tokens | Measured (350 W, natural EOS, 32K c1 / c4 / c8) |
 | --- | --- | --- |
-| **342** | **2,373,760** | 288 / 634 / 838 tok/s (**this release**; 298-305 / 716-738 / 957-975 at 450 W, user command) |
-| 300 | 6,247,680 | 269 / 610 / 800 tok/s: 4-7% slower, corruption check clean |
+| **342** | **3,014,656** (graph scratch; 2,467,200 without) | 288 / 634 / 838 tok/s before graph scratch (decode level with it); **this release** at 450 W: 300 / 713 / 950 tok/s |
+| 300 | ~6.9M estimated with graph scratch (6,247,680 measured at cap 128 without it) | 269 / 610 / 800 tok/s: 4-7% slower, corruption check clean (before graph scratch) |
 
-> **Disclaimer.** Other values were not measured on this fork. Expect KV ≈ 2.37M + (342 − HOT) × 92K tokens, and a
+> **Disclaimer.** Other values were not measured on this fork. Expect KV ≈ 3,014,656 + (342 − HOT) × 92K tokens at verification row cap 24, and a
 > decode cost that grows as more of your traffic routes to cold experts (roughly 1% per 6-10 experts in our
 > measurements). Check the `Allocate cache` line and bench your own export before relying on it.
 
@@ -234,7 +254,8 @@ few thousand tokens (the excerpt in step 4 shows the expected line).
 
 **Less host RAM:** `ENGRAM_RAM=0 ./serve.sh` reads both Engram tables from disk with direct I/O. The server then
 uses ~59 GiB of host RAM instead of ~148 GiB, with decode ~4% slower and prefill unchanged on Gen5 NVMe. See the
-README for the numbers.
+README for the numbers. Disk mode reads the tables from the exported checkpoint files, so the checkpoint view and the
+Hugging Face cache files its symlinks point to must stay at the same absolute paths as at export.
 
 Then run the corruption check, which compares sampled decode tokens against a teacher-forced prefill and must
 report `TRUE corruptions 0`, and a benchmark:
@@ -248,18 +269,20 @@ python3 /path/to/this-folder/tools/bench_steps.py result.json   # steps/s and to
 
 Optional: `tools/llm-bench-flare-steps.patch` (`git apply` inside `llm-inference-bench`, tested on v0.9.1; the
 benchmark is MIT-licensed, see its README) makes the benchmark's own summary show the "MTP-normalized decode steps/s"
-table for Flare, computed from Flare's draft-round counters.
+table for Hyperflare, computed from Hyperflare's draft-round counters.
 
 ## 6. Troubleshooting
 
 | Symptom | Cause and fix |
 | --- | --- |
-| Tuning fails with `OutOfMemoryError ... failed to prepare with configuration` | A **cold tuning cache** needs more free VRAM than serving. Export with `HOT=300` first, then the target: the tuning cache in `~/.cache/flare/kernels` is shared and the second export reuses it. A new draft count (`DRAFTS=7`) needs its own warm-up export |
+| Tuning fails with `OutOfMemoryError ... failed to prepare with configuration` | A tuning cache **not yet warmed by this release's code** (cold, or from 20261105) needs more free VRAM than serving at any `HOT` above ~300. Export with `HOT=300` first, then the target: the tuning cache in `~/.cache/flare/kernels` is shared and the second export reuses it. A new draft count (`DRAFTS=7`) needs its own warm-up export |
 | Export stops at `KeyError: 'FLARE_DS41_BRRR_CKPT'` | you ran `ignition export` directly; use `export.sh` or set `FLARE_DS41_BRRR_CKPT` to the checkpoint view |
 | BRRR kernel compile fails (`nvcc`, `ninja`) | `CUDA_HOME` must point at CUDA 13.1 (`nvcc` with `sm_120a`); `ninja` comes with `uv sync`. Compiled kernels are cached in `.brrr-ext/` in the checkout |
 | `index total_size does not match tensor payload bytes` | use this folder's `model.safetensors.index.json` (step 3) |
-| Export dies on `Cannot patch imported module triton.runtime.build` | Flare's torch/Triton patches are missing: run `uv run --locked --extra prepare python -m ignition.patches` after `uv sync` |
-| Chat requests return 400 for `thinking` / `clear_thinking` | Flare's thinking toggle is `chat_template_kwargs: {"enable_thinking": true}` (or `false`); vLLM's `thinking` / `clear_thinking` fields are rejected |
+| Export dies on `Cannot patch imported module triton.runtime.build` | Hyperflare's torch/Triton patches are missing: run `uv run --locked --extra prepare python -m ignition.patches` after `uv sync` |
+| Chat requests return 400 for `thinking` / `clear_thinking` | Hyperflare's thinking toggle is `chat_template_kwargs: {"enable_thinking": true}` (or `false`); vLLM's `thinking` / `clear_thinking` fields are rejected |
+| `serve.sh` stops with an invalid-value error for `--scheduler-policy interactive` | the `flare` binary predates this release's `source.patch`: rebuild it (step 2), or serve with `SCHEDULER=balanced` |
+| Chat requests return 400 for `reasoning_effort` | accepted values are `low`, `high`, `xhigh`, `max` or an integer from 1 through 100; `"medium"` is rejected |
 | The command does nothing and exits 0 | your shell's `env` is not `/usr/bin/env` (uv installs one at `~/.local/bin/env`); the scripts here call `/usr/bin/env` explicitly |
 | Corruption check reports true corruptions | `flashinfer-tiny-decode-swiglu.patch` is not applied in `.venv` |
 | `serve.sh` fails because `ds41-1017-engram-mxfp4` is not found | the checkpoint view had another directory name, and the model name follows it (step 3). `flare models list` shows the name; serve with `PACKAGE=<name>` or the package path |

@@ -2,6 +2,9 @@
   <img src="docs/images/flare-wordmark.png" alt="Flare — ASCII wordmark above a solar flare" width="912">
 </p>
 
+> **Flare = Hyperflare.** Upstream (NVIDIA/hyperflare-inference) renamed the project to Hyperflare; the binary, CLI and
+> cache paths are still `flare`. This fork adds DeepSeek-V4.1-Flash at TP3 (3 x RTX PRO 6000): [docs/TP3-GUIDELINES.md](docs/TP3-GUIDELINES.md), [docs/tp3/](docs/tp3/).
+
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
 Flare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
