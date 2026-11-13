@@ -12,6 +12,7 @@ from ignition.components.recurrent import DeltaMetadata, DeltaState
 
 from .indexer import IndexMetadata
 from .mla import MLAState
+from .shards import Shards
 
 
 @dataclass(frozen=True)
@@ -20,9 +21,7 @@ class DecoderState:
 
     @classmethod
     def allocate(cls, layer_types, world_size, slots, pages, device):
-        if world_size not in (1, 2, 4):
-            raise ValueError("GLM state requires one, two or four ranks")
-        heads = 64 // world_size
+        heads = Shards.of(world_size).heads
         layers = []
         for kind in layer_types:
             if kind == "linear_attention":

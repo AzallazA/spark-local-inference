@@ -115,6 +115,67 @@ def nvfp4_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 8192):
                        global_scale=(1.0 / global_scale).reshape(1).float(), global_scale_kind="multiplier")
 
 
+def decode_mxfp8_rows(weight, start: int, stop: int) -> torch.Tensor:
+    """Rows [start, stop) of a packed MXFP8 linear weight as BF16, exactly.
+
+    E4M3 values carry 3 mantissa bits and E8M0 scales are powers of two, so every product is a BF16 value.
+    """
+    packed = weight.weight
+    values = packed.values
+    if values.ndim == 3:
+        values = values[..., 0]
+    scales = packed.scale_rows.view(torch.uint8)
+    if scales.ndim == 3:
+        scales = scales[0] if scales.shape[0] == 1 else scales[..., 0]
+    columns = values.shape[1]
+    if values.shape[0] != scales.shape[0] or scales.shape[1] * 32 != columns:
+        raise ValueError("MXFP8 rows require one E8M0 scale per 32 values of every row")
+    rows = stop - start
+    factors = torch.exp2(scales[start:stop].to(torch.float32) - 127.0)
+    decoded = values[start:stop].to(torch.float32).view(rows, columns // 32, 32) * factors.unsqueeze(-1)
+    return decoded.view(rows, columns)[:, :weight.in_features].to(torch.bfloat16)
+
+
+@torch.no_grad()
+def nvfp4_draft_head_from_mxfp8(weight, *, rows_per_chunk: int = 4096):
+    """NVFP4 proposal head from a packed MXFP8 head shard, identical to `nvfp4_draft_head` of its BF16 decoding.
+
+    The shard is decoded chunk by chunk, so no full BF16 copy (2 bytes x vocab x hidden) is ever resident.
+    """
+    from b12x._lib.intrinsics.reference import swizzle_block_scale
+    from b12x.gemm.blockscaled import pack_weight
+
+    rows, columns = weight.out_features, weight.in_features
+    if columns % 128 or rows % 64:
+        raise ValueError("NVFP4 draft head requires 64-aligned rows and 128-aligned columns")
+    amax = torch.zeros((), dtype=torch.float32, device=weight.weight.values.device)
+    for start in range(0, rows, rows_per_chunk):
+        block = decode_mxfp8_rows(weight, start, min(rows, start + rows_per_chunk))
+        amax = torch.maximum(amax, block.abs().amax().float())
+    global_scale = (6.0 * 448.0) / amax.clamp_min(1e-8)
+    device = weight.weight.values.device
+    values = torch.empty((rows, columns // 2), dtype=torch.uint8, device=device)
+    scales = torch.empty((rows, columns // 16), dtype=torch.float8_e4m3fn, device=device)
+    for start in range(0, rows, rows_per_chunk):
+        stop = min(rows, start + rows_per_chunk)
+        values[start:stop], scales[start:stop] = _nvfp4_rows(decode_mxfp8_rows(weight, start, stop), global_scale)
+    return pack_weight(values, swizzle_block_scale(scales), recipe="nvfp4",
+                       global_scale=(1.0 / global_scale).reshape(1).float(), global_scale_kind="multiplier")
+
+
+def _nvfp4_rows(weight, global_scale):
+    """Packed E2M1 codes and E4M3 scales of BF16 rows, the arithmetic of `nvfp4_draft_head`."""
+    columns = weight.shape[1]
+    block = weight.float().view(-1, columns // 16, 16)
+    scale = (block.abs().amax(-1) / 6.0 * global_scale).clamp(max=448.0).to(torch.float8_e4m3fn)
+    effective = scale.float() / global_scale
+    quantized = block / torch.where(effective > 0, effective, torch.ones_like(effective)).unsqueeze(-1)
+    bounds = torch.tensor(_E2M1_BOUNDS, device=weight.device)
+    codes = (torch.bucketize(quantized.abs(), bounds) | ((quantized < 0).long() << 3)).to(torch.uint8)
+    codes = codes.view(-1, columns)
+    return codes[:, 0::2] | (codes[:, 1::2] << 4), scale.view(-1, columns // 16)
+
+
 @torch.no_grad()
 def mxfp8_draft_head(weight: torch.Tensor, *, rows_per_chunk: int = 1024):
     """Prepare an MXFP8 proposal head while retaining the BF16 target weights.

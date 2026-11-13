@@ -11,6 +11,8 @@ from ignition.components.resume import PreparedResumeState
 from ignition.components.sampling import PreparedSampling
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
+from .shards import Shards
+
 
 class PreparedResume:
     def __init__(self, weights, requests, pool, inputs, records, frame, sequence, *, rows,
@@ -19,7 +21,7 @@ class PreparedResume:
             inputs.row_generations[:rows], inputs.live_rows, world_size=weights.shard.world_size, state_rows=inputs.request_state_rows)
         self.validation = PreparedAllReduce(self.state.validation_input, self.state.validation_sum,
             runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.validation")
-        self.local_logits = torch.empty((rows, 154880 // weights.shard.world_size),
+        self.local_logits = torch.empty((rows, Shards.of(weights.shard.world_size).vocabulary),
             dtype=torch.bfloat16, device=self.state.hidden.device)
         self.logits = torch.empty((rows, 154880), dtype=torch.bfloat16, device=self.state.hidden.device)
         self.projection = PreparedVocabularyProjection(self.state.hidden, weights.head,

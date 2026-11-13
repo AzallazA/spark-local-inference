@@ -57,6 +57,7 @@ class CoreStorage:
 
         self.host_regions = []
         self.dynamic_regions = []
+        self.mixed_regions = []
         from .tensor_metadata import NumericStorage
 
         self.numeric_storage = NumericStorage()
@@ -263,6 +264,25 @@ class CoreStorage:
             raise MemoryError("native core host-address range exhausted")
         self._host_cursor += region.extent
         self.host_regions.append(region)
+        return region
+
+    def mixed_allocate(self, name, shape, dtype, *, device_rows):
+        """TP3 merged expert bank: one virtual range whose first `device_rows` rows are VRAM and
+        the rest pinned host memory, so one kernel call reads hot and cold experts alike."""
+        import torch
+        from b12x.sequence._shared.disk_table import _tensor_from_pointer
+
+        row = math.prod(shape[1:]) * dtype.itemsize
+        address = self._device_cursor
+        region = MixedRegion(self.cuda, address, shape[0] * row, device_rows * row, self.device)
+        if address + region.extent > self.DEVICE_BASE + self.RESERVATION_BYTES:
+            region.close()
+            raise MemoryError("mixed expert storage address range exhausted")
+        region.name = name
+        self.mixed_regions.append(region)
+        self._device_cursor += region.extent
+        region.device_view = _tensor_from_pointer(address, shape=tuple(shape), dtype=dtype,
+            device=torch.device("cuda", self.device), nbytes=math.prod(shape) * dtype.itemsize)
         return region
 
     def device_allocate(self, name, shape, dtype, *, group, maximum, units=None):
@@ -479,6 +499,57 @@ class ScratchPool:
             address, size = self.unbacked[-1]
             DeviceRegion(self.storage.cuda, address, size, self.storage.device)
             self.unbacked.pop()
+
+
+class MixedRegion:
+    """Device-backed prefix and host-NUMA-backed tail mapped contiguously in the rank's device range."""
+
+    def __init__(self, cuda, address, nbytes, device_bytes, device):
+        self.cuda, self.address, self.closed = cuda, address, True
+        numa = C.c_int()
+        cuda.call("cuDeviceGetAttribute", C.byref(numa), C.c_int(134), C.c_int(device))
+        device_properties = _Properties(1, 0 if os.name == "nt" else 1, _Location(1, device), None, (C.c_ubyte * 8)())
+        host_properties = _Properties(1, 0, _Location(3, max(0, numa.value)), None, (C.c_ubyte * 8)())
+        granularity = 0
+        for properties in (device_properties, host_properties):
+            value = C.c_size_t()
+            cuda.call("cuMemGetAllocationGranularity", C.byref(value), C.byref(properties), C.c_int(0))
+            granularity = max(granularity, value.value)
+        up = lambda n: -(-n // granularity) * granularity
+        # The page holding the hot/cold boundary stays on the device.
+        self.device_bytes = min(up(device_bytes), up(nbytes))
+        self.extent = up(nbytes)
+        self.host_bytes = self.extent - self.device_bytes
+        self.granularity = granularity
+        self.mapped = []
+        try:
+            for size, properties, offset in ((self.device_bytes, device_properties, 0),
+                                             (self.host_bytes, host_properties, self.device_bytes)):
+                if not size:
+                    continue
+                physical = C.c_uint64()
+                cuda.call("cuMemCreate", C.byref(physical), C.c_size_t(size), C.byref(properties), C.c_uint64(0))
+                try:
+                    cuda.call("cuMemMap", C.c_uint64(address + offset), C.c_size_t(size), C.c_size_t(0),
+                              physical, C.c_uint64(0))
+                finally:
+                    cuda.call("cuMemRelease", physical)
+                self.mapped.append((address + offset, size))
+            access = _Access(_Location(1, device), 3)
+            cuda.call("cuMemSetAccess", C.c_uint64(address), C.c_size_t(self.extent), C.byref(access), C.c_size_t(1))
+            cuda.call("cuMemsetD8_v2", C.c_uint64(address), C.c_ubyte(0), C.c_size_t(self.extent))
+        except BaseException:
+            for start, size in self.mapped:
+                cuda.call("cuMemUnmap", C.c_uint64(start), C.c_size_t(size))
+            raise
+        self.closed = False
+
+    def close(self):
+        if not self.closed:
+            self.cuda.call("cuCtxSynchronize")
+            for start, size in self.mapped:
+                self.cuda.call("cuMemUnmap", C.c_uint64(start), C.c_size_t(size))
+            self.closed = True
 
 
 class DeviceRegion:

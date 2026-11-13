@@ -171,14 +171,21 @@ pub trait HostStore {
 ```
 
 The worker calls `store` for each offered checkpoint, without waiting for GPU
-pressure. The scheduler defers a message checkpoint whose own planned prompt
-checkpoint is its direct child less than one physical page later, and terminal
-checkpoints, until a request resumes at that exact checkpoint. A preempted
-terminal counts as resumed. If its prompt capture cannot obtain a snapshot, the
-message is offered while the request still pins it; cancellation or error before
-that capture offers it at retirement. GPU captures, prefill cuts, and retention
-are unchanged; deferred points can be lost to GPU
+pressure. The scheduler offers message checkpoints immediately, including those
+followed by a prompt checkpoint less than one physical page later. A continuation
+can branch at the message endpoint and cannot use the prompt checkpoint's row.
+Terminal checkpoints are deferred until a request resumes at that exact
+checkpoint. A preempted terminal counts as resumed. GPU captures, prefill cuts,
+and GPU eviction policy are unchanged; deferred terminal points can be lost to GPU
 eviction before reuse, and are not announced to the pool until offered.
+Fork switch: `--scheduler-eager-message-offers false` (server key
+`scheduler_eager_message_offers`, default true) restores the earlier deferral of
+a last message checkpoint whose prompt checkpoint follows within one page; such
+a message is then offered on exact reuse or, if its prompt capture is skipped,
+while the request still pins it. With the prefill tail merge on
+(`--scheduler-prefill-tail-merge`), a short final segment is absorbed into the
+chunk and the message checkpoint before it is never captured, so neither
+setting can offer it.
 Compaction also offers a deferred branch point as its heir and refreshes
 descendant offers with their new parent.
 `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
@@ -247,11 +254,20 @@ policy allows it: the memory store standalone evicts any unpinned node, the
 disk store evicts any unpinned node, and the composite restricts the memory
 store to durable nodes.
 
-Each tier drops a non-root record's row once its only child commits, keeping
-the pages; readers and spills delay removal until they release the row. DRAM
-releases row slots, disk truncates at the row segment, and later spills omit it.
-A rewind or later fork restores the nearest row-bearing ancestor and re-prefills
-the remaining tokens.
+Disk drops a non-root record's row once its only child commits, keeping the
+pages, unless a child less than one physical page later has been indexed.
+Those close ancestors retain their rows for divergent continuations, even if
+that child is later removed. The close-child marker is in-memory; recovery
+reconstructs it from surviving parent-child links. DRAM retains close-ancestor
+rows during redundant-row thinning; ordinary capacity-driven record eviction
+and compaction still apply. Other redundant rows remain in DRAM while its
+free retention space exceeds two continuation rows. Reserved transfer intake
+does not count as retention headroom. When that threshold is reached, or an
+incoming record needs more space than is free, DRAM reclaims eligible
+redundant rows before evicting other records. Readers and spills delay row
+removal until their pins are released. DRAM releases row slots, disk truncates
+at the row segment, and later spills omit removed rows. A rewind or later
+fork restores its retained endpoint when available; otherwise it restores the
 With lazy write-behind, a crash or an incomplete shutdown drain can lose the
 DRAM-only descendants of a page-only disk prefix, leaving recovery to an older
 row-bearing ancestor. Startup prunes childless page-only records and any
@@ -393,11 +409,18 @@ the storage namespace identity, the layout fingerprint, the key (consumed count 
 digest), the parent key, the bucket digest, the page token count, the tail
 page count, the rank count, the per-rank plane sizes and row bytes, the page
 segment offset, the row segment offset, the row checksum, and the creation
-time. Version 2 uses flag bit 31 for a replicated page segment and bit 30 for a
-replicated row. Page offsets use one fixed stride for the whole record. Version-1
-records still recover, and the layout fingerprint is unchanged. An older binary
-treats replicated version-2 files as invalid and **deletes them during recovery**;
-downgrading therefore starts those records cold. A checksum segment follows,
+time. Versions 1 and 2 encode each plane size as `u64`; version 3 uses `u32`
+plane sizes so wider rank/plane catalogs fit the same header block. Row sizes
+remain `u64`. New records use version 3 when every plane fits `u32`, otherwise
+the `u64` format is retained. All encodings still require the header to fit 4 KiB.
+Versions 2 and 3 use flag bit 31 for a replicated page segment and bit 30 for a
+replicated row; version 3 also permits non-replicated records. Page offsets use
+one fixed stride for the whole record. Version-1 and version-2 records still
+recover and preserve their encoding on rewrite; cross-rank agreement compares
+canonical header fields independently of the file's encoding version. The
+layout fingerprint is unchanged. A binary that does not support a record's
+version treats it as invalid and **deletes it during recovery**; downgrading
+therefore starts those records cold. A checksum segment follows,
 one 64-bit xxh3 over each stored page record, padded to
 4 KiB, so a restore that reads only a suffix of the pages verifies each page
 it read. The page segment follows, page-major: page `i`, then rank `r`, then
@@ -578,7 +601,8 @@ API on this class of host and is the reference for call patterns.
 - `take_publications()` returns GPU-ready checkpoints offered since the previous
   call, each once, with their id, key, nearest offered ancestor's key, bucket
   digest, whole page chain, tail count since that ancestor, and row state slot.
-  Deferred checkpoints enter the list on reuse or the fallback above.
+  Message checkpoints enter the list at capture; deferred terminal checkpoints
+  enter on reuse or compaction.
 - `SchedulerStats` gains `host_lookups`, `host_hits`, `host_reused_tokens`,
   and `inbound_waiting`.
 - `release_after_shutdown` drops tickets.

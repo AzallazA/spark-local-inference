@@ -114,13 +114,21 @@ pub(super) fn scheduler(active: usize, pages: u32, snapshots: u32) -> RequestSch
 }
 
 fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_tokens: usize, image_slots: usize) -> RequestScheduler {
+    scheduler_with_chunk_geometry(active, pages, snapshots, page_tokens, image_slots, 512)
+}
+
+fn scheduler_with_chunk(active: usize, pages: u32, snapshots: u32, chunk: usize) -> RequestScheduler {
+    scheduler_with_chunk_geometry(active, pages, snapshots, 64, 4, chunk)
+}
+
+fn scheduler_with_chunk_geometry(active: usize, pages: u32, snapshots: u32, page_tokens: usize, image_slots: usize, chunk: usize) -> RequestScheduler {
     let mut scheduler = RequestScheduler::new(
         [9; 32],
         SchedulerLimits {
             request_slots: active.next_power_of_two(),
             max_active: active,
-            max_sequence_tokens: 2048,
-            prefill_chunk_size: 512,
+            max_sequence_tokens: chunk.max(2048),
+            prefill_chunk_size: chunk,
             pages,
             snapshots,
         },
@@ -217,6 +225,7 @@ pub(super) fn spec(tokens: usize, max_new: u32) -> RequestSpec {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
     }
 }
 fn records(
@@ -241,7 +250,7 @@ fn records(
     };
     records
 }
-fn init(scheduler: &mut RequestScheduler, fence: u64) {
+pub(super) fn init(scheduler: &mut RequestScheduler, fence: u64) {
     let step = scheduler.plan().unwrap();
     assert!(matches!(step.kind, GraphKind::Init | GraphKind::Restore));
     scheduler.commit(&step, Fence(fence)).unwrap();
@@ -2023,6 +2032,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
         })
         .unwrap();
     assert_eq!(s.request(handle).unwrap().state_slot, StateSlotId(1));
@@ -2889,6 +2899,64 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
     scheduler.record_host_lookup();
     scheduler.record_host_lookup();
     assert_eq!(scheduler.stats().host_lookups, 2);
+}
+
+#[test]
+fn prefill_absorbs_a_short_final_message_segment() {
+    // Default tools-only: merged with tools; without tools only under the upstream mode.
+    for (mode, tools, tokens) in [
+        (None, true, 130),
+        (None, false, 64),
+        (Some(PrefillTailMerge::On), false, 130),
+        (Some(PrefillTailMerge::Off), true, 64),
+    ] {
+        let mut scheduler = scheduler_with_chunk(1, 32, 4, 8192);
+        if let Some(mode) = mode {
+            scheduler
+                .configure_policy(PolicyConfig { prefill_tail_merge: mode, ..PolicyConfig::default() })
+                .unwrap();
+        }
+        let _handle = scheduler
+            .admit(RequestSpec {
+                message_boundaries: vec![64],
+                tools,
+                ..spec(130, 2)
+            })
+            .unwrap();
+        init(&mut scheduler, 1);
+        let step = scheduler.plan().unwrap();
+        assert_eq!(
+            (
+                step.kind,
+                step.lanes[0].start_position,
+                step.lanes[0].tokens
+            ),
+            (GraphKind::Prefill, 0, tokens),
+            "{mode:?} tools={tools}"
+        );
+    }
+}
+
+#[test]
+fn prefill_keeps_a_long_final_message_segment() {
+    let mut scheduler = scheduler_with_chunk(1, 32, 4, 8192);
+    let _handle = scheduler
+        .admit(RequestSpec {
+            message_boundaries: vec![64],
+            tools: true,
+            ..spec(1024, 2)
+        })
+        .unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(
+        (
+            step.kind,
+            step.lanes[0].start_position,
+            step.lanes[0].tokens
+        ),
+        (GraphKind::Prefill, 0, 64)
+    );
 }
 
 #[test]

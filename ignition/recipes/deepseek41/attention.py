@@ -31,6 +31,7 @@ from ignition.components.rotary import CompressedRotary as Rotary
 from ignition.components.parallel import TensorParallelShard
 
 from .pool import PAGE_TOKENS
+from .tp3_config import TP3Config
 
 
 # Bound indexer workspace while amortizing prefill selection launches.
@@ -250,7 +251,8 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", buffers=None, window_metadata=None):
+                 mla_compute_mode="auto", buffers=None, window_metadata=None, tp3=None):
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches (fused_qkv_norm, brrr_sparse, brrr_log)
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
@@ -319,6 +321,10 @@ class PreparedAttention:
                 rhs_prefetch_ready=packed_mxfp8,
                 allow_bf16_atomic_reduction=not packed_mxfp8,
                 buffers=buffers)
+        self.fused_qkv_norm = None
+        if self.norm_quant is not None and tp3.fused_qkv_norm:
+            from ignition.recipes.deepseek41.fused_qkv_norm import PreparedFusedQKVNorm
+            self.fused_qkv_norm = PreparedFusedQKVNorm(self.norm_quant, self.eps, log=tp3.brrr_log)
         self.query_norm = (PreparedRMSNorm(scratch.projected[:, :1280], weights["q_norm"], scratch.query_low,
             eps=self.eps, session=session, name=name + ".q_norm") if self.norm_quant is None else None)
         self.window_norm = (PreparedRMSNorm(scratch.projected[:, 1280:], weights["kv_norm"], scratch.window_values,
@@ -379,6 +385,18 @@ class PreparedAttention:
             decode_row_capacity=tokens if mode in ("decode", "verify", "draft") else None,
             session=session, name=f"{name}.attention",
             workspace=workspace, compute_mode=mla_compute_mode, **indexed)
+        # TP3 BRRR: one-launch sparse decode for main-layer decode/verify graphs (tp3.brrr_sparse).
+        self.brrr_sparse = None
+        if mode in ("decode", "verify") and tp3.brrr_sparse:
+            from ignition.recipes.deepseek41.brrr import PreparedBRRRSparse, sparse_supported
+            idx_width = scratch.selected.shape[1] if self.ratio else 0
+            if sparse_supported(tokens, self.window_indices.shape[1], idx_width, scratch.query.shape[1],
+                                scratch.query.shape[2]) and (not self.ratio or self.page_table.dtype == torch.int32):
+                self.brrr_sparse = PreparedBRRRSparse(scratch.query, self.window_cache, self.window_page_size,
+                    self.window_indices, self.window_lengths, weights["sink"], scratch.attended,
+                    **({} if not self.ratio else dict(indexed=pool.pages[f"layer{self.source.layer}.latent_page"],
+                        indexed_page_size=128 // self.ratio, indexed_indices=scratch.selected,
+                        indexed_lengths=self.index_lengths, page_table=self.page_table)))
         self.concurrent_query = None
         if (mode in ("decode", "verify", "draft") and not (mode == "decode" and tokens == 1)
                 and isinstance(workspace, ScratchArena) and workspace.overlap):
@@ -405,9 +423,13 @@ class PreparedAttention:
         position = self.window_metadata.position
         if self.mode == "prefill":
             gather_rows(self.window, m.state_rows, self.window_cache[:, :128 * 528])
+        if self.fused_qkv_norm is not None:
+            self.fused_qkv_norm.arm(s.projected)
         self.projections["qkv_a"](source)
         if self.norm_quant is None:
             self.query_norm(s.projected[:, :1280])
+        elif self.fused_qkv_norm is not None:
+            self.fused_qkv_norm(s.projected)
         else:
             self.norm_quant(s.projected)
         if self.concurrent_query is not None:
@@ -435,7 +457,13 @@ class PreparedAttention:
             # scratch uses must complete before the query branch rejoins.
             self.concurrent_query.finish(s.query_low, dependency)
             self.rotary.apply(s.query, position, compressed=bool(self.ratio))
-        self.attention()
+        if self.brrr_sparse is not None:
+            self.brrr_sparse()
+        else:
+            self.attention()
+        if getattr(self, "external_tail", False):
+            # TP3 BRRR experiment: the fused layer kernel applies inverse RoPE and the o-projection itself.
+            return s.attended
         self.rotary.apply(s.attended, position, compressed=bool(self.ratio), inverse=True)
         self.output_projection(s.attended.view(s.attended.shape[0], -1, 4096))
         if self.mode == "prefill":

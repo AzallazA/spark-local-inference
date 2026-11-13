@@ -4,6 +4,7 @@
 
 """Typed numeric storage and scalar launch arguments available during export."""
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 import gc
 import inspect
@@ -113,6 +114,17 @@ def record_numeric_tensor(tensor):
     registry = _NUMERIC_STORAGE.get()
     if registry is not None:
         registry.record(tensor)
+
+
+@contextmanager
+def unrecorded_numeric_tensors():
+    """Prepare operators whose weight operands are graph scratch (staging slots rewritten on every replay)
+    rather than checkpoint storage; the caller records the storage the slots are filled from."""
+    token = _NUMERIC_STORAGE.set(None)
+    try:
+        yield
+    finally:
+        _NUMERIC_STORAGE.reset(token)
 
 
 def _triton_parameters(kernel):

@@ -216,6 +216,10 @@ pub(super) fn prepare_inference_cached(
     {
         options.insert("add_generation_prompt".into(), Value::Bool(false));
     }
+    // Tool definitions reach the template through `options` (request tools, or template
+    // kwargs); an empty list renders no tool prompt.
+    let tools = raw.is_none()
+        && options.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty());
     let (rendered, echo) = if let Some(raw) = raw {
         let (mut token_ids, echo) = match raw {
             RawPrompt::Text(text) => (frontend.encode(text, true)?, text.clone()),
@@ -382,6 +386,7 @@ pub(super) fn prepare_inference_cached(
         prompt: Prompt {
             tokens,
             message_boundaries,
+            tools,
             data,
             conditioned_inputs,
             conditioning,

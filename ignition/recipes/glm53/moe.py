@@ -13,6 +13,8 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import PreparedRoutedExperts, PreparedRouter, RouterScratch
 
+from .shards import ROUTED_WIDTHS, Shards
+
 
 @dataclass(frozen=True)
 class MoeScratch:
@@ -24,11 +26,9 @@ class MoeScratch:
 
     @classmethod
     def allocate(cls, tokens, world_size, device):
-        if world_size not in (1, 2, 4):
-            raise ValueError("GLM experts require one, two or four ranks")
         return cls(torch.zeros((tokens, 288), dtype=torch.float32, device=device),
                    RouterScratch.allocate(tokens, device, experts=288, top_k=8),
-                   MLPScratch.allocate(tokens, 4096, 2048 // world_size, device),
+                   MLPScratch.allocate(tokens, 4096, Shards.of(world_size).expert_width, device),
                    torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device),
                    torch.zeros((tokens, 4096), dtype=torch.bfloat16, device=device))
 
@@ -48,8 +48,8 @@ class PreparedGlmMoe:
                 or not gate.norm_topk_prob or gate.routed_scaling_factor != 2.5):
             raise ValueError("GLM routing requires one group, sigmoid top-8 of 288, normalization and scale 2.5")
         if (weights.experts.num_experts != 288 or weights.experts.hidden_size != 4096
-                or weights.experts.intermediate_size not in (512, 1024, 2048)):
-            raise ValueError("GLM MoE requires all 288 experts with a TP1/TP2/TP4 intermediate partition")
+                or weights.experts.intermediate_size not in ROUTED_WIDTHS):
+            raise ValueError("GLM MoE requires all 288 experts with a supported rank-count intermediate partition")
         if source.dtype != torch.bfloat16 or source.shape != scratch.output.shape or source.shape[1] != 4096:
             raise ValueError("GLM MoE input must match BF16 [tokens,4096] scratch")
         self.source, self.scratch, self.output = source, scratch, scratch.output

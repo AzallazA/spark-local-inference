@@ -322,6 +322,9 @@ class PreparedParallelDraftRound:
         from .vocabulary_sampling import PreparedVocabularySoftmax, PreparedVocabularyBlockVerification
 
         o, b, w = self.owner, self.batch, self.width
+        # This rank's global vocabulary IDs as a buffer: compiled forwards are shared across ranks.
+        copy_start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
+        self.copy_columns = torch.arange(self.probabilities.shape[-1], device=self.probabilities.device) + copy_start
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         start, _ = o.weights.shard.padded_partition(o.requests.vocab_size, alignment=64)
         options = dict(start=start, runtime=o.sampling_runtime, session=o.session,
@@ -361,6 +364,27 @@ class PreparedParallelDraftRound:
             token_limits=o.inputs.query_lengths[:b], logprobs=logprobs)
         commit.prepare()
         self.operations = target, (), verify, commit
+
+    def _apply_copied_proposals(self, safe, limits):
+        """Replace a row's learned drafts with its fresh copied history continuation (point-mass proposals)."""
+        o = self.owner
+        if not hasattr(o, "copy_ids"):
+            return
+        positions = self.draft_positions
+        ids = o.copy_ids[safe][:, :positions.numel()]
+        fresh = (self.active & (o.copy_count[safe] > 0)
+                 & (o.copy_generation[safe] == o.requests.generation[safe])
+                 & (o.copy_expected[safe] == self.before))
+        usable = ((positions[None, :] < o.copy_count[safe, None]) & (ids >= 0) & (ids < o.requests.vocab_size)
+                  & (positions[None, :] < limits[:, None] - 1))
+        # Copied tokens replace the learned drafts over the matched prefix; later positions keep their learned
+        # drafts and proposal distributions, which stay exact proposals (verification requires every position
+        # within the verified prefix to carry a valid normalized proposal).
+        copied = fresh[:, None] & usable.int().cumprod(1).bool()
+        self.drafts.copy_(torch.where(copied, ids, self.drafts))
+        self.valid.logical_or_(copied)
+        point = (self.copy_columns[None, None, :] == ids[:, :, None]).float()
+        self.probabilities.copy_(torch.where(copied[:, :, None], point, self.probabilities))
 
     def __call__(self):
         self.propose()
@@ -404,6 +428,7 @@ class PreparedParallelDraftRound:
                 self.full_proposal()
                 if self.vocabulary_parallel:
                     self.valid.logical_and_(self.active[:, None] & (self.draft_positions[None, :] < limits[:, None] - 1))
+                    self._apply_copied_proposals(safe, limits)
                     self.sampled.copy_(self.drafts[:, -1])
                     self.markov_token.copy_(self.sampled)
             for i, proposal in enumerate(proposals):

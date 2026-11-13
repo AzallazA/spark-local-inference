@@ -8,7 +8,9 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
 
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllReduce
+from .probe import Probe
+from .tp3_config import TP3Config
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.expert_overlap import ConcurrentSharedExpert
 from ignition.components.ring_commit import PreparedRingCommit
@@ -23,6 +25,81 @@ from ignition.preparation.scratch import GraphBufferPool, GraphBuffers
 from .attention import AttentionIndices, AttentionScratch, PreparedAttention, PreparedGlobalKV, Rotary, normalize
 from .decoder_prefill import PreparedDecoderSuffix
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
+
+
+# TP3 BRRR: each rank decides per layer and graph whether the fused tail runs, from its own TP3Config (brrr_layers,
+# brrr_parked_max_rows, host_expert_layers, hot_experts, ...) and the graph's row count. The kernel's in-kernel
+# all-reduce needs every rank to make the same decision: a rank that runs Flare's path while a peer waits in the kernel
+# deadlocks. PreparedLayer records its decisions here and the bootstrap compares them across ranks
+# (check_brrr_decisions) in plain construction code, before any capture.
+_BRRR_DECISIONS = []
+_BRRR_CHECKED = 0
+_BRRR_DECISION_FIELDS = ("graph", "layer", "mode", "rows", "brrr", "gated")
+
+
+def record_brrr_decision(name, index, mode, rows, uses_brrr, gated=False):
+    _BRRR_DECISIONS.append((str(name), int(index), str(mode), int(rows), bool(uses_brrr), bool(gated)))
+
+
+def check_brrr_decisions(group):
+    """All-gather the BRRR decisions recorded since the previous check and raise when ranks disagree.
+
+    Collective over ``group`` (the Gloo group create_engine used): every rank must call it at the same point, from plain
+    construction code, never inside a traced or captured forward. No-op without a BRRR engine (no engine, no kernel to
+    deadlock) or without a group. Returns the number of decisions compared.
+    """
+    global _BRRR_CHECKED
+    from ignition.recipes.deepseek41.brrr import engine
+
+    if group is None or engine() is None:
+        return 0
+    import torch.distributed as dist
+
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("check_brrr_decisions must run outside CUDA graph capture")
+    pending, _BRRR_CHECKED = list(_BRRR_DECISIONS[_BRRR_CHECKED:]), len(_BRRR_DECISIONS)
+    gathered = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(gathered, pending, group=group)
+    root = gathered[0]
+    for rank, other in enumerate(gathered[1:], 1):
+        if other == root:
+            continue
+        if len(other) != len(root):
+            detail = f"rank 0 recorded {len(root)} layer decisions, rank {rank} recorded {len(other)}"
+        else:
+            at = next(i for i, (a, b) in enumerate(zip(root, other)) if a != b)
+            detail = (f"rank 0 decided {dict(zip(_BRRR_DECISION_FIELDS, root[at]))}, "
+                      f"rank {rank} decided {dict(zip(_BRRR_DECISION_FIELDS, other[at]))}")
+        raise RuntimeError("BRRR layer decisions differ between ranks (the fused kernel's all-reduce would deadlock): "
+                           f"{detail}. Every rank must receive the same TP3Config (brrr_*, host_expert_layers, "
+                           "hot_experts, global_cold) and graph catalog.")
+    return len(pending)
+
+def defers_post(index, engram_layers, aux_layers=()):
+    """Whether layer ``index`` leaves its mHC post to the next layer's attention mHC (lagged hyperconnection).
+
+    It never does before an Engram layer (the Engram mix reads the posted ``residual``) or a draft feedback layer
+    (which reads ``residual`` before the layer runs), nor in the last layer. ``engram_layers`` holds one flag per layer.
+    TP3 fork: tp3.share_engram_residual relies on the Engram rule (the Engram layer then never carries).
+    """
+    following = index + 1
+    return following < len(engram_layers) and not engram_layers[following] and following not in aux_layers
+
+
+def aliases(left, right):
+    """Construction-time check: do two tensors overlap in one storage? (Never call it inside a traced forward.)"""
+    if left.untyped_storage()._cdata != right.untyped_storage()._cdata:
+        return False
+    a, b = left.storage_offset() * left.element_size(), right.storage_offset() * right.element_size()
+    return a < b + right.nbytes and b < a + left.nbytes
+
+
+def check_engram_residual(index, scratch, carry):
+    """tp3.share_engram_residual guard: a carried layer's attention mHC reads the previous layer's ffn_hc.residual,
+    which the Engram mix would overwrite when engram_residual shares its storage. Construction code only."""
+    if carry and aliases(scratch.engram_residual, scratch.ffn_hc.residual):
+        raise ValueError(f"layer {index}: engram_residual shares ffn_hc.residual's storage, so an Engram layer "
+                         "must not receive a deferred mHC post (carry)")
 
 
 @dataclass(frozen=True)
@@ -66,15 +143,26 @@ class Scratch:
 
     @classmethod
     def allocate(cls, tokens, samples, world, device, *, experts=384, top_k=6, buffers=None,
-                 candidate_tokens=None):
+                 candidate_tokens=None, engram_chunk_rows=0, share_engram_residual=False):
+        """``engram_chunk_rows`` and ``share_engram_residual`` are the TP3 fork's graph-scratch savings
+        (tp3.engram_chunk_rows, tp3.share_engram_residual); their defaults allocate the base layout."""
         if buffers is None:
             buffers = GraphBufferPool(device, chunk_bytes=2 << 20).cursor()
         def zeros(*shape, dtype=torch.bfloat16, cursor=buffers):
             return cursor.zeros(shape, dtype)
-        residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
+        if share_engram_residual:
+            residual, engram_residual = zeros(tokens, 4, 5120), None
+        else:
+            residual, engram_residual = zeros(tokens, 4, 5120), zeros(tokens, 4, 5120)
         pre_mix, attn_mix = zeros(tokens, 4, dtype=torch.float32), zeros(tokens, 4, dtype=torch.float32)
         attention_hc = MHCScratch.allocate(tokens, 5120, device, buffers=buffers)
         ffn_hc = MHCScratch.allocate(tokens, 5120, device, buffers=buffers)
+        if share_engram_residual:
+            # Lifetimes (PreparedLayer.__call__ with carry=False, which PreparedDecoder guarantees for Engram layers
+            # and PreparedLayer checks): the Engram mix writes engram_residual, the layer's attention mHC reads it,
+            # and only then does the layer's ffn mHC write ffn_hc.residual; the previous layer's post consumed its
+            # ffn_hc.residual into `residual` before the Engram mix runs.
+            engram_residual = ffn_hc.residual
         attention = AttentionScratch.allocate(tokens, world, device, buffers=buffers, candidate_tokens=candidate_tokens)
         attention_output, mlp_output = zeros(tokens, 5120), zeros(tokens, 5120)
         _, vocabulary = TensorParallelShard(0, world).padded_partition(129280, alignment=64)
@@ -84,7 +172,7 @@ class Scratch:
         # Embedding, Engram projection, and feed-forward intermediates execute serially.
         embed, lookup, ffn = buffers.fork(), buffers.fork(), buffers.fork()
         embedding = zeros(tokens, 5120, cursor=embed)
-        engram = EngramScratch.allocate(tokens, device, buffers=lookup, world=world)
+        engram = EngramScratch.allocate(tokens, device, buffers=lookup, world=world, chunk_rows=engram_chunk_rows)
         shared = MLPScratch.allocate(tokens, 5120, 2304 // world, device, buffers=ffn)
         router_logits = zeros(tokens, experts, dtype=torch.float32, cursor=ffn)
         router = RouterScratch.allocate(tokens, device, experts=experts, top_k=top_k, buffers=ffn)
@@ -143,9 +231,15 @@ class PreparedLayer:
     def __init__(self, index, weights, tables, scratch, metadata, pool, rotary, *, shard, mode,
                  runtime, coordinator, session, name, workspace, carry, defer_post,
                  boundary=None, replay_start=None, window_staging=None, mla_compute_mode="auto", buffers=None,
-                 window_metadata=None):
+                 window_metadata=None, tp3=None, probe=None):
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches; the decoder shares one instance per graph
         s, text = scratch, pool.config.text
         self.scratch, self.carry = s, carry
+        self.probe = Probe(tp3.probe) if probe is None else probe
+        self.probe_index, self.probe_mode = index, mode
+        self.probe.allocate(scratch.residual.device)  # allocate eagerly, outside traced forwards (no-op unless enabled)
+        # Debug A/B (flare#193): tp3.no_engram keeps the Engram handshake but discards its contribution.
+        self.no_engram = tp3.no_engram
         self.metadata = metadata
         buffers = scratch.buffers if buffers is None else buffers
         self.image_mask = (buffers.zeros(metadata.token_ids.shape, torch.bool)
@@ -157,6 +251,8 @@ class PreparedLayer:
                 metadata, pool,
                 scratch=s.engram, session=session, name=name + ".engram", workspace=workspace,
                 runtime=runtime, coordinator=coordinator)
+        if self.engram is not None:
+            check_engram_residual(index, s, carry)
         source = s.engram_residual if self.engram is not None else s.residual
         options = dict(rms_eps=text["rms_norm_eps"], norm_eps=text["rms_norm_eps"], hc_eps=text["hc_eps"],
                        sinkhorn_iters=text["hc_sinkhorn_iters"])
@@ -168,8 +264,9 @@ class PreparedLayer:
             metadata, pool, rotary, mode=mode, world=shard.world_size,
             session=session, name=name + ".attention", workspace=workspace, replay_start=replay_start,
             window_staging=window_staging, mla_compute_mode=mla_compute_mode, buffers=buffers,
-            window_metadata=window_metadata)
-        self.attention_reduce = PreparedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
+            window_metadata=window_metadata, tp3=tp3)
+        # Chunked: a decode-sized runtime (tp3.ar_rows) still reduces prefill rows; one part in decode.
+        self.attention_reduce = PreparedChunkedAllReduce(s.attention.output, s.attention_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".attention_reduce")
         self.ffn_hc = PreparedMHC((s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb),
             _mhc_weights(weights, "ffn", "ffn_norm"), s.ffn_hc, session=session, name=name + ".ffn_hc", workspace=workspace,
@@ -181,49 +278,117 @@ class PreparedLayer:
             routed_scaling_factor=text["routed_scaling_factor"], correction_bias=weights.experts.correction,
             image_correction_bias=weights.experts.vision_correction if self.image_mask is not None else None,
             image_mask=self.image_mask)
-        self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, s.router.ids,
+        self.cold_experts = self.hot_map = None
+        if weights.experts.cold is not None:
+            # TP3 expert promotion: hot experts on the GPU, cold experts in host memory. Each bank sees the
+            # router's IDs remapped to its local slots; IDs outside a bank are inactive routes there.
+            self.hot_map, self.cold_map = weights.experts.hot_map, weights.experts.cold_map
+            self.hot_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
+            self.cold_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
+            self.cold_routed = buffers.zeros(tuple(s.routed.shape), s.routed.dtype)
+            route_ids = self.hot_ids
+        elif weights.experts.hot_map is not None:
+            # Merged bank: one remap from global expert IDs to the bank's hot-first slots.
+            self.hot_map, self.cold_map = weights.experts.hot_map, None
+            self.hot_ids = buffers.zeros(tuple(s.router.ids.shape), s.router.ids.dtype)
+            route_ids = self.hot_ids
+        else:
+            route_ids = s.router.ids
+        self.experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.experts, route_ids,
             s.router.weights, s.routed, session=session, name=name + ".experts", workspace=workspace,
             router_plan=self.router.plan)
+        if weights.experts.cold is not None:
+            self.cold_experts = PreparedRoutedExperts(s.ffn_hc.normalized, weights.experts.cold, self.cold_ids,
+                s.router.weights, self.cold_routed, session=session, name=name + ".cold_experts",
+                workspace=workspace, router_plan=self.router.plan)
         self.shared = PreparedMLP(s.ffn_hc.normalized, weights.experts.shared, s.shared.gate_up,
             s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
             swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
         self.concurrent_shared = None
         if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
-                parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
+                parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan,
+                                *(() if self.cold_experts is None else (self.cold_experts.plan,))),
                 session=session, workspace=workspace,
                 defer_launch=s.ffn_hc.normalized.shape[0] > 4)
-        self.mlp_reduce = PreparedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
+        self.mlp_reduce = PreparedChunkedAllReduce(s.mlp_partial, s.mlp_output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".mlp_reduce")
         self.post = None if defer_post else PreparedMHCPost(s.mlp_output, s.ffn_hc.residual,
             s.ffn_hc.post, s.ffn_hc.comb, s.residual, session=session, name=name + ".post")
+        self.brrr = None
+        # tp3.brrr_parked_max_rows = N: parked (host-expert) layers use BRRR only in graphs of at most N rows; wide
+        # verification of parked layers stays on Flare's MoE path (BRRR-40 measured c8 -2.7% vs H300, BRRR-26 level).
+        from ignition.recipes.deepseek41.weights import host_expert_layers
+        parked_rows = tp3.brrr_parked_max_rows
+        rows = metadata.positions.numel()
+        # A layer counts as parked only if it actually has a host tail (HOT >= 384 loads it fully resident, no hot_map).
+        parked = index in host_expert_layers(tp3) and self.hot_map is not None
+        gated = bool(parked_rows) and parked and rows > parked_rows
+        if index in tp3.brrr_layers and mode in ("decode", "verify") and not gated:
+            # TP3 BRRR experiment: one fused kernel from the attention output to the MLP all-reduce.
+            if self.cold_experts is not None or self.image_mask is not None:
+                raise ValueError(f"BRRR layer {index} needs one expert bank (resident or merged hot/cold)")
+            from ignition.recipes.deepseek41.brrr import PreparedBRRRTail
+            self.attention.external_tail = True
+            self.brrr = PreparedBRRRTail(index, weights, s, self.attention.window_metadata.position,
+                                         rotary.frequencies[bool(self.attention.ratio)], config=pool.config, tp3=tp3)
+        if tp3.brrr_layers:
+            record_brrr_decision(name, index, mode, rows, self.brrr is not None, gated)
 
     def __call__(self):
-        s = self.scratch
-        if self.engram is not None:
+        s, probe = self.scratch, self.probe
+        if self.engram is not None and self.no_engram:
+            # Debug A/B (flare#193): keep the Engram handshake (readiness wait, lookup, timestamps) but
+            # discard its contribution, so only Engram's effect on the residual is removed.
+            source = self.engram(s.residual)
+            source.copy_(s.residual)
+        elif self.engram is not None:
             source = self.engram(s.residual)
         else:
             source = s.residual
         incoming = ((s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
                     if self.carry else (source,))
+        probe.record(source, self.probe_index, 0, self.probe_mode)
         if self.boundary is None:
             self.attention_hc(*incoming)
         else:
             self.boundary(self.attention.selectors[0])
+        if self.brrr is not None:
+            self.brrr(self.attention(s.attention_hc.normalized))
+            if self.post is not None:
+                self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
+            return
         self.attention_reduce(self.attention(s.attention_hc.normalized))
+        probe.record(s.attention_output, self.probe_index, 1, self.probe_mode)
         self.ffn_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(s.ffn_hc.normalized)
         if self.image_mask is not None:
             self.image_mask.copy_(self.metadata.token_ids >= 129280)
         self.router(self.router_projection(s.ffn_hc.normalized))
+        probe.router(s.router.ids, s.router.weights, self.probe_index, self.probe_mode)
+        probe.full(s.ffn_hc.normalized, self.probe_index, "in", self.probe_mode)
+        if self.cold_experts is not None:
+            flat = s.router.ids.reshape(-1)
+            torch.index_select(self.hot_map, 0, flat, out=self.hot_ids.view(-1))
+            torch.index_select(self.cold_map, 0, flat, out=self.cold_ids.view(-1))
+        elif self.hot_map is not None:
+            torch.index_select(self.hot_map, 0, s.router.ids.reshape(-1), out=self.hot_ids.view(-1))
         self.experts()
+        if self.cold_experts is not None:
+            self.cold_experts()
+            s.routed.add_(self.cold_routed)
+        probe.full(s.routed, self.probe_index, "out", self.probe_mode)
         if self.concurrent_shared is None:
             self.shared(s.ffn_hc.normalized)
         else:
             self.concurrent_shared.finish(s.ffn_hc.normalized, s.routed)
+        probe.record(s.routed, self.probe_index, 3, self.probe_mode)
+        probe.record(s.shared.output, self.probe_index, 4, self.probe_mode)
         torch.add(s.routed, s.shared.output, out=s.mlp_partial)
+        probe.record(s.mlp_partial, self.probe_index, 5, self.probe_mode)
         self.mlp_reduce(s.mlp_partial)
+        probe.record(s.mlp_output, self.probe_index, 2, self.probe_mode)
         if self.post is not None:
             self.post(s.mlp_output, s.ffn_hc.residual, s.ffn_hc.post, s.ffn_hc.comb)
 
@@ -231,9 +396,12 @@ class PreparedLayer:
 class PreparedDecoder:
     def __init__(self, weights, tables, scratch, metadata, pool, *, mode, runtime,
                  vocabulary_runtime, coordinator, session, name, workspace,
-                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False):
+                 window_staging=None, suffix_scratch=None, vision=None, mla_compute_mode="auto", scoring=None, vocabulary_parallel=False,
+                 tp3=None):
         if scratch.local_logits.dtype != torch.float32 or scratch.logits.dtype != torch.float32:
             raise ValueError("DeepSeek target vocabulary logits require FP32 storage")
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches, shared by every layer of this graph
+        self.probe = Probe(tp3.probe)
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.mode = mode
         self.vision = vision if mode == "prefill" else None
@@ -248,7 +416,8 @@ class PreparedDecoder:
         self.output_metadata = metadata if self.packing is None else self.packing.metadata
         self.output_scratch = scratch if self.packing is None else (
             suffix_scratch if suffix_scratch is not None else Scratch.allocate(
-                128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device))
+                128, scratch.hidden.shape[0], weights.shard.world_size, scratch.embedding.device,
+                engram_chunk_rows=tp3.engram_chunk_rows, share_engram_residual=tp3.share_engram_residual))
         self.aux_layers = () if weights.draft is None else weights.config.draft.target_layers
         if self.packing is not None and any(layer <= decoder_start for layer in self.aux_layers):
             raise ValueError("bounded decoder feedback requires draft target layers after its global-KV boundary")
@@ -296,15 +465,15 @@ class PreparedDecoder:
                         source_indices=self.window_metadata)
                     layer = replace(layer, attention={key: value for key, value in layer.attention.items()
                                                       if key not in ("compressor", "index_k", "index_norm")})
-            defer = (index + 1 < len(weights.layers) and weights.layers[index + 1].engram is None
-                     and index + 1 not in self.aux_layers)
+            defer = defers_post(index, [layer.engram is not None for layer in weights.layers], self.aux_layers)
             self.layers.append(PreparedLayer(index, layer, tables, layer_scratch, layer_metadata, pool, self.rotary,
                 shard=weights.shard, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,
                 carry=carry, defer_post=defer, boundary=boundary, replay_start=replay_start,
                 window_staging=None if self.window_commit is None else self.window_commit.staging[index],
                 mla_compute_mode=mla_compute_mode, buffers=layer_buffers,
-                window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata)))
+                window_metadata=(self.window_metadata if layer_metadata is metadata else self.suffix_window_metadata),
+                tp3=tp3, probe=self.probe))
             carry = defer
         buffers.join(*layer_cursors)
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
@@ -333,6 +502,8 @@ class PreparedDecoder:
 
     def __call__(self):
         s, m = self.scratch, self.metadata
+        self.probe.step(s.residual.device, self.mode)
+        self.probe.positions(m.positions, self.mode)
         self.table_requests()
         if self.vision is not None:
             self.safe_tokens.copy_(m.token_ids.clamp(0, self.weights.embedding.shape[0] - 1))

@@ -19,6 +19,7 @@ from .decoder import LayerScratch, PreparedGlmLayer
 from .kda import KDAScratch
 from .mla import MLAScratch
 from .moe import MoeScratch
+from .shards import Shards
 from .state import DecoderMetadata, DecoderState
 from .weights import ModelWeights, MoEWeights
 
@@ -52,10 +53,11 @@ class DecoderScratch:
             raise ValueError("GLM sampling capacity must be positive and fit the token capacity")
         def buffer(*shape):
             return torch.zeros(shape, dtype=torch.bfloat16, device=device)
-        layers = (KDAScratch.allocate(tokens, 64 // shard.world_size, device),
-            MLAScratch.allocate(tokens, 64 // shard.world_size, blocks, mode, device, context_ranks=context_ranks,
+        shards = Shards.of(shard.world_size)
+        layers = (KDAScratch.allocate(tokens, shards.heads, device),
+            MLAScratch.allocate(tokens, shards.heads, blocks, mode, device, context_ranks=context_ranks,
                                 remote=remote),
-            MLPScratch.allocate(tokens, 4096, 12288 // shard.world_size, device),
+            MLPScratch.allocate(tokens, 4096, shards.dense_width, device),
             MoeScratch.allocate(tokens, shard.world_size, device))
         if overlay_layers:
             from ignition.components.moe import RouterScratch
@@ -65,7 +67,7 @@ class DecoderScratch:
 
             layers = overlay(layers, keep=(IndexScratch, RouterScratch))
         return cls(buffer(tokens, 4096), buffer(tokens, 4, 4096), buffer(sample_rows, 4, 4096),
-            buffer(sample_rows, 4096), buffer(sample_rows, 154880 // shard.world_size), buffer(sample_rows, 154880),
+            buffer(sample_rows, 4096), buffer(sample_rows, shards.vocabulary), buffer(sample_rows, 154880),
             MHCScratch.allocate(tokens, 4096, device), MHCScratch.allocate(tokens, 4096, device),
             *layers, buffer(tokens, 4096), buffer(tokens, 4096))
 

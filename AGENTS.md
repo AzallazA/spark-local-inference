@@ -184,6 +184,7 @@ and hardware sections of the preparation guide.
 | Change Protobuf metadata or core loading/export | [Runtime core design](docs/runtime-core-design.md), [prepared model contract](helios/model-contract.md), and [core compatibility](#model-core-compatibility) |
 | Diagnose or optimize performance | [GPU performance work](docs/performance-work.md), plus model or preparation development guidance for affected code |
 | Change CLI, API, or configuration behavior | [CLI design](docs/cli-design.md) and the relevant [API](docs/api.md) sections |
+| Work on the TP3 fork (DeepSeek-V4.1-Flash on three RTX PRO 6000, `ds41-tp3-*` branches): measure, export, change the BRRR kernel or the release folder | [TP3 fork handbook](docs/TP3-GUIDELINES.md): paths and commands, workflows, agent tips, and the rules with the incidents behind them |
 
 For sampling or frontend metadata changes, also read
 [sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).

@@ -208,6 +208,7 @@ impl Fixture {
         Prompt {
             tokens,
             message_boundaries: vec![],
+            tools: false,
             data,
             conditioned_inputs: vec![],
             conditioning: vec![],
@@ -1336,20 +1337,24 @@ fn packing_sees_reserved_pages_and_pack_failure_retains_submission_until_drain()
 }
 
 #[test]
-fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() {
+fn exact_prompt_checkpoints_publish_only_after_snapshot_completion() {
     let fixture = Fixture::new();
     let (sender, receiver) = mpsc::channel();
     let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 2);
     incoming.prompt.message_boundaries = vec![10];
+    // A tool request: the default tools-only tail merge applies (Prompt.tools reaches the spec).
+    incoming.prompt.tools = true;
     sender.send(vec![incoming]).unwrap();
     let mut worker = fixture.worker(receiver);
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     let handle = worker.active[0].as_ref().unwrap().request;
     advance(&mut worker, GraphKind::Init, 1, None);
-    advance(&mut worker, GraphKind::Prefill, 2, None);
+    // The 3-token final message segment rides along with the chunk, so the
+    // boundary at 10 is not a separate graph and publishes no checkpoint.
+    advance(&mut worker, GraphKind::Prefill, 2, Some(1));
     assert_eq!(
         worker.scheduler.request(handle).unwrap().consumed_tokens,
-        10
+        13
     );
     assert_eq!(worker.scheduler.stats().message_checkpoints, 0);
     assert!(!worker.publish().unwrap());
@@ -1359,12 +1364,12 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
         .iter()
         .find(|u| u.buffer == "state_expected_consumed")
         .unwrap();
-    assert_eq!(&expected.bytes[..8], &10i64.to_le_bytes());
-    assert_eq!(worker.scheduler.stats().message_checkpoints, 0);
+    assert_eq!(&expected.bytes[..8], &13i64.to_le_bytes());
+    assert_eq!(worker.scheduler.stats().prompt_checkpoints, 0);
     worker
         .complete(GraphKind::Snapshot, completion(&worker, &snapshot, 3, None))
         .unwrap();
-    assert_eq!(worker.scheduler.stats().message_checkpoints, 1);
+    assert_eq!(worker.scheduler.stats().prompt_checkpoints, 1);
     assert_eq!(
         worker
             .scheduler
@@ -1373,21 +1378,12 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
             .reused_prompt_tokens(),
         0
     );
-    advance(&mut worker, GraphKind::Prefill, 4, Some(1));
-    assert_eq!(
-        worker.scheduler.request(handle).unwrap().consumed_tokens,
-        13
-    );
-    assert_eq!(worker.scheduler.stats().prompt_checkpoints, 0);
+    advance(&mut worker, GraphKind::Decode, 4, Some(2));
     assert!(!worker.publish().unwrap());
     advance(&mut worker, GraphKind::Snapshot, 5, None);
-    assert_eq!(worker.scheduler.stats().prompt_checkpoints, 1);
-    advance(&mut worker, GraphKind::Decode, 6, Some(2));
-    assert!(!worker.publish().unwrap());
-    advance(&mut worker, GraphKind::Snapshot, 7, None);
     assert!(worker.publish().unwrap());
     assert!(!worker.publish().unwrap());
-    assert_eq!(worker.scheduler.stats().snapshot_publications, 3);
+    assert_eq!(worker.scheduler.stats().snapshot_publications, 2);
     let metrics = fixture.metrics.snapshot(false);
     assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 2));
     let mut finished = 0;
@@ -1418,8 +1414,8 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
         (live.phase, live.reused_prompt_tokens()),
         (RequestPhase::Restore, 13)
     );
-    advance(&mut worker, GraphKind::Restore, 8, None);
-    advance(&mut worker, GraphKind::Resume, 9, Some(1));
+    advance(&mut worker, GraphKind::Restore, 6, None);
+    advance(&mut worker, GraphKind::Resume, 7, Some(1));
     let metrics = fixture.metrics.snapshot(false);
     assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 3));
 }
@@ -3357,6 +3353,7 @@ fn exercise_text_preemption(
                 grammar_constrained: false,
                 host_stops: false,
                 prompt_logprobs: false,
+                tools: false,
             })
             .unwrap();
         worker.scheduler.cancel(pressure).unwrap();
@@ -4669,6 +4666,7 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: true,
+                    tools: false,
                 })
                 .unwrap();
             worker.scheduler.set_vision_images(occupied, &[64]).unwrap();
@@ -5215,6 +5213,7 @@ fn unpinned_checkpoint(
         host_stops: false,
         prompt_logprobs: false,
         growable_output: true,
+        tools: false,
     };
     let plan = worker.scheduler.plan_admission(&spec).unwrap();
     let key = plan.history().key_at(end as u64).unwrap();
@@ -5377,6 +5376,7 @@ fn publication_copy_pins_survive_ancestor_compaction() {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: true,
+        tools: false,
     };
     let plan = worker.scheduler.plan_admission(&spec).unwrap();
     let key = plan.history().key_at(64).unwrap();
@@ -5526,6 +5526,7 @@ fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: true,
+            tools: false,
         };
         worker.scheduler.admit(spec).unwrap();
         worker.service_store().unwrap();

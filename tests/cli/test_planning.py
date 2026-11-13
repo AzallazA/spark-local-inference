@@ -474,6 +474,23 @@ def test_context_parallel_pages_hold_every_rank_share_unless_disabled():
                                   speculation=None)
 
 
+def test_context_parallel_page_counts_round_up_when_pages_do_not_divide_the_context():
+    # Three context ranks of 64-token pages: 192 positions per page, which 262144 and 8192 are not multiples of.
+    trio = recipe("trio", 160, (3,))
+    sharded = replace(trio, ranks=MappingProxyType({3: replace(trio.ranks[3], page_tokens=192)}))
+    gpus = (gpu(0, 95), gpu(1, 95), gpu(2, 95))
+    plan = planning.plan(sharded, sharded.checkpoints[0], gpus, selected=None, concurrency=4, reserve_bytes=0,
+                         speculation=None)
+    assert (plan.context_parallel, plan.page_tokens) == (True, 192)
+    assert plan.demand_pages == 4 * 1366 and 1365 * 192 < 262144 <= 1366 * 192
+    assert plan.minimum_pages == 4 * 43 and 42 * 192 < 8192 <= 43 * 192
+    assert plan.context == 262144
+    # Pages that divide the context plan exactly as before.
+    whole = planning.plan(sharded, sharded.checkpoints[0], gpus, selected=None, concurrency=4, reserve_bytes=0,
+                          speculation=None, context_parallel=False)
+    assert (whole.page_tokens, whole.demand_pages, whole.minimum_pages) == (64, 4 * 4096, 4 * 128)
+
+
 def test_context_parallelism_follows_the_flag():
     from types import SimpleNamespace
 
@@ -550,6 +567,18 @@ def test_first_fitting_gpus_and_smallest_supported_tensor_parallel_size():
     split = derive(gpus=(gpu(0, 50), gpu(1, 50)))
     assert split.world_size == 2 and split.weights_bytes == 30 * GIB
     assert derive(PAIR, tuple(gpu(index, 60) for index in range(4))).world_size == 4
+
+
+def test_exact_rank_counts_are_chosen_only_on_hosts_with_exactly_that_many_gpus():
+    # 250 GiB of weights: one or two 96 GB GPUs never fit, three and four do. A four-GPU host keeps TP4.
+    trio = replace(recipe("trio", 250, (1, 2, 3, 4)), exact_rank_counts=frozenset({3}))
+    four = tuple(gpu(index, 95) for index in range(4))
+    assert derive(trio, four).world_size == 4
+    assert derive(trio, four[:3]).world_size == 3
+    assert derive(trio, four, selected=(0, 1, 2)).world_size == 3
+    assert derive(replace(trio, exact_rank_counts=frozenset()), four).world_size == 3
+    with pytest.raises(ValueError, match="exact rank counts must be declared tensor-parallel sizes"):
+        replace(trio, exact_rank_counts=frozenset({5}))
 
 
 def test_explicit_gpus_set_the_tensor_parallel_size():

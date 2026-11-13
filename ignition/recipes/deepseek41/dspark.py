@@ -11,13 +11,15 @@ from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .attention import AttentionIndices, Rotary, normalize
 from .decoder import PreparedLayer
+from .tp3_config import TP3Config
 
 
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime,
-                 coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False):
+                 coordinator, session, name, workspace, mla_compute_mode="auto", vocabulary_parallel=False, tp3=None):
         if scratch.local_logits.dtype != torch.bfloat16 or scratch.logits.dtype != torch.bfloat16:
             raise ValueError("DSpark proposal vocabulary logits require BF16 storage")
+        tp3 = TP3Config() if tp3 is None else tp3  # TP3 fork switches (draft layers never use BRRR: mode "draft")
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
@@ -30,7 +32,7 @@ class PreparedDraft:
             shard=weights.shard, mode="draft", runtime=runtime, coordinator=coordinator,
             session=session, name=f"{name}.layer{i}", workspace=workspace, carry=i > 0,
             defer_post=i + 1 < len(weights.draft.layers), mla_compute_mode=mla_compute_mode,
-            window_metadata=self.window_metadata)
+            window_metadata=self.window_metadata, tp3=tp3)
             for i, layer in enumerate(weights.draft.layers))
         self.head_hidden = scratch.buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype)
         head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head

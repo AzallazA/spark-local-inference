@@ -33,17 +33,20 @@ def _rank(rank, world_size, rendezvous, snapshot, rows):
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    from ignition.recipes.glm53.shards import Shards
+
     shard = TensorParallelShard(rank, world_size)
+    shards = Shards.of(world_size)
     manifest = inspect_indexed_checkpoint(snapshot)
     prefixes = (f"{TEXT_PREFIX}.layers.0.mlp.", f"{TEXT_PREFIX}.layers.3.mlp.shared_experts.")
     with GlmWeightLoader(manifest, device, shard=shard, prefixes=prefixes) as loader:
         dense_weights = loader.load_mlp(0)
         shared_prefix = prefixes[1].rstrip(".")
-        extent = shard.partition(2048, alignment=128)
+        extent = shard.padded_partition(2048, alignment=128)
         shared_weights = MLPWeights(
             loader.load_linear_group(tuple(f"{shared_prefix}.{name}" for name in ("gate_proj", "up_proj")),
-                                     row_ranges=(extent, extent)),
-            loader.load_linear_group((shared_prefix + ".down_proj",), column_range=extent),
+                                     row_ranges=(extent, extent), pad=True),
+            loader.load_linear_group((shared_prefix + ".down_proj",), column_range=extent, pad=True),
         )
         assert loader._session.torch_copy_bytes == 0
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank,
@@ -58,8 +61,8 @@ def _rank(rank, world_size, rendezvous, snapshot, rows):
         seed = source.clone()
         partial_output = torch.empty_like(source)
         dense_output, output = torch.empty_like(source), torch.empty_like(source)
-        gate_up = torch.empty((rows, 2 * 12288 // world_size), device=device, dtype=torch.bfloat16)
-        intermediate = torch.empty((rows, 12288 // world_size), device=device, dtype=torch.bfloat16)
+        gate_up = torch.empty((rows, 2 * shards.dense_width), device=device, dtype=torch.bfloat16)
+        intermediate = torch.empty((rows, shards.dense_width), device=device, dtype=torch.bfloat16)
         counter = torch.zeros(1, device=device, dtype=torch.int32)
         arena = ScratchArena(device)
         with RecordedPreparationSession(device=device, checkpoint="GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
@@ -70,8 +73,8 @@ def _rank(rank, world_size, rendezvous, snapshot, rows):
                                 session=session, name="dense", workspace=arena, swiglu_limit=10.0)
             dense_reduce = PreparedAllReduce(partial_output, dense_output, runtime=runtime, session=session,
                                              coordinator=coordinator, name="dense.reduce")
-            shared_gate_up = torch.empty((rows, 2 * 2048 // world_size), device=device, dtype=torch.bfloat16)
-            shared_intermediate = torch.empty((rows, 2048 // world_size), device=device, dtype=torch.bfloat16)
+            shared_gate_up = torch.empty((rows, 2 * shards.expert_width), device=device, dtype=torch.bfloat16)
+            shared_intermediate = torch.empty((rows, shards.expert_width), device=device, dtype=torch.bfloat16)
             shared = PreparedMLP(dense_output, shared_weights, shared_gate_up, shared_intermediate, partial_output,
                                  session=session, name="shared", workspace=arena, swiglu_limit=10.0)
             shared_reduce = PreparedAllReduce(partial_output, output, runtime=runtime, session=session,
@@ -130,11 +133,12 @@ def _rank(rank, world_size, rendezvous, snapshot, rows):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("world_size", [2, 3, 4])
 @pytest.mark.parametrize("rows", [1, 8])
 def test_native_compiled_glm_mlps(world_size, rows, tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
-    assert torch.cuda.device_count() == 4
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} CUDA devices are required; {torch.cuda.device_count()} are visible")
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
     if not snapshot.is_dir():

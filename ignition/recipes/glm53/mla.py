@@ -21,6 +21,7 @@ from ignition.components.sparse_mla_sm103 import Sm103PrefillSparseMLA, Sm103Spa
 from ignition.preparation.tuning import register_finalizer
 
 from .indexer import IndexMetadata, IndexScratch, IndexState, PreparedGlmIndexer
+from .shards import HEAD_COUNTS
 
 
 @dataclass(frozen=True)
@@ -66,8 +67,8 @@ class MLAScratch:
 
     @classmethod
     def allocate(cls, tokens, heads, blocks, mode, device, *, context_ranks=1, remote=False):
-        if heads not in (16, 32, 64):
-            raise ValueError("GLM MLA scratch requires TP1, TP2 or TP4 head partitions")
+        if heads not in HEAD_COUNTS:
+            raise ValueError("GLM MLA scratch requires a supported rank-count head partition")
         from .dcp import PREFILL_SLICE_ROWS, SLICE_ROWS
 
         index = IndexScratch.allocate(tokens, blocks, mode, device, context_ranks=context_ranks)
@@ -78,6 +79,9 @@ class MLAScratch:
         # Fused layer-input projection: query 1536, latent 512, index key 128 and index head weights 32.
         projected = buffer(2208)
         prefill = context_ranks > 1 and mode == "prefill"
+        query = buffer(heads, 256)
+        # CP prefill consumes each query slice before expanding values into the same rows.
+        expanded = query if prefill else buffer(heads, 256)
         exchange = min(tokens, SLICE_ROWS) if context_ranks > 1 and not prefill else 0
         # Context-parallel rows absorb, attend and expand one slice at a time; otherwise every row at once.
         absorbed = exchange or (min(tokens, PREFILL_SLICE_ROWS) if prefill else tokens)
@@ -90,7 +94,7 @@ class MLAScratch:
 
         window = min(WINDOW_RECORDS, blocks * 256) if remote and prefill else 0
         return cls(projected, projected[:, :1536], buffer(1536), projected[:, 1536:2048], buffer(512),
-            buffer(heads, 256), zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), buffer(heads, 256),
+            query, zeros(absorbed, heads, 512), zeros(absorbed, heads, 512), expanded,
             buffer(4096), zeros(tokens, dtype=torch.int32), index,
             zeros(exchange, heads * context_ranks, 512), zeros(exchange, heads * context_ranks, 512),
             zeros(exchange, heads * context_ranks, dtype=torch.float32), zeros(positions, 528, dtype=torch.uint8),
@@ -112,6 +116,9 @@ class MLAScratch:
 _CHAINS = weakref.WeakValueDictionary()
 _CHAIN_HANDLES = itertools.count()
 
+
+# Head counts per rank that b12x's BF16 x MXFP8 batched GEMM qualifies (mxfp8_bmm._QUALIFIED_BATCHES).
+MXFP8_BMM_HEADS = frozenset((8, 16, 32))
 
 @torch.library.custom_op("flare::start_glm_query_chain", mutates_args=("query", "absorbed", "gathered", "workspace"))
 def _start_query_chain(source: torch.Tensor, query: torch.Tensor, absorbed: torch.Tensor, gathered: torch.Tensor,
@@ -218,8 +225,8 @@ class PreparedGlmMLA:
         if (module.num_heads, module.q_lora_rank, module.kv_lora_rank, module.qk_nope_head_dim,
                 module.qk_rope_head_dim, module.v_head_dim) != (64, 1536, 512, 256, 0, 256):
             raise ValueError("canonical MLA geometry differs from GLM 5.3 Flash")
-        if module.indexer is None or module.skip_topk or heads not in (16, 32, 64):
-            raise ValueError("GLM MLA requires a full indexer and TP1, TP2 or TP4 head partitions")
+        if module.indexer is None or module.skip_topk or heads not in HEAD_COUNTS:
+            raise ValueError("GLM MLA requires a full indexer and a supported rank-count head partition")
         if (state.cache.shape != (state.index.cache.shape[0] * 4, 64, 528)
                 or weights["q_b_proj"].out_features != heads * 256
                 or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
@@ -240,6 +247,19 @@ class PreparedGlmMLA:
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
         if isinstance(weights["kv_b_proj"], torch.Tensor):
             values = weights["kv_b_proj"].view(heads, 512, 512)
+            self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]
+            batched_projection = BatchedUnquantizedProjection
+        elif heads not in MXFP8_BMM_HEADS:
+            # b12x qualifies its BF16 x MXFP8 BMM for 8, 16 and 32 groups only, and three ranks hold 24 heads
+            # (shards.py). The MXFP8 kv_b_proj (the draft layer's in the FP4-Local checkpoint; target layers
+            # store BF16) decodes exactly into BF16, E4M3 x E8M0 fitting BF16's mantissa and exponent, so the
+            # BF16 BMM computes the same products for 2x the bytes of a 12.6 MiB per-layer weight.
+            packed = weights["kv_b_proj"].weight
+            stored = packed.values.view(heads * 512, 512)
+            exponents = packed.scale_rows.view(torch.uint8).view(heads * 512, 16).int() - 127
+            decoded = stored.float().view(heads * 512, 16, 32) * torch.ldexp(
+                torch.ones_like(exponents, dtype=torch.float32), exponents)[..., None]
+            values = decoded.view(heads, 512, 512).to(torch.bfloat16)
             self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]
             batched_projection = BatchedUnquantizedProjection
         else:
@@ -396,7 +416,11 @@ class PreparedGlmMLA:
             for slice in self.slices:
                 slice[4].rebind_cache(self.state.cache)
 
-    def __call__(self, source):
+    def __call__(self, source, *, select=True):
+        """Attend with the indexer's selection, or without `select` with the one already in index scratch.
+
+        A pass that reuses the selection writes its latent records but leaves the C4 cache and tail unchanged.
+        """
         s, p = self.scratch, self.projections
         p["qkv_a_proj"](source)
         rms_norm(s.query_input, self.module.q_a_layernorm.weight, s.query_residual,
@@ -411,7 +435,8 @@ class PreparedGlmMLA:
         rms_norm(s.latent_input, self.module.kv_a_layernorm.weight, s.latent,
             self.module.kv_a_layernorm.variance_epsilon, round_before_weight=True)
         self.writer()
-        self.indexer()
+        if select:
+            self.indexer()
         if self.context is None:
             s.visible.copy_(self.metadata.positions + 1)
             if self.end is not None:

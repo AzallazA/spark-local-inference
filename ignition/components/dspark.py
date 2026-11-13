@@ -29,6 +29,12 @@ class DSparkForwards:
 
 
 class SpeculativePreparation:
+    COPY_INPUTS = ("copy_token_ids", "copy_token_count", "copy_expected_consumed", "copy_generation")
+
+    def copy_buffers(self):
+        return {"copy_token_ids": self.copy_ids, "copy_token_count": self.copy_count,
+                "copy_expected_consumed": self.copy_expected, "copy_generation": self.copy_generation}
+
     def __init__(
         self,
         weights,
@@ -67,6 +73,13 @@ class SpeculativePreparation:
             "runtime": runtime, "vocabulary_runtime": vocabulary_runtime, "coordinator": coordinator
         }
         self.vocabulary_parallel_sampling = vocabulary_parallel_sampling
+        # Copied history proposals (flare run --history-drafts): Helios writes each request's continuation
+        # of shared decoded history; inactive unless the count is positive and the cursor is fresh.
+        capacity, device = requests.capacity, requests.status.device
+        self.copy_ids = torch.full((capacity, 7), -1, dtype=torch.int64, device=device)
+        self.copy_count = torch.zeros(capacity, dtype=torch.int32, device=device)
+        self.copy_expected = torch.full((capacity,), -1, dtype=torch.int64, device=device)
+        self.copy_generation = torch.zeros(capacity, dtype=torch.int64, device=device)
         self.sampling_runtime, self.logprob_runtime = sampling_runtime, logprob_runtime
         self.markov_runtime = markov_runtime
         # Only sampling uses the result channel; model forwards receive the collectives above.

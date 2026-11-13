@@ -51,15 +51,19 @@ def runs_concurrently(graph):
     return bool(ready)
 
 
-@pytest.fixture(scope="module", params=[2, 4])
+# (world, routed expert columns): None is the upstream 128-aligned shard; 704 is FLARE_GLM53_EXPERT_COLUMNS=704.
+@pytest.fixture(scope="module", params=[(2, None), (3, None), (3, 704), (4, None)], ids=["2", "3", "3-704", "4"])
 def expert_partition(request):
     snapshot = os.environ.get("FLARE_GLM53_SNAPSHOT")
-    if snapshot is None:
+    if snapshot is None or not Path(snapshot).is_dir():
         pytest.skip("FLARE_GLM53_SNAPSHOT must identify the checkpoint")
     manifest = inspect_indexed_checkpoint(Path(snapshot))
-    shard = TensorParallelShard(0, request.param)
+    # Three ranks: the last rank holds the 768-column shard with 256 zero-padded expert columns, or at 704 routed
+    # columns 1408..2047 plus 64 zero columns (the shared expert stays at 768).
+    world, expert_columns = request.param
+    shard = TensorParallelShard(world - 1, world)
     tree = create_model_tree(manifest.snapshot)
-    with GlmWeightLoader(manifest, "cuda:0", shard=shard,
+    with GlmWeightLoader(manifest, "cuda:0", shard=shard, expert_columns=expert_columns,
                          prefixes=(f"{TEXT_PREFIX}.layers.3.mlp.",)) as loader:
         scales = loader.allocate_expert_scale_scratch()
         weights = loader.load_mlp(3, scale_scratch=scales)

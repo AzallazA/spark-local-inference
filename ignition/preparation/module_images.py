@@ -59,12 +59,21 @@ class ModuleImages:
         return self.native.allocation_contexts()
 
     def __enter__(self):
+        import os
+        if os.getenv("FLARE_DS41_EAGER_PROFILE"):
+            # An external CUPTI profiler is attached; skip our recorder (CUPTI allows one subscriber).
+            ModuleImages.active += 1
+            return self
         self.native.start()
         self._token = _CURRENT.set(self)
         self._active = True
         return self
 
     def __exit__(self, kind, value, traceback):
+        import os
+        if os.getenv("FLARE_DS41_EAGER_PROFILE") and not self._active:
+            ModuleImages.active -= 1
+            return
         try:
             self.native.stop()
         finally:

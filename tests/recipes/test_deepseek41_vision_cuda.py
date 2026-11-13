@@ -30,18 +30,50 @@ from ignition.components.deepseek_vision import (
     PrefillVisionInputs,
     PreparedVisionGeneration,
     VisionState,
+    staged_aligner_geometry,
 )
-from ignition.components.weights import DirectWeightLoader
+from ignition.components.weights import DirectWeightLoader, _park_on_host
+from ignition.preparation.core_storage import HostRegion, CoreStorage, _Cuda
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA device"
 )
 
 
+# Weight staging variants: None = resident weights read in place; "resident" = VRAM-to-VRAM staging; "parked"
+# stages from device-visible host memory parked the production way (cuMemHostRegister'ed regions with
+# identical CPU and device addresses, as FLARE_DS41_VISION_HOST=1 does) through cudaMemcpy; "parked-kernel"
+# copies the same host-mapped source with the elementwise kernel path. The pool is NaN-filled before every
+# replay below, so a stale or missing staging copy fails the comparison.
+STAGING = (None, "resident", "parked", "parked-kernel")
+
+
+def _park_weights(weights, device):
+    """Move vision/aligner tensors into mapped host regions; returns (parked weights, regions to close)."""
+    import math
+    import mmap
+
+    cuda, cursor, regions = _Cuda(), CoreStorage.HOST_BASE, []
+
+    def host_allocate(name, shape, dtype):
+        nonlocal cursor
+        size = math.prod(shape) * dtype.itemsize
+        extent = -(-size // mmap.PAGESIZE) * mmap.PAGESIZE
+        region = HostRegion(cuda, cursor, extent, shape, dtype, device.index)
+        cursor += region.extent
+        regions.append(region)
+        return region
+
+    parked = {name: _park_on_host(host_allocate, name, tensor) if name.startswith(("vision.", "aligner."))
+              else tensor for name, tensor in weights.items()}
+    return parked, regions
+
+
+@pytest.mark.parametrize("staging", STAGING)
 @pytest.mark.parametrize("compiler", ("fx", "aot"))
 @pytest.mark.parametrize("height,width,capacity", [(24, 24, 576), (25, 31, 1152), (93, 93, 9216)])
 @torch.no_grad()
-def test_compiled_vision_publishes_only_valid_current_generation(compiler, height, width, capacity):
+def test_compiled_vision_publishes_only_valid_current_generation(compiler, height, width, capacity, staging):
     snapshot = (
         Path.home()
         / ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
@@ -62,6 +94,10 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     manifest = IndexedCheckpoint(snapshot, MappingProxyType(tensors), tuple(records))
     with DirectWeightLoader(manifest, device, prefixes=prefixes) as loader:
         weights = {name: loader.load_tensor(name) for name in loader._sources}
+    reference_weights, regions = weights, []
+    if staging is not None and staging.startswith("parked"):
+        weights, regions = _park_weights(weights, device)
+        assert all(weights[name].data_ptr() >= CoreStorage.HOST_BASE for name in weights if name.startswith("vision."))
     spec = importlib.util.spec_from_file_location(
         "deepseek41_vision_reference", snapshot / "inference/vision.py"
     )
@@ -74,7 +110,7 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     vit.load_state_dict(
         {
             name.removeprefix("vision."): value
-            for name, value in weights.items()
+            for name, value in reference_weights.items()
             if name.startswith("vision.")
         },
         assign=True,
@@ -82,7 +118,7 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     aligner.load_state_dict(
         {
             name.removeprefix("aligner."): value
-            for name, value in weights.items()
+            for name, value in reference_weights.items()
             if name.startswith("aligner.")
         },
         assign=True,
@@ -92,7 +128,8 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     features = feature_h * feature_w
     pool = GraphBufferPool(device, chunk_bytes=2 << 20)
     buffers = pool.cursor()
-    scratch = VisionScratch.allocate(capacity, device, hidden=5120, buffers=buffers)
+    scratch = VisionScratch.allocate(capacity, device, hidden=5120, buffers=buffers,
+                                     staging=staged_aligner_geometry(weights) if staging else None)
     inputs = VisionInputs.allocate(device, patches=9216)
     requests = DeviceRequestState.allocate(device, vocab_size=129280, capacity=4)
     batch = BatchInputs.allocate(512, 8, device, capacity=4)
@@ -126,8 +163,19 @@ def test_compiled_vision_publishes_only_valid_current_generation(compiler, heigh
     inputs.vision_generation.fill_(7)
     requests.generation[2] = 7
     requests.status[2] = 1
+    try:
+        _run(compiler, device, weights, scratch, inputs, state, records, frame, sequence, arena, pool, buffers,
+             staging, height, width, patches, features, vit, aligner)
+    finally:
+        for region in regions:
+            region.close()
+
+
+def _run(compiler, device, weights, scratch, inputs, state, records, frame, sequence, arena, pool, buffers,
+         staging, height, width, patches, features, vit, aligner):
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision", buffers=buffers)
+        encoder = PreparedVision(weights, scratch, inputs, session=session, workspace=arena, name="vision", buffers=buffers,
+                                 stage_weights=staging is not None, kernel_copy=staging == "parked-kernel")
         operation = PreparedVisionGeneration(encoder, state, completion_outputs(records), frame, sequence, buffers=buffers)
         if compiler == "aot":
             from ignition.preparation.aot import aot_forward

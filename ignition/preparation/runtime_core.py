@@ -190,26 +190,20 @@ class RecordedExportGraph:
 
 
 def record_export_graph(graph, storage, *, owners=()):
-    """Copy an uninstantiated graph before releasing its CUDA template."""
-    import flare_heliopause
-    from .module_images import ModuleImages
+    """Retain a captured template, its executable and external export resources.
 
-    images = ModuleImages.current()
-    if images is None:
-        raise RuntimeError("graph metadata recording requires an active native module recorder")
+    Owners must not reference the graph: Torch's destruction finalizer retains
+    them independently. Native replay callers must drain before resetting graphs.
+    """
     pools = (storage.pool, storage.graph_pool)
     owned = {pool.id for pool in pools}
     if not set(graph.pools()) <= owned:
         raise ValueError("export graph uses a CUDA pool without an external owner")
-    context, _ = flare_heliopause.current_context()
-    recorded = images.native.record_template(int(graph.raw_cuda_graph()), 1)
-    owner = RecordedExportGraph(images.native, recorded, context, pools, owners)
-    try:
-        graph.reset()
-    except BaseException:
-        owner.reset()
-        raise
-    return owner
+    # Device pointers in captured nodes do not retain their Python resource owners.
+    # Release these references only when the graph is reset or collected.
+    graph.retain_object((pools, tuple(owners)), synchronize_before_release=True)
+    instantiate_graph(graph)
+    return graph
 
 
 def capture_graph(*, retain_graphs=False):
@@ -317,6 +311,11 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
     allocations.extend(Allocation(f"host-{index}", region.address, region.extent, alignment=4096,
         preserve_address=True, memory="mapped_host") for index, region in enumerate(storage.host_regions)
         if not region.closed)
+    # TP3 merged expert banks: one allocation per bank; Helios maps its first <device bytes> as VRAM
+    # and the rest as pinned host-NUMA memory, so the bank stays one contiguous range.
+    for index, region in enumerate(r for r in getattr(storage, "mixed_regions", ()) if not r.closed):
+        allocations.append(Allocation(f"mixed-{index}-{region.device_bytes}", region.address, region.extent,
+            alignment=storage.granularity, preserve_address=True))
     allocations.extend(Allocation(region.name, region.address, region.extent, alignment=storage.granularity,
         initialize="zero", preserve_address=True, sizing=dict(capacity=region.group,
         unit_bytes=region.unit_bytes, maximum=region.maximum)) for region in dynamic)

@@ -30,6 +30,7 @@ def _rank(rank, world, rendezvous, snapshot, mode):
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.glm53.kda import KDAScratch, PreparedGlmKDA
     from ignition.recipes.glm53.model import create_model_tree
+    from ignition.recipes.glm53.shards import Shards
     from ignition.recipes.glm53.weights import TEXT_PREFIX, GlmWeightLoader
 
     torch.cuda.set_device(rank)
@@ -49,7 +50,7 @@ def _rank(rank, world, rendezvous, snapshot, mode):
     try:
         capacity = 65 if mode == "prefill" else 2
         count = capacity if mode == "prefill" else 1
-        heads = 64 // world
+        heads = Shards.of(world).heads
         state = DeltaState.allocate(6, device, heads=heads, channels=3 * heads * 128)
         metadata = DeltaMetadata.allocate(2, device)
         scratch = KDAScratch.allocate(capacity, heads, device)
@@ -129,11 +130,12 @@ def _rank(rank, world, rendezvous, snapshot, mode):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
 def test_actual_kda_native_tp_graph(world, mode, tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
-    assert torch.cuda.device_count() == 4
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"{world} CUDA devices are required; {torch.cuda.device_count()} are visible")
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
     if not snapshot.is_dir():

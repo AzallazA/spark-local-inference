@@ -4,7 +4,9 @@
 
 """Prepared DeepSeek ViT, spatial aligner, and bounded image feature delivery."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +16,24 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
+from ignition.components.vision_staging import WeightStaging
 from ignition.components.weights import MLPWeights
+from ignition.preparation.tensor_metadata import record_numeric_tensor, unrecorded_numeric_tensors
+
+# Weight staging (PreparedVision(stage_weights=True)): every block shares these names and shapes, so two
+# VRAM slots double-buffer the 32-block stack; the patch embedding and final norm stay resident for one
+# image; the aligner is staged after the last block into slots aliasing the dead block scratch.
+BLOCK_WEIGHTS = ("norm1.weight", "attn.wqkv.weight", "attn.wqkv.bias", "attn.wo.weight", "attn.wo.bias",
+                 "norm2.weight", "mlp.w1.weight", "mlp.w2.weight")
+RESIDENT_WEIGHTS = ("vision.patch_embed.proj.weight", "vision.patch_embed.proj.bias", "vision.norm.weight")
+ALIGNER_WEIGHTS = ("aligner.w1.weight", "aligner.w1.bias", "aligner.w2.weight", "aligner.w2.bias")
+VISION_BLOCKS = 32
+
+
+def staged_aligner_geometry(weights):
+    """Shapes and dtypes for `VisionScratch.allocate(staging=...)` when the aligner is staged."""
+    return {name: (tuple(weights[name].shape), weights[name].dtype) for name in ALIGNER_WEIGHTS if name in weights}
+
 
 @dataclass(frozen=True)
 class VisionInputs:
@@ -65,12 +84,21 @@ class VisionScratch:
     aligned: torch.Tensor
     activated: torch.Tensor
     output: torch.Tensor
+    # Weight staging slots that only the merger stage reads (see `staged_aligner_geometry`), and how many
+    # of their bytes the pool had to allocate afresh (the rest alias attention/feed-forward chunks). Not a
+    # tensor tree: `scratch.overlay()` walks dataclass tensors only, so these slots are invisible to it and
+    # this scratch must not be overlaid when they are present.
+    staging_slots: dict | None = None
+    staging_allocated_bytes: int = 0
 
     @classmethod
-    def allocate(cls, patches, device, *, hidden, buffers=None):
-        def zeros(cursor, *shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if cursor is None
-                    else cursor.zeros(shape, torch.bfloat16))
+    def allocate(cls, patches, device, *, hidden, buffers=None, staging=None):
+        """`staging` maps names to (shape, dtype) of merger-stage weight slots: allocated inside the merger
+        fork, they share the pool extent of the attention and feed-forward stages, which are dead once the
+        block stack has finished, so staging the aligner costs only the excess over those stages."""
+        def zeros(cursor, *shape, dtype=torch.bfloat16):
+            return (torch.zeros(shape, dtype=dtype, device=device) if cursor is None
+                    else cursor.zeros(shape, dtype))
 
         pixels = zeros(buffers, patches, 588)
         residual, normalized, projected = (zeros(buffers, patches, 1024) for _ in range(3))
@@ -80,18 +108,29 @@ class VisionScratch:
         qkv = zeros(attention, patches, 3072)
         query, key, value = (zeros(attention, patches, 16, 64) for _ in range(3))
         attended = zeros(attention, patches, 1024)
+        # Largest first: the pool is first-fit over exact-size chunks, so the aligner slots take the
+        # feed-forward stage's chunks before the merger's own buffers fragment them.
+        staged, allocated = None, 0
+        if staging:
+            before = merger.pool.nbytes if merger is not None else 0
+            staged = {name: zeros(merger, *shape, dtype=dtype) for name, (shape, dtype)
+                      in sorted(staging.items(), key=lambda item: -math.prod(item[1][0]))}
+            allocated = (merger.pool.nbytes - before if merger is not None
+                         else sum(tensor.nbytes for tensor in staged.values()))
         merged = zeros(merger, patches // 9, 9216)
         aligned, activated, output = (zeros(merger, patches // 9, hidden) for _ in range(3))
         if buffers is not None:
             buffers.join(*stages)
         return cls(pixels, residual, normalized, qkv, query, key, value, attended, projected,
-                   mlp, merged, aligned, activated, output)
+                   mlp, merged, aligned, activated, output, staged, allocated)
 
     def rows(self, patches):
         return type(self)(
             *(
                 self.mlp.rows(patches)
                 if name == "mlp"
+                else getattr(self, name)
+                if name in ("staging_slots", "staging_allocated_bytes")
                 else getattr(self, name)[
                     : patches // 9 if name in ("merged", "aligned", "activated", "output") else patches
                 ]
@@ -101,7 +140,17 @@ class VisionScratch:
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name, buffers=None):
+    """Prepared ViT and aligner over one scratch capacity.
+
+    With ``stage_weights`` the prepared kernels read every weight from VRAM staging slots that the graph
+    refills from ``weights`` (typically device-visible host memory) on each replay: two slots double-buffer
+    the block stack so block ``i + 1`` copies on the arena's auxiliary stream while block ``i`` computes,
+    the patch embedding and final norm are staged once before the first block, and the aligner is staged
+    after the last block into ``scratch.staging_slots`` (allocate with ``staged_aligner_geometry``).
+    """
+
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name, buffers=None,
+                 stage_weights=False, kernel_copy=False):
         self.scratch, self.inputs = scratch, inputs
         tokens, device = scratch.patches.shape[0], scratch.patches.device
         self.frequencies = 10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32)
@@ -113,50 +162,68 @@ class PreparedVision:
         self.indices = zeros((tokens // 9, 9)).fill_(-1)
         self.num_patches, self.num_features = zeros((1,)), zeros((1,))
 
+        self.staging = self.resident = self.aligner = None
+        bound = weights
+        if stage_weights:
+            bound = self._prepare_staging(weights, scratch, workspace, buffers, kernel_copy)
+
         def project(key, source, out):
             return UnquantizedProjection(
                 source,
-                weights[key + ".weight"],
+                bound[key + ".weight"],
                 out,
-                bias=weights.get(key + ".bias"),
+                bias=bound.get(key + ".bias"),
                 session=session,
                 name=name + "." + key,
             )
 
-        self.patch = project("vision.patch_embed.proj", scratch.patches, scratch.residual)
-        self.blocks = []
-        for index in range(32):
-            prefix = f"vision.blocks.{index}"
-            norm1 = PreparedRMSNorm(
+        # Staged kernels read slot tensors: scratch rewritten on every replay, not checkpoint storage, so
+        # they are not recorded as numeric storage (`_prepare_staging` recorded the parked sources).
+        with unrecorded_numeric_tensors() if stage_weights else nullcontext():
+            self.patch = project("vision.patch_embed.proj", scratch.patches, scratch.residual)
+            self.blocks = []
+            for index in range(VISION_BLOCKS):
+                prefix = f"vision.blocks.{index}"
+                norm1 = PreparedRMSNorm(
+                    scratch.residual,
+                    bound[prefix + ".norm1.weight"],
+                    scratch.normalized,
+                    eps=1e-6,
+                    session=session,
+                    name=f"{name}.{index}.norm1",
+                )
+                qkv = project(prefix + ".attn.wqkv", scratch.normalized, scratch.qkv)
+                output = project(prefix + ".attn.wo", scratch.attended, scratch.projected)
+                norm2 = PreparedRMSNorm(
+                    scratch.residual,
+                    bound[prefix + ".norm2.weight"],
+                    scratch.normalized,
+                    eps=1e-6,
+                    session=session,
+                    name=f"{name}.{index}.norm2",
+                )
+                mlp = PreparedMLP(
+                    scratch.normalized,
+                    MLPWeights(bound[prefix + ".mlp.w1.weight"], bound[prefix + ".mlp.w2.weight"]),
+                    scratch.mlp.gate_up,
+                    scratch.mlp.intermediate,
+                    scratch.mlp.output,
+                    session=session,
+                    name=f"{name}.{index}.mlp",
+                    workspace=workspace,
+                    round_silu=True,
+                )
+                self.blocks.append((norm1, qkv, output, norm2, mlp))
+            self.norm = PreparedRMSNorm(
                 scratch.residual,
-                weights[prefix + ".norm1.weight"],
+                bound["vision.norm.weight"],
                 scratch.normalized,
                 eps=1e-6,
                 session=session,
-                name=f"{name}.{index}.norm1",
+                name=name + ".norm",
             )
-            qkv = project(prefix + ".attn.wqkv", scratch.normalized, scratch.qkv)
-            output = project(prefix + ".attn.wo", scratch.attended, scratch.projected)
-            norm2 = PreparedRMSNorm(
-                scratch.residual,
-                weights[prefix + ".norm2.weight"],
-                scratch.normalized,
-                eps=1e-6,
-                session=session,
-                name=f"{name}.{index}.norm2",
-            )
-            mlp = PreparedMLP(
-                scratch.normalized,
-                MLPWeights(weights[prefix + ".mlp.w1.weight"], weights[prefix + ".mlp.w2.weight"]),
-                scratch.mlp.gate_up,
-                scratch.mlp.intermediate,
-                scratch.mlp.output,
-                session=session,
-                name=f"{name}.{index}.mlp",
-                workspace=workspace,
-                round_silu=True,
-            )
-            self.blocks.append((norm1, qkv, output, norm2, mlp))
+            self.align1 = project("aligner.w1", scratch.merged, scratch.aligned)
+            self.align2 = project("aligner.w2", scratch.activated, scratch.output)
         self.attention = PreparedVarlenAttention(
             scratch.query,
             scratch.key,
@@ -167,19 +234,63 @@ class PreparedVision:
             workspace=workspace,
             name=name + ".attention",
         )
-        self.norm = PreparedRMSNorm(
-            scratch.residual,
-            weights["vision.norm.weight"],
-            scratch.normalized,
-            eps=1e-6,
-            session=session,
-            name=name + ".norm",
-        )
-        self.align1 = project("aligner.w1", scratch.merged, scratch.aligned)
-        self.align2 = project("aligner.w2", scratch.activated, scratch.output)
+
+    def _prepare_staging(self, weights, scratch, workspace, buffers, kernel_copy):
+        """Allocate the staging slots and return the weight mapping the prepared kernels bind."""
+        stream = workspace.auxiliary_stream if getattr(workspace, "overlap", False) else None
+        options = dict(stream=stream, buffers=buffers, kernel_copy=kernel_copy)
+        self.block_sources = tuple(
+            {suffix: weights[f"vision.blocks.{index}.{suffix}"]
+             for suffix in BLOCK_WEIGHTS if f"vision.blocks.{index}.{suffix}" in weights}
+            for index in range(VISION_BLOCKS))
+        self.resident_sources = {name: weights[name] for name in RESIDENT_WEIGHTS if name in weights}
+        self.aligner_sources = {name: weights[name] for name in ALIGNER_WEIGHTS if name in weights}
+        self.staging = WeightStaging(self.block_sources[0], slots=2, **options)
+        options["token"] = self.staging.token  # one ordering token keeps every stage after the preceding join
+        if any(set(sources) != set(self.block_sources[0]) or not self.staging.matches(sources)
+               for sources in self.block_sources):
+            raise ValueError("vision weight staging requires every block to share one weight geometry")
+        self.resident = WeightStaging(self.resident_sources, slots=1, **options)
+        if scratch.staging_slots is None or set(scratch.staging_slots) != set(self.aligner_sources):
+            raise ValueError("staged vision weights require VisionScratch.allocate(staging=staged_aligner_geometry(weights))")
+        self.aligner = WeightStaging(self.aligner_sources, storage=(scratch.staging_slots,), **options)
+        # The parked tensors remain the checkpoint storage the package stores and the graph reads from.
+        for sources in (*self.block_sources, self.resident_sources, self.aligner_sources):
+            for tensor in sources.values():
+                record_numeric_tensor(tensor)
+        bound = dict(weights)
+        for index in range(VISION_BLOCKS):
+            for suffix, tensor in self.staging.slot(index).items():
+                bound[f"vision.blocks.{index}.{suffix}"] = tensor
+        bound.update(self.resident.slot(0))
+        bound.update(self.aligner.slot(0))
+        return bound
+
+    @property
+    def staging_bytes(self):
+        """Bytes of staging slots this graph reads (block slots, resident set, and aligner slots)."""
+        return sum(s.nbytes for s in (self.staging, self.resident, self.aligner) if s is not None)
+
+    @property
+    def aliased_staging_bytes(self):
+        """Aligner slot bytes placed in chunks the attention/feed-forward stages had already created."""
+        return 0 if self.aligner is None else self.aligner.nbytes - self.scratch.staging_allocated_bytes
+
+    @property
+    def allocated_staging_bytes(self):
+        """Staging bytes the pool allocated afresh for this graph's cursor (block slots, resident set, and
+        the aligner slots that found no free chunk)."""
+        return self.staging_bytes - self.aliased_staging_bytes
 
     def __call__(self):
         s = self.scratch
+        staged = self.staging is not None
+        if staged:
+            # The patch embedding is needed first: stage it and wait, then start block 0's copies so they
+            # overlap the patch GEMM and the rotary tables.
+            self.resident.stage(0, self.resident_sources)
+            self.resident.join(0, s.patches)
+            self.staging.stage(0, self.block_sources[0])
         self.patch(s.patches)
         angles = (self.positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None, :]
         cos, sin = angles.cos(), angles.sin()
@@ -188,7 +299,14 @@ class PreparedVision:
             a, b = source.float().chunk(2, dim=-1)
             destination.copy_(torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1))
 
-        for norm1, qkv, output, norm2, mlp in self.blocks:
+        for index, (norm1, qkv, output, norm2, mlp) in enumerate(self.blocks):
+            if staged:
+                # Slot index % 2 holds this block; block index - 1 (the other slot's last reader) has been
+                # enqueued, so the next block's copies may now overwrite that slot while this block runs.
+                # The residual is block index - 1's last output: it orders this join after that compute.
+                self.staging.join(index, s.residual)
+                if index + 1 < len(self.blocks):
+                    self.staging.stage(index + 1, self.block_sources[index + 1])
             q, k, v = qkv(norm1(s.residual)).view(-1, 3, 16, 64).unbind(1)
             rotate(q, s.query)
             rotate(k, s.key)
@@ -196,11 +314,16 @@ class PreparedVision:
             self.attention()
             s.residual.add_(output(s.attended))
             s.residual.add_(mlp(norm2(s.residual)))
+        if staged:
+            # The aligner slots alias attention and feed-forward scratch: fork only after the last block.
+            self.aligner.stage(0, self.aligner_sources)
         self.norm(s.residual)
         indices = self.indices.long()
         gathered = s.normalized[indices.clamp(0, s.normalized.shape[0] - 1)]
         gathered = torch.where(indices[:, :, None] >= 0, gathered, 0)
         s.merged.copy_(gathered.transpose(1, 2).reshape(s.merged.shape))
+        if staged:
+            self.aligner.join(0, s.merged)
         s.activated.copy_(F.gelu(self.align1(s.merged)))
         return self.align2(s.activated)
 

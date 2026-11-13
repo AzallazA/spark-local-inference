@@ -29,13 +29,13 @@ from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
-    PrefillVisionInputs, PreparedVisionGeneration, VisionState)
+    PrefillVisionInputs, PreparedVisionGeneration, VisionState, staged_aligner_geometry)
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
     create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime, create_roce_runtime)
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.host_memory import virtual_device_memory, release_unused
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, virtual_device_memory, release_unused
 from ignition.preparation.frontend import PromptEncoder, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
@@ -46,7 +46,7 @@ from ignition.progress import phase
 from ignition.components.paged_batch import BatchInputs, Metadata, PreparedBatch
 from .recipe import RECIPE
 from .attention import INDEXER_QUERY_ROWS
-from .decoder import PreparedDecoder, Scratch, DraftScratch
+from .decoder import PreparedDecoder, Scratch, DraftScratch, check_brrr_decisions
 from ignition.components.dspark import PreparedContext, PreparedMarkov
 from .dspark import PreparedDraft
 from .engram import Tables
@@ -54,10 +54,8 @@ from ignition.components.paged_generation import PreparedGeneration
 from ignition.components.paged_maintenance import PreparedMaintenance
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
 from ignition.components.paged_resume import PreparedResume
-from .weights import ModelWeights
-
-
-_CONTEXT = partial(PreparedContext, compact_prefill=True)
+from .tp3_config import TP3Config
+from .weights import ModelWeights, vision_host_parked
 
 
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
@@ -67,12 +65,12 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, window_staging, suffix_scratch, vision,
-                       draft_vocabulary_runtime=None):
-    """Bind attention arithmetic and the proposal head's BF16 gather channel."""
+                       draft_vocabulary_runtime=None, tp3=None):
+    """Bind attention arithmetic, the proposal head's BF16 gather channel and the TP3 fork switches."""
     return (partial(PreparedDecoder, window_staging=window_staging, suffix_scratch=suffix_scratch,
-                    vision=vision, mla_compute_mode=mla_compute_mode),
+                    vision=vision, mla_compute_mode=mla_compute_mode, tp3=tp3),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
-                    mla_compute_mode=mla_compute_mode))
+                    mla_compute_mode=mla_compute_mode, tp3=tp3))
 
 
 def _can_race_contextual_plans(config, signatures, device):
@@ -90,6 +88,15 @@ def _can_race_contextual_plans(config, signatures, device):
     return True
 
 
+def _sampling_defaults(config):
+    """Vocabulary-parallel sampling has no top-p filter: declare top_p fixed at 1 so requests clamp instead of failing."""
+    defaults = RECIPE.sampling_defaults.as_dict()
+    if config.vocabulary_parallel_sampling:
+        defaults["top_p"] = 1.
+        defaults.setdefault("ranges", {})["top_p"] = {"min": 1., "max": 1.}
+    return defaults
+
+
 @dataclass(frozen=True)
 class PreparationConfig:
     collective_tuning: str = "static"
@@ -97,6 +104,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -133,9 +141,16 @@ class PreparationConfig:
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
+    # TP3 fork switches (expert parking, BRRR, vision staging, ...): recipe.prepare builds it from the environment
+    # once; None means the bare upstream behaviour (TP3Config defaults).
+    tp3: TP3Config | None = None
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.tp3 is None:
+            object.__setattr__(self, "tp3", TP3Config())
+        elif not isinstance(self.tp3, TP3Config):
+            raise TypeError("tp3 must be a TP3Config")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -193,7 +208,8 @@ class PreparationConfig:
         self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared widths")
-        if self.minimum_pages <= 0 or self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if (self.minimum_pages <= 0 or self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0
+                or self.compile_headroom_bytes < 0):
             raise ValueError("page and snapshot budgets must be positive and headroom nonnegative")
         if self.kv_pages is not None and (type(self.kv_pages) is not int or self.kv_pages < self.minimum_pages):
             raise ValueError("kv_pages must cover the minimum page capacity")
@@ -262,6 +278,11 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
         buffers["speculative_prefix_limits"] = prefix_limits
         packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
         packed_inputs += ("speculative_prefix_limits",)
+        # Copied history proposals for `flare run --history-drafts`: consumed only by the TP3 vocabulary-parallel
+        # draft path, so only that path advertises the inputs (upstream rejects --history-drafts without them).
+        if config.vocabulary_parallel_sampling:
+            buffers.update(speculation.copy_buffers())
+            packed_inputs += speculation.COPY_INPUTS
         packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
         proposals = {}
         for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
@@ -295,6 +316,21 @@ def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buf
     return confidence
 
 
+def _brrr_zero_ranges(tp3):
+    """TP3 BRRR: device ranges the export zeroes for the fused kernel (brrr.Engine.zero_ranges; empty unless
+    tp3.brrr_counter_parity, so the default package is unchanged)."""
+    if not tp3.brrr_layers:
+        return ()
+    from ignition.recipes.deepseek41.brrr import engine
+
+    e = engine()
+    if e is None:
+        if tp3.brrr_counter_parity:
+            raise RuntimeError("TP3 config: brrr_counter_parity is set but no BRRR engine was created")
+        return ()
+    return e.zero_ranges()
+
+
 def _collective_runtimes(config, group, device, *, coordinator, core_storage, verification_samples):
     """Share one RoCE channel across ordered graph collectives on separate hosts."""
     tokens = max(config.prefill_chunk_size, config.decode_tokens, config.request_capacity * config.draft_tokens)
@@ -321,9 +357,24 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
-    prefill = create_dma_all_reduce_runtime(group, device,
-        max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
+    from ignition.recipes.deepseek41.brrr import create_engine
+    create_engine(group, device, ipc, config.tp3)  # TP3 BRRR experiment: no-op unless tp3.brrr_layers is set
+    # The DMA all-reduce reduce-scatters the 5120-wide hidden state across ranks, so it needs the world
+    # size to divide 5120. TP3 instead shares ONE PCIe all-reduce runtime, sized for a prefill chunk, between
+    # decode and prefill: graph capture enters only the main collective's capture() context, so a second
+    # runtime's reductions would be captured outside the protocol b12x requires (and could desynchronize).
+    if 5120 % len(config.devices):
+        # tp3.ar_rows = N sizes the shared runtime for N rows instead of a whole prefill chunk; the decoder's
+        # chunked reductions split prefill rows to fit (786 MiB/GPU at 4096 rows vs 190 MiB at 1024).
+        ar_rows = config.tp3.ar_rows or config.prefill_chunk_size
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=max(config.all_reduce_tokens, min(config.prefill_chunk_size, ar_rows)), hidden_size=5120, ipc=ipc)
+        prefill = collective
+    else:
+        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+            max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+        prefill = create_dma_all_reduce_runtime(group, device,
+            max_tokens=config.prefill_chunk_size, hidden_size=5120, ipc=ipc)
     _, local_vocab = TensorParallelShard(0, len(config.devices)).padded_partition(129280, alignment=64)
     vocabulary = create_all_gather_runtime(group, device, max_rows=sample_rows,
         columns=local_vocab * len(config.devices) * 2, ipc=ipc)
@@ -342,6 +393,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     shard = TensorParallelShard(rank, len(config.devices))
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
+    tp3 = config.tp3  # TP3 fork switches: one instance, threaded through weights, decoder, BRRR, attention, vision
+    if progress is not None:
+        progress(tp3.describe())
+    # Truncated mini views (tp3.mini, test tooling) have no ratio-1 decoder suffix to compact prefill feedback.
+    context_factory = partial(PreparedContext, compact_prefill=not tp3.mini)
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
@@ -351,7 +407,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    host_allocator=core_storage.host_allocate, tp3=tp3)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -405,6 +462,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
@@ -420,15 +478,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         if (weights.config.decoder_start is not None
                 and weights.config.text["candidate_source_layer_id"] >= weights.config.decoder_start):
             candidate_tokens = min(candidate_tokens, 128)
+        # TP3 fork graph-scratch savings (default off): chunked Engram projection rows, engram_residual on ffn_hc.residual.
+        # Every rank reads one TP3Config, so every rank allocates the same shapes and aliases.
+        scratch_options = dict(engram_chunk_rows=tp3.engram_chunk_rows, share_engram_residual=tp3.share_engram_residual)
         prefill_storage = Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=candidate_tokens)
+            buffers=activation_buffers.cursor(), candidate_tokens=candidate_tokens, **scratch_options)
         scored_storage = (Scratch.allocate(config.prefill_chunk_size, 1, shard.world_size, device,
-            buffers=activation_buffers.cursor(), candidate_tokens=config.prefill_chunk_size)
+            buffers=activation_buffers.cursor(), candidate_tokens=config.prefill_chunk_size, **scratch_options)
             if config.prompt_logprobs else None)
         # The suffix boundary gathers from the full prefill into disjoint destinations.
-        suffix_storage = Scratch.allocate(128, 1, shard.world_size, device, buffers=prefill_storage.buffers)
+        suffix_storage = Scratch.allocate(128, 1, shard.world_size, device, buffers=prefill_storage.buffers,
+            **scratch_options)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device,
-            buffers=activation_buffers.cursor())
+            buffers=activation_buffers.cursor(), **scratch_options)
         window_staging = (decoder_storage.buffers.zeros(
             (len(weights.layers), slots, (128 + max(config.speculative_widths)) * 528), torch.uint8)
             if config.dspark else None)
@@ -446,7 +508,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             window_staging=window_staging, suffix_scratch=suffix_storage, vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective)
+            draft_vocabulary_runtime=draft_vocabulary_collective, tp3=tp3)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -468,7 +530,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
                 sampling_runtime=sampling_collective, logprob_runtime=logprob_collective,
                 buffers=activation_buffers.cursor(),
-                forwards=DSparkForwards(decoder_factory, DraftScratch, _CONTEXT,
+                forwards=DSparkForwards(decoder_factory, DraftScratch, context_factory,
                     draft_factory, PreparedMarkov))
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -524,21 +586,43 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                         buffers=cursor)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
-                        context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT, buffers=cursor)
+                        context_factory=PreparedContext if kind == "scored_prefill" else context_factory, buffers=cursor)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
             graph_buffers=graph_buffers, forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
+            # TP3: tp3.vision_stage stages the host-parked tower's weights through VRAM slots taken from each vision
+            # graph's cursor (so they share the activation pool with the other graphs and are counted with the graph
+            # operands); tp3.vision_stage_copy = "kernel" copies with an elementwise kernel instead of cudaMemcpy.
+            # The parked bytes stay host-resident either way.
+            stage_vision = tp3.vision_stage
+            copy_mode = tp3.vision_stage_copy
+            if stage_vision and not vision_host_parked(weights.vision, core_storage.host_regions):
+                # Nothing to stage from: the tower is already resident (no host allocator parked it).
+                if progress is not None:
+                    progress("tp3.vision_stage ignored: the vision tower is not host-parked; using it resident")
+                stage_vision = False
+            staging_report = None
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
                 cursor = activation_buffers.cursor()
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120, buffers=cursor)
+                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120, buffers=cursor,
+                    staging=staged_aligner_geometry(weights.vision) if stage_vision else None)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
-                    session=session, workspace=arena, name=name, buffers=cursor)
+                    session=session, workspace=arena, name=name, buffers=cursor,
+                    stage_weights=stage_vision, kernel_copy=copy_mode == "kernel")
+                if stage_vision:
+                    report = (encoder.staging_bytes, encoder.allocated_staging_bytes, encoder.aliased_staging_bytes, name)
+                    staging_report = max(staging_report, report) if staging_report else report
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor),
                     "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
+            if staging_report is not None and progress is not None:
+                total, allocated, aliased, largest = staging_report
+                progress(f"vision weight staging ({copy_mode}): {total >> 20} MiB of slots, max over vision graphs "
+                         f"({largest}): {allocated >> 20} MiB newly allocated in the activation pool, "
+                         f"{aliased >> 20} MiB of aligner slots aliasing block-stage scratch")
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             suffix = "-no-mtp" if config.dspark and not enabled else ""
@@ -558,6 +642,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     transient.close()
+    # TP3 BRRR: ranks must agree on every layer's fused-kernel decision before any of them can enter the kernel
+    # (its all-reduce would deadlock); plain construction code, before tuning and capture.
+    check_brrr_decisions(group)
     release_unused()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
@@ -582,9 +669,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                 graph_pool=core_storage.graph_pool.id, cache_root=config.kernel_cache,
                 compile_decoder=config.compile_decoder, warmup_storage=core_storage,
                 progress=progress)
-        with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
-            tuning = session.tune(show_progress=progress is not None and rank == 0,
-                                  console=stage.console, contextual=contextual)
+        # TP3: --joint-tuning compiles race forwards before scratch is released for compilation;
+        # tp3.joint_headroom_mib lowers the compile headroom for that phase only.
+        headroom = session.headroom_bytes
+        if contextual is not None and tp3.joint_headroom_mib is not None:
+            session.headroom_bytes = tp3.joint_headroom_mib << 20
+        try:
+            with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
+                tuning = session.tune(show_progress=progress is not None and rank == 0,
+                                      console=stage.console, contextual=contextual)
+        finally:
+            session.headroom_bytes = headroom
         if contextual is not None and progress is not None:
             from .contextual_selection import contextual_summary
 
@@ -600,6 +695,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             scratch_pool.release_backing()
             if progress is not None:
                 progress(f"released {sum(size for _, size in scratch_pool.unbacked) >> 20} MiB of scratch for compilation")
+        check_brrr_decisions(group)  # anything constructed since the catalog (contextual selection, tuning)
         graphs, compiled = capture_forwards(forwards, signatures, session=session, device=device, stream=stream,
             pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
             progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
@@ -617,7 +713,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    assets = {role: {"path": str(path)}
+    assets = {role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
         for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name,
@@ -625,7 +721,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "pages": pages, "state_rows": state_rows, "snapshots": snapshots, "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(metadata_path, eos_token_ids=[1], prompt_encoder=PromptEncoder.DEEPSEEK_V41,
             image_profile="deepseek_row_major" if vision_state is not None else None),
-        "sampling_defaults": RECIPE.sampling_defaults.as_dict(), "assets": assets,
+        "sampling_defaults": _sampling_defaults(config), "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency,
             page_tokens=PAGE_TOKENS, draft_lag=0 if config.dspark else None, rows=None,
             embedding_tables=range(len(tables.sources)))}
@@ -649,7 +745,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "indexer_query_rows": INDEXER_QUERY_ROWS,
         "free_device_bytes": free, "total_device_bytes": total, "headroom_bytes": config.headroom_bytes,
         "allocated_bytes": torch.cuda.memory_allocated(device), "reserved_bytes": torch.cuda.memory_reserved(device),
-        "tuning": tuning, "compiled_decoder": config.compile_decoder}
+        "tuning": tuning, "compiled_decoder": config.compile_decoder,
+        # TP3 fork: the switches this rank was prepared with (also written beside the package as tp3-config.json).
+        "tp3_config": tp3.to_metadata()}
     if scoring is not None:
         memory.update(scoring.memory_report())
     memory["draft_prefix_selection"] = config.draft_prefix_selection
@@ -674,7 +772,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                           *storage_ranges(disposable), *completion.zero_ranges()),
+                           *storage_ranges(disposable), *completion.zero_ranges(), *_brrr_zero_ranges(tp3)),
         export_events=tables.events(),
         embedding_catalog=tables.resident_catalog(),
         core_data=tables if rank == 0 else None,
@@ -687,4 +785,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
+    if rank == 0:
+        # Recorded by export_package as a JSON sidecar next to the package's model file: the package index has no
+        # free-form field (the native exporter types every serving key), so the config travels beside it.
+        model.package_sidecars = {"tp3-config.json": tp3.to_metadata()}
+        if progress is not None:
+            progress("TP3 config record: " + json.dumps(tp3.to_metadata(), sort_keys=True))
     return model

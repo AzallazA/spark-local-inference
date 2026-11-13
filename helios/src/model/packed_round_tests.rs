@@ -119,7 +119,7 @@ fn packed_combined_packing_preserves_sparse_slot_keys_and_ceiling_padding() {
     for _ in 0..4 {
         let prompt = vec![7; 64];
         let h = scheduler.admit(RequestSpec { prompt_logprobs: false, message_boundaries: vec![], prompt: prompt.clone(), conditioning: vec![],
-            max_new_tokens: 64, grammar_constrained: false, host_stops: false, growable_output: false }).unwrap();
+            max_new_tokens: 64, grammar_constrained: false, host_stops: false, growable_output: false, tools: false }).unwrap();
         admissions[h.slot as usize] = Some(Admission { prompt_logprobs: false, handle: h, sampling: SamplingParameters::default(),
             max_new_tokens: 64, prompt, data: PromptData { positions: (0..64).map(|i| [i; 3]).collect(),
                 vision_token_indices: vec![-1; 64], ..Default::default() }, grammar_mask: None, ignore_eos: true });

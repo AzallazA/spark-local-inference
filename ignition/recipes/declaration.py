@@ -251,6 +251,13 @@ class Recipe:
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
+    # Bytes per rank that the recipe parks in device-visible host memory instead of VRAM (e.g. DeepSeek V4.1's
+    # cold experts at TP3), subtracted from the planner's resident-weight estimate. Called with the world size.
+    host_offload_bytes: Callable[[int], int] | None = None
+    # Rank counts the planner chooses only when the host has exactly that many supported GPUs; `--gpus`
+    # listing exactly that many selects them as well. A padded partition (GLM 5.3 at TP3) must not displace
+    # an exact one (TP4) on a four-GPU host just because it is the first size that fits.
+    exact_rank_counts: frozenset[int] = frozenset()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes, serving_modes
@@ -272,6 +279,8 @@ class Recipe:
         if any(not name.startswith("B12X_") or not isinstance(value, str)
                for name, value in self.b12x_environment.items()):
             raise ValueError("b12x settings name B12X_ variables with string values")
+        if not self.exact_rank_counts <= set(self.ranks):
+            raise ValueError("exact rank counts must be declared tensor-parallel sizes")
         if self.speculation is not None and set(self.plain_ranks) != set(self.ranks):
             raise ValueError("a recipe that speculates declares its costs without speculation for every rank count")
         for name, method in self.speculative_methods.items():
@@ -307,8 +316,9 @@ class Recipe:
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:
             draft_bytes = method.draft_bytes
+        parked = 0 if self.host_offload_bytes is None else self.host_offload_bytes(world_size)
         return -(-(device_bytes + checkpoint.expansion_bytes - checkpoint.draft_bytes
-                   + (draft_bytes if learned else 0)) // world_size)
+                   + (draft_bytes if learned else 0)) // world_size) - parked
 
     def live_rows(self, concurrency: int, speculation: Speculation | None) -> int:
         """Permanently backed null, live, and speculative execution rows."""

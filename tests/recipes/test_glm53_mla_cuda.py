@@ -6,7 +6,9 @@
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +16,8 @@ from b12x.attention import sparse_mla
 from cuda.bindings import driver as cuda
 
 from ignition.components.parallel import TensorParallelShard
+from ignition.components.linear import BatchedQuantizedProjection, BatchedUnquantizedProjection
+from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
@@ -22,6 +26,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.recipes.glm53.indexer import IndexMetadata
 from ignition.recipes.glm53.mla import MLAScratch, MLAState, PreparedGlmMLA
 from ignition.recipes.glm53.model import create_model_tree
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.weights import TEXT_PREFIX, GlmWeightLoader
 
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -85,14 +90,18 @@ def assert_selection(actual, expected, indexer):
         assert torch.all(logits[row][changed] == cutoff)
 
 
-@pytest.fixture(scope="module", params=[1, 2, 4])
+# (world, rank): the last rank of each size, and every rank of three (24/24/16 checkpoint heads, 24 each).
+@pytest.fixture(scope="module", params=[(1, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 3)],
+                ids=lambda value: f"{value[0]}.{value[1]}")
 def model_weights(request):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
+    if not snapshot.is_dir():
+        pytest.skip("GLM 5.3 Flash checkpoint is not available")
     tree = create_model_tree(snapshot)
     manifest = inspect_indexed_checkpoint(snapshot)
-    world = request.param
-    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(world - 1, world),
+    world, rank = request.param
+    with GlmWeightLoader(manifest, "cuda:0", shard=TensorParallelShard(rank, world),
             prefixes=(f"{TEXT_PREFIX}.layers.3.self_attn.",)) as loader:
         weights = loader.load_attention(3)
     return tree.model.language_model.layers[3].self_attn, weights, world
@@ -107,7 +116,8 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
     capacity = 1 << (rows - 1).bit_length()
     sequences = rows if mode == "decode" else 1
     source = torch.zeros((capacity, 4096), dtype=torch.bfloat16, device=device)
-    scratch = MLAScratch.allocate(capacity, 64 // world, 64, mode, device)
+    # The last rank of three holds heads 48..63 and 8 zero-weight padding heads (24 per rank).
+    scratch = MLAScratch.allocate(capacity, Shards.of(world).heads, 64, mode, device)
     state = MLAState.allocate(128, 4, device)
     metadata = IndexMetadata.allocate(capacity, sequences, 64, device)
     arena = ScratchArena(device, overlap=overlap)
@@ -234,4 +244,158 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
         finally:
             if worker is not None:
                 worker.close()
+            graph.reset()
+
+
+@pytest.mark.parametrize("overlap", [True, False])
+@torch.no_grad()
+def test_reused_selection_attends_only_to_the_first_pass_records(model_weights, overlap):
+    """A draft pass that shares the first pass's selection excludes its own and later records."""
+    module, weights, world = model_weights
+    if world == 1:
+        pytest.skip("GLM prepares draft graphs for TP2, TP3 and TP4")
+    device = torch.device("cuda:0")
+    source = torch.zeros((2, 4096), dtype=torch.bfloat16, device=device)
+    scratch = MLAScratch.allocate(2, Shards.of(world).heads, 64, "decode", device)
+    state = MLAState.allocate(128, 4, device)
+    metadata = IndexMetadata.allocate(2, 2, 64, device)
+    history = torch.zeros((256, 512), dtype=torch.bfloat16, device=device)
+    history_slots = torch.zeros(256, dtype=torch.int64, device=device)
+    arena = ScratchArena(device, overlap=overlap)
+    with RecordedPreparationSession(device=device, checkpoint="GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD",
+            workload_schema="glm-mla-shared-selection-v1", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        attention = PreparedGlmMLA(module, weights, source, scratch, state, metadata,
+            mode="decode", session=session, name="mla", workspace=arena)
+        writer = PreparedLatentCacheWriter(history, state.cache, history_slots, session=session, name="history")
+        session.tune()
+        state.cache.zero_()
+        state.index.cache.zero_()
+        state.index.tail.zero_()
+        generator = torch.Generator(device=device).manual_seed(173)
+        metadata.block_table.copy_(torch.randperm(128, device=device, generator=generator, dtype=torch.int32)
+                                   .reshape(2, 64))
+        # Request zero is live in state slot 2; request one is idle.
+        metadata.state_slots.copy_(torch.tensor([2, -1], device=device))
+        metadata.query_start_loc.copy_(torch.tensor([0, 1, 1], dtype=torch.int32, device=device))
+        metadata.requests.zero_()
+        page = metadata.block_table[0, 0].long()
+        # Latent records of positions 0 through 255 precede the first draft pass at position 256. With fewer
+        # than 512 complete C4 pools every pool is selected, so the selection does not depend on the query.
+        history.normal_(generator=generator)
+        history_slots.copy_(page * 256 + torch.arange(256, device=device))
+        writer()
+
+        def run(position, *, select, write=True):
+            slot = metadata.block_table[0, position // 256].long() * 256 + position % 256
+            metadata.positions.copy_(torch.tensor([position, -1], device=device))
+            metadata.token_slots.copy_(torch.where(torch.tensor([write, False], device=device), slot, -1))
+            return attention(source, select=select).clone()
+
+        source[0].normal_(std=.1, generator=generator)
+        run(256, select=True)
+        physical, lengths = scratch.index.physical.clone(), scratch.index.selected_lengths.clone()
+        # Sixty-four complete pools and the tail token at position 256.
+        assert lengths.tolist() == [257, 0]
+        index_cache, index_tail = state.index.cache.clone(), state.index.tail.clone()
+        source[0].normal_(std=.1, generator=generator)
+        reused = run(257, select=False)
+        # The pass writes its latent record and leaves the selection and C4 state unchanged.
+        assert torch.equal(scratch.index.physical, physical) and torch.equal(scratch.index.selected_lengths, lengths)
+        assert torch.equal(state.index.cache, index_cache) and torch.equal(state.index.tail, index_tail)
+        own = (metadata.block_table[0, 1].long() * 256 + 1).item()
+        assert state.cache.view(-1, 528)[own].count_nonzero()
+        assert not reused[1].count_nonzero()
+        # Selecting at the preceding position with the same query attends to the same records.
+        preceding = run(256, select=True, write=False)
+        assert torch.equal(scratch.index.physical[0, :257].sort().values, physical[0, :257].sort().values)
+        assert ((preceding.float() - reused.float()).norm() / reused.float().norm()).item() < 1e-3
+        # Selecting at the pass's own position also attends to its record.
+        state.index.cache.copy_(index_cache)
+        state.index.tail.copy_(index_tail)
+        current = run(257, select=True, write=False)
+        assert scratch.index.selected_lengths.tolist() == [258, 0]
+        assert ((current.float() - reused.float()).norm() / reused.float().norm()).item() > 2e-2
+
+
+@pytest.mark.parametrize("model_weights", [2], indirect=True)
+@torch.no_grad()
+def test_cp_prefill_query_reuse_matches_separate_values_across_slices(model_weights):
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference
+    from ignition.recipes.glm53.dcp import ContextShards, PREFILL_SLICE_ROWS
+
+    module, weights, world = model_weights
+    device, capacity, blocks, heads = torch.device("cuda:0"), 8192, 32, Shards.of(world).heads
+    torch.manual_seed(53)
+    caches = [pack_mla_kv_cache_reference(torch.randn(blocks * 256, 512, device=device)).view(-1, 64, 528)
+              for _ in range(world)]
+    peers = torch.tensor([cache.data_ptr() for cache in caches], dtype=torch.int64, device=device)
+    storage = MLAScratch.allocate(capacity, heads, blocks, "prefill", device, context_ranks=world)
+    queries = torch.randn(storage.query.shape, dtype=torch.bfloat16, device=device) * .1
+    arena, operations, graphs, compiled = ScratchArena(device), {}, {}, {}
+    kv = weights["kv_b_proj"]
+    projection = BatchedUnquantizedProjection if isinstance(kv, torch.Tensor) else BatchedQuantizedProjection
+    if isinstance(kv, torch.Tensor):
+        values = kv.view(heads, 512, 512)
+        absorb_weights, expand_weights = values[:, :256], values[:, 256:]
+    else:
+        values, scales = kv.weight.values.view(heads, 512, 512), kv.weight.scale_rows.view(heads, 512, 16)
+        absorb_weights, expand_weights = (values[:, :256], scales[:, :256]), (values[:, 256:], scales[:, 256:])
+    with RecordedPreparationSession(device=device, checkpoint="glm53-cp-scratch",
+            workload_schema="glm-cp-scratch-v1", numerical_policy="default") as session:
+        session.register_scratch(arena)
+        for rows in (capacity, 2049):
+            for alias in (False, True):
+                key = rows, alias
+                s = storage.rows(rows, "prefill")
+                if not alias:
+                    s = replace(s, expanded=torch.empty_like(s.expanded))
+                metadata = IndexMetadata.allocate(rows, 1, blocks, device)
+                metadata.positions.copy_(torch.arange(rows, device=device) + 8)
+                metadata.block_table[0].copy_(torch.arange(blocks, device=device))
+                s.index.physical.fill_(-1)
+                s.index.physical[:, :4].copy_(torch.arange(4, device=device))
+                s.index.selected_lengths.fill_(4)
+                # Isolate the production CP slice loop with real projections, attention and peer-cache reads.
+                op = PreparedGlmMLA.__new__(PreparedGlmMLA)
+                op.scratch, op.metadata, op.state = s, metadata, SimpleNamespace(peers=peers)
+                op.context = SimpleNamespace(shards=ContextShards.on(0, world, device))
+                op.windows, op.slices = (), []
+                caps = sparse_mla.Caps(device=device, num_q_heads=heads, max_q_rows=PREFILL_SLICE_ROWS, max_width=2051,
+                    softmax_scale=module.scaling, max_batch=PREFILL_SLICE_ROWS, max_kv_rows=s.slab.shape[0],
+                    kv_dtype=torch.uint8, head_dim=512, v_head_dim=512, page_size=64,
+                    model_type=sparse_mla.ModelType.GLM_NEXT, cache_record_bytes=528, mode="extend")
+                for start in range(0, rows, PREFILL_SLICE_ROWS):
+                    end = min(start + PREFILL_SLICE_ROWS, rows)
+                    absorbed, attended = s.absorbed_query[:end - start], s.attended[:end - start]
+                    name = f"cp{rows}.{alias}.{start}"
+                    absorb = projection(s.query[start:end].transpose(0, 1), absorb_weights,
+                        absorbed.transpose(0, 1), major="n", session=session, name=name + ".absorb")
+                    attention = PreparedSparseMLA(absorbed, s.slab.view(-1, 64, 528), s.index.physical[start:end],
+                        s.visible[start:end], s.index.selected_lengths[start:end], attended, caps=caps,
+                        session=session, name=name + ".attention", workspace=arena)
+                    expand = projection(attended.transpose(0, 1), expand_weights,
+                        s.expanded[start:end].transpose(0, 1), major="k", session=session, name=name + ".expand")
+                    op.slices.append((start, end, absorb, attention, expand))
+                operations[key] = op
+        session.tune()
+        for key, op in operations.items():
+            def forward(op=op):
+                op.scratch.query.copy_(queries[:op.scratch.query.shape[0]])
+                op.attend_gathered_context()
+                arena.tensor.fill_(255)
+            compiled[key] = compile_forward(forward)
+            compiled[key]()
+            graphs[key] = torch.cuda.CUDAGraph()
+            with session.capture(), torch.cuda.graph(graphs[key]):
+                compiled[key]()
+        session.freeze()
+        for rows in (capacity, 2049, capacity):
+            graphs[rows, False].replay()
+            expected = operations[rows, False].scratch.expanded.clone()
+            storage.query.fill_(float("nan"))
+            graphs[rows, True].replay()
+            torch.cuda.synchronize(device)
+            assert torch.equal(operations[rows, True].scratch.expanded, expected)
+        for graph in graphs.values():
             graph.reset()

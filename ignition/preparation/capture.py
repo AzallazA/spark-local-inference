@@ -4,6 +4,7 @@
 
 """Compile prepared model forwards and capture CUDA graphs for their shapes."""
 
+import os
 from contextlib import nullcontext
 from time import monotonic
 
@@ -15,6 +16,7 @@ from .aot import ForwardCache
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+from .host_memory import COMPILE_HEADROOM_BYTES
 
 
 @_defer_full_collection()
@@ -31,7 +33,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     serving replays variants serially and may choose them in any order.
     All eager warmups precede capture so their transient workspaces do not
     coexist with retained graph intermediates.
-    ``retain_graphs`` records export metadata without executables when
+    ``retain_graphs`` keeps templates and executables for export when
     ``warmup_storage`` supplies external CUDA pool owners.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
     and graph capture; it is unused for the ordinary serving catalog.
@@ -56,7 +58,8 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         cache = ForwardCache(namespace=session.namespace.to_dict(), device=device, root=cache_root,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              compile_workers=getattr(session, "requested_compile_workers", None),
-                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
+                             lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune,
+                             compile_headroom_bytes=getattr(session, "compile_headroom_bytes", COMPILE_HEADROOM_BYTES))
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
         if compile_group is not None:
@@ -99,6 +102,37 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         release_unused()
     elif materialize is not None:
         materialize()
+    # TP3 profiling (opt-in, FLARE_DS41_EAGER_PROFILE=<substring>): run matching forwards eagerly (compiled code,
+    # no graph capture) inside a cudaProfiler range for nsys --capture-range=cudaProfilerApi, then exit.
+    profile_match = os.getenv("FLARE_DS41_EAGER_PROFILE")
+    if profile_match and label != "Prepare and tune kernels":
+        iters = int(os.getenv("FLARE_DS41_EAGER_ITERS", "20"))
+        targets = [name for name in names if profile_match in name]
+        if progress is not None:
+            progress(f"eager-profile targets ({profile_match!r}): {targets} of {list(names)}")
+        if targets:
+            for name in targets:
+                fn = compiled.get(name, functions[name])
+                if coordinator is not None:
+                    coordinator.barrier(f"profile {name}", coordinator.ranks)
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with warmup(), torch.cuda.stream(stream):
+                    for _ in range(3):
+                        fn()
+                    stream.synchronize()
+                    torch.cuda.nvtx.range_push(f"ds41_profile_{name}")
+                    torch.cuda.profiler.start()
+                    for _ in range(iters):
+                        torch.cuda.nvtx.range_push("step")
+                        fn()
+                        torch.cuda.nvtx.range_pop()
+                    stream.synchronize()
+                    torch.cuda.profiler.stop()
+                    torch.cuda.nvtx.range_pop()
+            torch.cuda.synchronize(device)
+            import sys
+            sys.stdout.flush()
+            sys.exit(0)
     with phase(progress, "Warm serving graphs", total=len(names)) as stage:
         for name in names:
             function = functions[name]

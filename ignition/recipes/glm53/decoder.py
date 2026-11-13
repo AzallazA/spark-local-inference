@@ -15,6 +15,7 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from .kda import KDAScratch, PreparedGlmKDA
 from .mla import MLAScratch, PreparedGlmMLA
 from .moe import MoeScratch, PreparedGlmMoe
+from .shards import Shards
 from .weights import MoEWeights
 
 
@@ -29,20 +30,19 @@ class LayerScratch:
 
     @classmethod
     def allocate(cls, tokens, world_size, device, *, sparse, block_type, mode, blocks=0):
-        if world_size not in (1, 2, 4):
-            raise ValueError("GLM layers require one, two or four ranks")
+        shards = Shards.of(world_size)
         def buffer(width):
             return torch.zeros((tokens, width), dtype=torch.bfloat16, device=device)
         if block_type == "linear_attention":
-            attention = KDAScratch.allocate(tokens, 64 // world_size, device)
+            attention = KDAScratch.allocate(tokens, shards.heads, device)
         elif block_type == "indexed_attention":
-            attention = MLAScratch.allocate(tokens, 64 // world_size, blocks, mode, device)
+            attention = MLAScratch.allocate(tokens, shards.heads, blocks, mode, device)
         else:
             raise ValueError("GLM layers require linear_attention or indexed_attention")
         return cls(MHCScratch.allocate(tokens, 4096, device), MHCScratch.allocate(tokens, 4096, device),
                    attention, buffer(4096),
                    MoeScratch.allocate(tokens, world_size, device) if sparse else
-                   MLPScratch.allocate(tokens, 4096, 12288 // world_size, device), buffer(4096))
+                   MLPScratch.allocate(tokens, 4096, shards.dense_width, device), buffer(4096))
 
 
 def _install_mhc(module, norm, weights, prefix, norm_name):

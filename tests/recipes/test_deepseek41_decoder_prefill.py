@@ -72,7 +72,9 @@ def test_decoder_feedback_at_replay_boundary_is_rejected_before_component_constr
         sources=(SimpleNamespace(layer=20),), draft=SimpleNamespace(target_layers=(20,))),
         draft=object(), layers=tuple(SimpleNamespace(engram=None) for _ in range(40)),
         shard=SimpleNamespace(world_size=4), embedding=None)
-    scratch = SimpleNamespace(embedding=torch.zeros(1), hidden=torch.zeros((1, 5120)))
+    # FP32 vocabulary logits pass the decoder's storage check, so the replay-boundary check is what rejects.
+    scratch = SimpleNamespace(embedding=torch.zeros(1), hidden=torch.zeros((1, 5120)),
+                              local_logits=torch.zeros(1), logits=torch.zeros(1))
     with pytest.raises(ValueError, match="draft target layers after"):
         decoder.PreparedDecoder(weights, None, scratch, Metadata.allocate(256, 1, 2, "cpu"), None,
             mode="prefill", runtime=None, vocabulary_runtime=None, coordinator=None,

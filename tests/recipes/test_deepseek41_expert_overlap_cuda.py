@@ -33,8 +33,9 @@ def expert_weights(request):
     snapshot = os.environ.get("FLARE_DS41_SNAPSHOT")
     if snapshot is None:
         pytest.skip("FLARE_DS41_SNAPSHOT must identify the checkpoint")
-    with DeepSeekWeightLoader(inspect_indexed_checkpoint(Path(snapshot)), "cuda:0",
-            shard=TensorParallelShard(0, request.param), prefixes=("layers.3.",)) as loader:
+    from ignition.recipes.deepseek41.tp3_config import TP3Config
+    with DeepSeekWeightLoader(inspect_indexed_checkpoint(Path(snapshot)), "cuda:0", shard=TensorParallelShard(0, request.param),
+            prefixes=("layers.3.",), tp3=TP3Config.from_environment()) as loader:
         weights = loader.load_layer(3).experts
         config = loader.config.text
     return weights, config, request.param

@@ -153,8 +153,9 @@ impl Inputs {
                         }
                         if binding.source == PageTable
                             && width
-                                < config.prepared_sequence_tokens
-                                    / config.contract.cache.page_tokens
+                                < config
+                                    .prepared_sequence_tokens
+                                    .div_ceil(config.contract.cache.page_tokens)
                         {
                             return Err("page-table view cannot cover the prepared context".into());
                         }

@@ -45,7 +45,7 @@ fn prompt_prefill_gpu_and_native_costs() {
                     let mut tokens = vec![42; length];
                     tokens[0] = 100 + serial;
                     let prompt = Prompt {
-                        tokens, message_boundaries: vec![],
+                        tokens, message_boundaries: vec![], tools: false,
                         data: crate::model::PromptData { positions: (0..length).map(|i| [i as i64; 3]).collect(),
                             vision_token_indices: vec![-1; length], spans: vec![] },
                         conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {

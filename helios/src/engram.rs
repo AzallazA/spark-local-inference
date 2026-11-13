@@ -152,6 +152,8 @@ impl Stats {
     }
 }
 
+pub use reader::default_gather_threads;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Storage {
     #[default]
@@ -341,42 +343,58 @@ impl Shared {
         max_tokens: usize,
         context: usize,
         device: i32,
-        storage: Storage,
+        storage: &[Storage],
         cache_bytes: u64,
         workers: usize,
+        gather_threads: usize,
         resident_scales: bool,
     ) -> Result<Arc<Self>> {
-        if storage == Storage::Ram && cache_bytes != 0 {
+        if storage.len() != index.tables.len() {
+            return Err("embedding table storage list does not match the table count".into());
+        }
+        if cache_bytes != 0 && storage.iter().all(|s| *s == Storage::Ram) {
             return Err("embedding row cache requires disk table storage".into());
         }
         let index = Arc::new(index);
         let stats = Arc::new(Stats::default());
-        let table_bytes: u128 = index
+        // Disk tables of this set share the row-cache budget in proportion to their bytes;
+        // RAM-resident tables take none of it.
+        let disk_bytes: u128 = index
             .tables
             .iter()
-            .flat_map(|table| &table.planes)
+            .zip(storage)
+            .filter(|(_, storage)| **storage == Storage::Disk)
+            .flat_map(|(table, _)| &table.planes)
             .map(|plane| plane.nbytes as u128)
-            .sum();
+            .sum::<u128>()
+            .max(1);
         let readers = index
             .tables
             .iter()
-            .map(|table| {
+            .zip(storage)
+            .map(|(table, storage)| {
+                let ram = *storage == Storage::Ram;
                 let bytes: u128 = table.planes.iter().map(|plane| plane.nbytes as u128).sum();
-                let budget = usize::try_from(cache_bytes as u128 * bytes / table_bytes)
-                    .map_err(|_| "embedding row cache exceeds host address range")?;
+                let budget = if ram {
+                    0
+                } else {
+                    usize::try_from(cache_bytes as u128 * bytes / disk_bytes)
+                        .map_err(|_| "embedding row cache exceeds host address range")?
+                };
                 let rows = max_tokens
                     .checked_mul(table.heads)
                     .ok_or("embedding row capacity exceeds host range")?;
                 reader::Reader::from_files(
                     files,
                     &table.planes,
-                    storage == Storage::Ram,
+                    ram,
                     budget,
                     rows,
                     stats.clone(),
                     workers,
-                    resident_scales,
+                    resident_scales && !ram,
                 )
+                .map(|reader| reader.with_gather_threads(gather_threads))
             })
             .collect::<Result<Vec<_>>>()?;
         Self::with_readers(index, readers, ranks, max_tokens, context, device, stats)

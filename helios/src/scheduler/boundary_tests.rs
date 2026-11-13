@@ -50,6 +50,13 @@ fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, act
     }
     s
 }
+/// Message-boundary tests whose final segment is a few tokens: the prefill tail merge (upstream
+/// PR #69) would absorb it, so they run with one prefill graph per message segment.
+fn exact_segments(mut s: RequestScheduler) -> RequestScheduler {
+    s.configure_policy(PolicyConfig { prefill_tail_merge: PrefillTailMerge::Off, ..PolicyConfig::default() })
+        .unwrap();
+    s
+}
 fn spec(system: Option<usize>, prompt: usize, output: u32) -> RequestSpec {
     RequestSpec {
         message_boundaries: system.into_iter().collect(),
@@ -60,6 +67,7 @@ fn spec(system: Option<usize>, prompt: usize, output: u32) -> RequestSpec {
         host_stops: false,
         prompt_logprobs: false,
         growable_output: false,
+        tools: false,
     }
 }
 fn run_step(s: &mut RequestScheduler) -> ScheduledPlan {
@@ -346,12 +354,12 @@ fn prompt_6459_retains_exact_prompt_and_terminal_with_immutable_admission_reuse(
 #[test]
 fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
     let mut s = scheduler(2, false);
-    let h = s.admit(spec(Some(10), 70, 3)).unwrap();
+    let h = s.admit(spec(Some(10), 200, 3)).unwrap();
     assert_eq!(s.free_snapshot_count(), 2);
     assert_eq!(s.stats().active_requests, 1);
     finish(&mut s, h);
     let mut s = scheduler_with_concurrency(3, false, 64, 1);
-    let h = s.admit(spec(Some(10), 70, 3)).unwrap();
+    let h = s.admit(spec(Some(10), 200, 3)).unwrap();
     assert_eq!(s.free_snapshot_count(), 3);
     stop_at_capture(&mut s, h, 10);
     let step = s.plan().unwrap();
@@ -377,8 +385,8 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
 #[test]
 fn duplicate_boundary_publication_does_not_remap_live_partial_pages() {
     let mut s = scheduler_with_concurrency(6, false, 64, 2);
-    let a = s.admit(spec(Some(10), 70, 2)).unwrap();
-    let b = s.admit(spec(Some(10), 70, 2)).unwrap();
+    let a = s.admit(spec(Some(10), 200, 2)).unwrap();
+    let b = s.admit(spec(Some(10), 200, 2)).unwrap();
     stop_at_capture(&mut s, a, 10);
     run_step(&mut s);
     stop_at_capture(&mut s, b, 10);
@@ -543,7 +551,7 @@ fn snapshot_pressure_retains_complete_conversations_until_endpoint_eviction() {
         let mut lengths = Vec::new();
         for turn in 0..turns {
             let length = 160 + 8 * turn;
-            let mut request = spec(Some(length - 10), length, 1);
+            let mut request = spec(Some(length - 128), length, 1);
             request.prompt[0] = (turn + 1) as u32;
             let handle = s.admit(request).unwrap();
             while s.request(handle).unwrap().phase != RequestPhase::Finishing {
@@ -683,11 +691,180 @@ fn message_boundaries_must_be_ordered_unique_and_within_the_prompt() {
 }
 
 #[test]
-fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
+fn host_offers_message_endpoints_even_when_a_prompt_is_nearby() {
     let page_tokens = 64;
     for gap in [page_tokens - 1, page_tokens] {
         for output in [1, 3] {
-            let mut s = scheduler_with_concurrency(16, false, page_tokens, 1);
+            let mut s = exact_segments(scheduler_with_concurrency(16, false, page_tokens, 1));
+            s.enable_publications();
+            let message = 3 * page_tokens - 1;
+            let prompt = message + gap;
+            let mut request = spec(Some(message), prompt, output);
+            request.message_boundaries.insert(0, page_tokens);
+            let h = s.admit(request).unwrap();
+            stop_at_capture(&mut s, h, message as u64);
+            run_step(&mut s);
+            let message_id = s.request(h).unwrap().prefix.unwrap();
+            let offered = s.take_publications();
+            assert_eq!(offered.len(), 2);
+            assert_eq!(offered[1].id, message_id);
+            let terminal = finish(&mut s, h);
+            let offered = s.take_publications();
+            if output > 1 {
+                assert_eq!(offered.len(), 1);
+                let p = &offered[0];
+                assert_eq!(p.key.consumed_tokens, prompt as u64);
+                assert_eq!(
+                    p.parent,
+                    Some(s.cache.checkpoint(message_id).unwrap().prefix())
+                );
+                let start = p.parent.unwrap().consumed_tokens as usize / page_tokens;
+                assert_eq!(p.tail(), &s.cache.page_chain(p.id).unwrap()[start..]);
+                assert_eq!(s.cache.checkpoint(p.id).unwrap().parent(), Some(message_id));
+            } else {
+                assert!(offered.is_empty());
+            }
+            assert!(s.cache.checkpoint(message_id).unwrap().ready());
+            assert!(s.cache.checkpoint(terminal).unwrap().ready());
+            assert_eq!(
+                s.stats().snapshot_publications,
+                if output > 1 { 4 } else { 3 }
+            );
+        }
+    }
+}
+
+#[test]
+fn message_endpoint_is_offered_eagerly_and_terminal_on_exact_resume() {
+    let mut s = exact_segments(scheduler_with_concurrency(16, false, 64, 1));
+    s.enable_publications();
+    let h = s.admit(spec(Some(127), 129, 3)).unwrap();
+    stop_at_capture(&mut s, h, 127);
+    run_step(&mut s);
+    let message = s.request(h).unwrap().prefix.unwrap();
+    let offered = s.take_publications();
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].id, message);
+    let terminal = finish(&mut s, h);
+    let prompt = s.take_publications().pop().unwrap();
+    let message_key = s.cache.checkpoint(message).unwrap().prefix();
+    assert_eq!((prompt.parent, prompt.tail_pages), (Some(message_key), 1));
+    for id in [message, terminal] {
+        let key = s.cache.checkpoint(id).unwrap().prefix();
+        let mut request = spec(None, 1, 1);
+        request.prompt = if id == message {
+            (0..127).collect()
+        } else {
+            let mut tokens: Vec<_> = (0..129).collect();
+            tokens.extend([900, 900]);
+            tokens
+        };
+        let plan = s.plan_admission(&request).unwrap();
+        assert_eq!(plan.resident_tokens(), key.consumed_tokens);
+        assert!(s.take_publications().is_empty());
+        let h = s.admit_planned(request.clone(), plan, None).unwrap().handle;
+        assert_eq!(s.request(h).unwrap().prefix, Some(id));
+        let offered = s.take_publications();
+        if id == message {
+            assert!(offered.is_empty()); // Already offered at capture.
+        } else {
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0].id, id);
+        }
+        assert!(s.cache.checkpoint(id).unwrap().pin_count() > 0);
+        assert_eq!(run_step(&mut s).kind, GraphKind::Restore);
+        assert_eq!(s.plan().unwrap().kind, GraphKind::Resume);
+        s.cancel(h).unwrap();
+        let h = s.admit(request).unwrap();
+        assert!(s.take_publications().is_empty());
+        s.cancel(h).unwrap();
+    }
+}
+
+#[test]
+fn eager_message_offer_survives_missing_prompt_capture() {
+    for cancel in [false, true] {
+        let mut s = exact_segments(scheduler_with_concurrency(3, false, 64, 1));
+        s.enable_publications();
+        let h = s.admit(spec(Some(127), 129, 3)).unwrap();
+        stop_at_capture(&mut s, h, 127);
+        run_step(&mut s);
+        let message = s.request(h).unwrap().prefix.unwrap();
+        let offered = s.take_publications();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, message);
+        // Other requests reserve all remaining rows, so the planned prompt copy skips.
+        let held: Vec<_> = (0..2).map(|_| s.reserve_snapshot(0).unwrap()).collect();
+        if cancel {
+            s.cancel(h).unwrap();
+        } else {
+            assert_eq!(run_step(&mut s).kind, GraphKind::Prefill);
+            assert_eq!(s.request(h).unwrap().consumed_tokens, 129);
+            assert!(s.cache.checkpoint(message).unwrap().pin_count() > 0);
+            assert_eq!(s.stats().prompt_checkpoints, 0);
+        }
+        assert!(s.take_publications().is_empty());
+        if !cancel {
+            assert_eq!(finish(&mut s, h), message);
+            assert!(s.take_publications().is_empty());
+        }
+        for snapshot in held {
+            s.release_snapshot(snapshot);
+        }
+    }
+}
+
+/// Tail merge settings with and without tools: off, upstream on, and the fork's tools-only rule
+/// (merges only the request with tools).
+const MERGE_CASES: [(PrefillTailMerge, bool); 4] = [
+    (PrefillTailMerge::Off, false),
+    (PrefillTailMerge::On, false),
+    (PrefillTailMerge::ToolsOnly, false),
+    (PrefillTailMerge::ToolsOnly, true),
+];
+
+#[test]
+fn all_selected_message_boundaries_are_offered() {
+    for (mode, tools) in MERGE_CASES {
+        let mut s = scheduler_with_concurrency(16, false, 64, 1);
+        s.configure_policy(PolicyConfig { prefill_tail_merge: mode, ..PolicyConfig::default() })
+            .unwrap();
+        s.enable_publications();
+        let mut request = spec(None, 130, 3);
+        request.message_boundaries = vec![127, 129];
+        request.tools = tools;
+        let h = s.admit(request).unwrap();
+        finish(&mut s, h);
+        // With the tail merge (PR #69) the whole 130-token prompt is one chunk, so no
+        // message checkpoint is captured and PR #227 has nothing to offer.
+        let expected: &[u64] = if mode.applies(tools) { &[130] } else { &[127, 129, 130] };
+        assert_eq!(
+            s.take_publications()
+                .iter()
+                .map(|p| p.key.consumed_tokens)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+// Fork switch `eager_message_offers = false`: the pre-#227 deferral (tail merge off as well).
+fn deferred_offers(mut s: RequestScheduler) -> RequestScheduler {
+    s.configure_policy(PolicyConfig {
+        prefill_tail_merge: PrefillTailMerge::Off,
+        eager_message_offers: false,
+        ..PolicyConfig::default()
+    })
+    .unwrap();
+    s
+}
+
+#[test]
+fn host_offers_skip_only_messages_shadowed_by_their_own_prompt_without_eager_offers() {
+    let page_tokens = 64;
+    for gap in [page_tokens - 1, page_tokens] {
+        for output in [1, 3] {
+            let mut s = deferred_offers(scheduler_with_concurrency(16, false, page_tokens, 1));
             s.enable_publications();
             let message = 3 * page_tokens - 1;
             let prompt = message + gap;
@@ -732,8 +909,8 @@ fn host_offers_skip_only_messages_shadowed_by_their_own_prompt() {
 }
 
 #[test]
-fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
-    let mut s = scheduler_with_concurrency(16, false, 64, 1);
+fn deferred_message_and_terminal_are_offered_once_on_exact_resume_without_eager_offers() {
+    let mut s = deferred_offers(scheduler_with_concurrency(16, false, 64, 1));
     s.enable_publications();
     let h = s.admit(spec(Some(127), 129, 3)).unwrap();
     stop_at_capture(&mut s, h, 127);
@@ -772,9 +949,9 @@ fn deferred_message_and_terminal_are_offered_once_on_exact_resume() {
 }
 
 #[test]
-fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
+fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable_without_eager_offers() {
     for cancel in [false, true] {
-        let mut s = scheduler_with_concurrency(3, false, 64, 1);
+        let mut s = deferred_offers(scheduler_with_concurrency(3, false, 64, 1));
         s.enable_publications();
         let h = s.admit(spec(Some(127), 129, 3)).unwrap();
         stop_at_capture(&mut s, h, 127);
@@ -806,18 +983,192 @@ fn deferred_message_is_offered_while_pinned_if_prompt_capture_is_unavailable() {
 }
 
 #[test]
-fn only_the_last_selected_message_can_be_shadowed_by_the_prompt() {
-    let mut s = scheduler_with_concurrency(16, false, 64, 1);
-    s.enable_publications();
-    let mut request = spec(None, 130, 3);
-    request.message_boundaries = vec![127, 129];
-    let h = s.admit(request).unwrap();
-    finish(&mut s, h);
-    assert_eq!(
-        s.take_publications()
-            .iter()
-            .map(|p| p.key.consumed_tokens)
-            .collect::<Vec<_>>(),
-        [127, 130]
-    );
+fn only_the_last_selected_message_can_be_shadowed_by_the_prompt_without_eager_offers() {
+    for (mode, tools) in MERGE_CASES {
+        let mut s = scheduler_with_concurrency(16, false, 64, 1);
+        s.configure_policy(PolicyConfig {
+            prefill_tail_merge: mode,
+            eager_message_offers: false,
+            ..PolicyConfig::default()
+        })
+        .unwrap();
+        s.enable_publications();
+        let mut request = spec(None, 130, 3);
+        request.message_boundaries = vec![127, 129];
+        request.tools = tools;
+        let h = s.admit(request).unwrap();
+        finish(&mut s, h);
+        // With the tail merge the whole 130-token prompt is one chunk: no message checkpoint.
+        let expected: &[u64] = if mode.applies(tools) { &[130] } else { &[127, 130] };
+        assert_eq!(
+            s.take_publications()
+                .iter()
+                .map(|p| p.key.consumed_tokens)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+/// DeepSeek V4.1 chat without tools renders earlier assistant turns without their reasoning
+/// (`<｜Assistant｜></think>` instead of the generation prompt's `<｜Assistant｜><think>`), so the
+/// next turn diverges one token after the last user message and can only resume from that
+/// message's checkpoint. The upstream tail merge (PR #69, mode `On`) absorbs the 2-token
+/// generation prompt and never captures it, so the follow-up turn falls back to the previous
+/// boundary and re-prefills the whole last user message. The fork default (`ToolsOnly`) keeps
+/// that checkpoint for requests without tools and still merges requests with tools, whose
+/// prompt-end checkpoint prefixes the next turn.
+#[test]
+fn tail_merge_keeps_the_follow_up_turn_resume_point_without_tools() {
+    assert_eq!(PolicyConfig::default().prefill_tail_merge, PrefillTailMerge::ToolsOnly);
+    for (mode, tools, resume) in [
+        (PrefillTailMerge::Off, false, 398),
+        (PrefillTailMerge::On, false, 100),
+        (PrefillTailMerge::ToolsOnly, false, 398),
+        (PrefillTailMerge::ToolsOnly, true, 100),
+    ] {
+        let mut s = scheduler_with_concurrency(16, false, 64, 1);
+        s.configure_policy(PolicyConfig { prefill_tail_merge: mode, ..PolicyConfig::default() })
+            .unwrap();
+        let mut first = spec(Some(100), 400, 3);
+        first.message_boundaries.push(398);
+        first.tools = tools;
+        let h = s.admit(first).unwrap();
+        finish(&mut s, h);
+        let mut follow_up = spec(None, 1, 1);
+        follow_up.prompt = (0..399).chain([7777, 7778, 7779]).collect();
+        follow_up.tools = tools;
+        let plan = s.plan_admission(&follow_up).unwrap();
+        assert_eq!(plan.resident_tokens(), resume, "{mode:?} tools={tools}");
+    }
+}
+
+/// Three-rank context-parallel GLM (DCP3) pages hold 768 positions while prefill chunks stay at 4096, so chunk
+/// ends, message endpoints and request ends fall inside pages, and the context (16384 here, 2^20 when
+/// serving) is not a whole number of pages.
+fn context_parallel_scheduler(mtp: bool) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [9; 32],
+        SchedulerLimits {
+            request_slots: 4,
+            max_active: 2,
+            max_sequence_tokens: 16384,
+            prefill_chunk_size: 4096,
+            pages: 256,
+            snapshots: 16,
+        },
+        SchedulerCapabilities {
+            completion_token_capacity: 16,
+            vocabulary: 248320,
+            page_tokens: 768,
+            vision: crate::model::VisionCapabilities {
+                feature_slots: 4,
+                features_per_request: 16384,
+                max_images: 4,
+                patches_per_feature: 4,
+                patch_capacities: vec![256, 1024, 4096, 16384],
+            },
+            draft_pages_per_request: 1,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    s.measured_graph_durations(&super::tests::duration_graphs(4))
+        .unwrap();
+    if mtp {
+        s.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    }
+    s
+}
+
+#[test]
+fn partial_768_token_pages_capture_restore_and_branch_across_4096_token_chunks() {
+    const PAGE: usize = 768;
+    for system in [1, 700, 767, 768, 769, 1000, 4095, 4096, 4097, 4600, 6143, 6144, 8191, 8193] {
+        for mtp in [false, true] {
+            let mut s = context_parallel_scheduler(mtp);
+            let prompt = system + 5000;
+            let h = s.admit(spec(Some(system), prompt, 3)).unwrap();
+            stop_at_capture(&mut s, h, system as u64);
+            let prior = s.request(h).unwrap().pages().collect::<Vec<_>>();
+            // Pages grow with prefill; the capture point's partial page is already held.
+            assert!(prior.len() >= system.div_ceil(PAGE) + usize::from(mtp), "{system} {mtp}");
+            run_step(&mut s);
+            let r = s.request(h).unwrap();
+            assert_eq!(r.prefix_tokens, system as u64);
+            // Only whole pages are shared; the partial page stays private to the request.
+            assert_eq!(r.shared_pages.len(), system / PAGE, "{system} {mtp}");
+            assert_eq!(r.pages().collect::<Vec<_>>(), prior);
+            let continuation = s.plan().unwrap();
+            assert_eq!(continuation.kind, GraphKind::Prefill);
+            assert_eq!(continuation.lanes[0].start_position, system as u64);
+            assert!(continuation.lanes[0].tokens <= 4096 && continuation.lanes[0].tokens > 0);
+            stop_at_capture(&mut s, h, prompt as u64);
+            run_step(&mut s);
+            let terminal = finish(&mut s, h);
+            let consumed = s.cache.checkpoint(terminal).unwrap().prefix().consumed_tokens;
+            assert_eq!(consumed, (prompt + 2) as u64);
+            assert_eq!(s.cache.page_chain(terminal).unwrap().len(), (prompt + 2) / PAGE);
+            assert_eq!(s.cache.lookup(&history(system)).unwrap().consumed_tokens, system as u64);
+            assert_eq!(s.cache.lookup(&history(prompt)).unwrap().consumed_tokens, prompt as u64);
+            // Two branches after the system prompt restore its partial page into private copies.
+            let mut branch = spec(Some(system), prompt, 3);
+            branch.prompt[system] = 777;
+            let a = s.admit(branch.clone()).unwrap();
+            let b = s.admit(branch).unwrap();
+            assert_eq!(s.request(a).unwrap().consumed_tokens, system as u64);
+            assert_eq!(s.request(a).unwrap().reused_prompt_tokens(), system as u64);
+            run_step(&mut s);
+            let (ra, rb) = (s.request(a).unwrap(), s.request(b).unwrap());
+            assert_eq!(ra.phase, RequestPhase::Prefill);
+            assert_eq!(ra.shared_pages, rb.shared_pages);
+            if system % PAGE != 0 || mtp {
+                assert_ne!(ra.private_pages[0], rb.private_pages[0]);
+            }
+            assert_eq!(ra.pages().count(), system.div_ceil(PAGE) + usize::from(mtp), "{system} {mtp}");
+            let step = s.plan().unwrap();
+            assert_eq!(step.kind, GraphKind::Prefill);
+            assert!(step.lanes.iter().all(|lane| lane.start_position == system as u64));
+            s.cancel(a).unwrap();
+            s.cancel(b).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_full_context_request_ends_on_a_partial_768_token_page() {
+    // 16384 = 21 pages of 768 + 256 positions: a request that fills the context needs 22 pages, the last one
+    // partial. The step emulation here emits whole speculative rounds, so drafting runs only through prefill.
+    for mtp in [false, true] {
+        let mut s = context_parallel_scheduler(mtp);
+        let output = 8;
+        let h = s.admit(spec(None, 16384 - output - 7, output as u32)).unwrap();
+        let mut chunks = Vec::new();
+        for _ in 0..400 {
+            let r = s.request(h).unwrap();
+            if r.phase == RequestPhase::Finishing || mtp && r.consumed_tokens >= (16384 - output - 7) as u64 {
+                break;
+            }
+            let step = run_step(&mut s);
+            if step.kind == GraphKind::Prefill {
+                chunks.push(step.lanes[0].tokens);
+            }
+        }
+        assert!(chunks.iter().all(|&tokens| tokens <= 4096), "{chunks:?}");
+        assert_eq!(chunks.iter().sum::<usize>(), 16384 - output - 7);
+        let r = s.request(h).unwrap();
+        assert_eq!(r.pages().count(), 16384usize.div_ceil(768) + usize::from(mtp), "{mtp}");
+        if !mtp {
+            assert_eq!(r.phase, RequestPhase::Finishing);
+            let consumed = r.consumed_tokens;
+            assert!(consumed as usize > 21 * 768, "{consumed}");
+            if let Some(terminal) = s.finish(h).unwrap() {
+                assert_eq!(s.cache.page_chain(terminal).unwrap().len(), consumed as usize / 768);
+            }
+        }
+        // One more token than the context is refused at admission.
+        assert!(s.admit(spec(None, 16384, 1)).is_err());
+    }
 }

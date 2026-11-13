@@ -13,16 +13,15 @@ from ignition.components.state import StateLayout, StateStorage
 
 from .indexer import IndexState
 from .mla import MLAState
+from .shards import Shards
 from .state import DecoderState
 
 
 def continuation_layout(layer_types, world_size, *, mtp=False):
-    if world_size not in (1, 2, 4):
-        raise ValueError("GLM continuation storage requires one, two or four ranks")
+    heads = Shards.of(world_size).heads
     layer_types = tuple(layer_types)
     if not layer_types:
         raise ValueError("GLM continuation storage requires attention layers")
-    heads = 64 // world_size
     regions = []
     for index, kind in enumerate(layer_types):
         if kind == "linear_attention":

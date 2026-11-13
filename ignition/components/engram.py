@@ -24,7 +24,8 @@ def _lookup(source: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor,
             timings: torch.Tensor, frame: torch.Tensor, barrier_input: torch.Tensor,
             barrier_output: torch.Tensor, interval: int, barrier: int, plan: int, event: int) -> None:
     wait_for_readiness(source, event, timings, frame, interval, barrier_input, barrier_output, barrier)
-    lookup_op(plan, weight.view(torch.float8_e4m3fn), scales, hashes, count, out, hashes.shape[0], True)
+    lookup_op(plan, weight if weight.shape[-1] == 128 else weight.view(torch.float8_e4m3fn),
+              scales, hashes, count, out, hashes.shape[0], True)
 
 
 @_lookup.register_fake
@@ -43,10 +44,11 @@ class EngramInputs:
     interval: int
 
     @classmethod
-    def allocate(cls, tokens, device, *, timings, interval=0):
+    def allocate(cls, tokens, device, *, timings, interval=0, packed_fp4=False):
         ready = torch.cuda.Event(external=True)
         ready.record(torch.cuda.current_stream(device))
-        return cls(torch.zeros((tokens * 24, 256), dtype=torch.uint8, device=device),
+        # Staged rows: 256 FP8 bytes, or 128 bytes of packed MXFP4 pairs.
+        return cls(torch.zeros((tokens * 24, 128 if packed_fp4 else 256), dtype=torch.uint8, device=device),
                    torch.zeros((tokens * 24, 8), dtype=torch.uint8, device=device),
                    torch.full((tokens, 24), -1, dtype=torch.int64, device=device), ready, timings, interval)
 
@@ -68,8 +70,9 @@ class PreparedEngramLookup:
         self.plan = engram.plan(engram.Caps(device=output.device, max_tokens=tokens,
             max_seqs=tokens, max_requests=tokens, vocab_size=len(token_map), layer_id=layer,
             tp_size=1, tp_rank=0), token_map=token_map, geometry=geometry,
-            invocation={"operation": "lookup", "compact_rows": True})
-        binding = SimpleNamespace(weight=self.weights.view(torch.float8_e4m3fn),
+            invocation={"operation": "lookup", "compact_rows": True,
+                        **({"packed_fp4": True} if self.weights.shape[-1] == 128 else {})})
+        binding = SimpleNamespace(weight=self.weights if self.weights.shape[-1] == 128 else self.weights.view(torch.float8_e4m3fn),
             scale_bytes=self.scales, hash_ids=self.hashes, num_tokens=count, out=output)
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run_lookup(binding, tokens, clear_tail=True), owners=(inputs, binding))),))

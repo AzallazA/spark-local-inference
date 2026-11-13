@@ -19,6 +19,7 @@ from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.kda import KDAScratch, PreparedGlmKDA
 from ignition.recipes.glm53.model import create_model_tree
 from ignition.recipes.glm53.weights import TEXT_PREFIX, GlmWeightLoader
@@ -51,9 +52,9 @@ def runs_concurrently(graph):
     return bool(ready)
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 def test_rank_state_and_scratch_geometry(world):
-    heads = 64 // world
+    heads = Shards.of(world).heads
     state = DeltaState.allocate(6, "cpu", heads=heads, channels=3 * heads * 128)
     scratch = KDAScratch.allocate(65, heads, "cpu")
     assert state.recurrent.shape == (6, heads, 128, 128)

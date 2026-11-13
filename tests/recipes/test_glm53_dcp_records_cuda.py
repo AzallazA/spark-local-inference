@@ -3,13 +3,15 @@
 
 """Gathering latent records over a network, window by window, reproduces the slab CUDA IPC pulls on one host."""
 
+import os
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1" or not torch.cuda.is_available(),
+                                reason="GPU test: set FLARE_RUN_CUDA_TESTS=1 (never run beside a GPU benchmark)")
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("end", [1, 5, 37, 1000, 2048])
 def test_windowed_records_match_the_ipc_pull(world, end):
     from ignition.recipes.glm53.dcp import (ContextShards, pack_records, pull_context, scatter_records,

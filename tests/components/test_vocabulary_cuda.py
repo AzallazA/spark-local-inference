@@ -57,7 +57,7 @@ def _rank(rank, world, rendezvous, vocab, indexed=False, output_dtype=torch.bflo
     try:
         with RecordedPreparationSession(device=device, checkpoint="vocabulary-test",
                 workload_schema="column-gather-v1", numerical_policy="default", coordinator=coordinator,
-                compile_workers=2) as session:
+                compile_workers=max(2, world)) as session:
             for rows in (4, 1):
                 result = output if indexed else output[:rows]
                 heads[rows] = PreparedVocabularyProjection(source[:rows], weight, local[:rows], result,
@@ -126,7 +126,7 @@ def _rank(rank, world, rendezvous, vocab, indexed=False, output_dtype=torch.bflo
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("vocab", [154880, 128896])
 def test_sharded_vocabulary_native_replay(world, vocab, tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -150,7 +150,7 @@ def test_fp32_vocabulary_expands_rows_after_gather_under_native_replay(tmp_path)
              nprocs=2, join=True)
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 @torch.no_grad()
 def test_quantized_draft_shards_preserve_logits_under_compiled_replay(world):
     from b12x.preparation import PreparationSession

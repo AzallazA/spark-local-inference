@@ -9,6 +9,8 @@ import torch
 
 from ignition.components.vision_delivery import PreparedFeaturePublication
 
+from .vision import ROW_BANDS
+
 FEATURES = 8192
 PATCH_CAPACITIES = (64, 256, 1024, 4096, 16384, 32768)
 
@@ -60,15 +62,22 @@ class PreparedVisionGeneration:
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
         live = torch.arange(capacity, device=count.device) < count
         pixels, positions = i.vision_pixel_values[:capacity], i.vision_position_ids[:capacity]
-        valid &= (~live[:, None] | torch.isfinite(pixels)).all()
+        # Row bands keep the FP32-sized boolean temporaries (and the FP32 select the copy used to make) out
+        # of the shared graph pool; the checks and the BF16 patches are unchanged.
+        step = -(-capacity // ROW_BANDS)
+        for start in range(0, capacity, step):
+            valid &= (~live[start:start + step, None] | torch.isfinite(pixels[start:start + step])).all()
         valid &= (~live[:, None] | ((positions >= 0) & (positions < capacity))).all()
         self.errors.copy_(~valid)
-        e.scratch.patches.copy_(torch.where(valid & live[:, None], pixels, 0))
+        e.scratch.patches.copy_(pixels).masked_fill_(~(valid & live)[:, None], 0)
         m.position_ids.copy_(torch.where(valid & live[:, None], positions, 0))
         m.cu_seqlens.copy_(torch.where(valid, i.vision_cu_seqlens, 0))
         m.num_patches.copy_(torch.where(valid, count, 0))
         output = e(e.scratch.patches)
         feature_live = torch.arange(capacity // 4, device=count.device) < features
-        finite = (~feature_live[:, None] | torch.isfinite(output)).all()
+        finite = torch.ones((), dtype=torch.bool, device=count.device)
+        step = -(-(capacity // 4) // ROW_BANDS)
+        for start in range(0, capacity // 4, step):
+            finite &= (~feature_live[start:start + step, None] | torch.isfinite(output[start:start + step])).all()
         self.errors.copy_(self.errors | (~finite).int() * 64)
         self.publish(output, m.num_patches // 4, self.errors)

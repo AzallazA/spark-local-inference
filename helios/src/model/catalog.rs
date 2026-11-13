@@ -47,14 +47,9 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
         || config.limits.request_slots != manifest.request_capacity()
         || config.limits.max_sequence_tokens == 0
         || config.limits.max_sequence_tokens > config.prepared_sequence_tokens
-        || !config
-            .prepared_sequence_tokens
-            .is_multiple_of(page_tokens.max(1))
+        // A request's last page may be partial: context-parallel pages (768 positions over three
+        // ranks) do not divide a 2^20 context, and every admission rounds its pages up.
         || page_tokens == 0
-        || !config
-            .limits
-            .max_sequence_tokens
-            .is_multiple_of(page_tokens)
         || config.limits.pages == 0
         || config.limits.pages > i32::MAX as u32
         || config.limits.snapshots > i32::MAX as u32 - (config.limits.request_capacity() + 1) as u32

@@ -23,7 +23,7 @@ def test_default_catalog_covers_4096_prefill_and_four_requests():
 
 
 @pytest.mark.parametrize("values", [
-    {"devices": ()}, {"devices": (0, 0)}, {"devices": (0, 1, 2)}, {"devices": (-1, 0)},
+    {"devices": ()}, {"devices": (0, 0)}, {"devices": (0, 1, 2, 3, 4)}, {"devices": (-1, 0)},
     {"context": 513}, {"context": 2097152}, {"prefill_chunk_size": 4097},
     {"context": 256, "prefill_chunk_size": 512}, {"max_active": 65}, {"pages": 0},
     {"snapshot_budget_bytes": 0}, {"headroom_bytes": -1}, {"expert_activation": "fp8"},

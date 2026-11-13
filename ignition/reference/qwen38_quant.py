@@ -166,6 +166,39 @@ def decode_csf_scales(
     return torch.from_numpy(decoded)
 
 
+def expand_csf_scales_padded(
+    full: torch.Tensor, bases: torch.Tensor, *, row_range: tuple[int, int], column_range: tuple[int, int],
+    padded_rows: int | None = None, padded_columns: int | None = None, compact: bool = False,
+) -> torch.Tensor:
+    """Expand a CSF scale rectangle the way b12x fills a `CsfSource` with `padded_rows`/`padded_columns`.
+
+    `full` is the complete decoded [rows, columns] E4M3 byte matrix and `bases` its per-row base
+    plane. Both b12x paths copy the selected rectangle to the origin. The one-time Triton expansion
+    (`_csf_prepare.py::_expand_source`, used when scales expand at load) reads `padding_base` (0)
+    for every element outside the rectangle, so padded rows and columns are zero (`compact=False`).
+    The compact payload that `fused_moe.expand_scales` decodes into a shared scratch before every
+    layer (`_pack_codes` + `Nvfp4CsfDecoder.decode_all`, both activation modes) stores one base per
+    row, read at column 0 inside the rectangle, plus a zero code for padded columns, so a padded
+    column of a covered row decodes to that row's base while padded rows still decode to zero
+    (`compact=True`). With A16 activations the decoder additionally lifts every byte through the
+    W4A16 scale table and clamps the stored row base to 240 (`tests/recipes/glm53_a16_layout.py`).
+    Packed weight values in the padding are zero, and padded intermediate positions also see zero
+    gate activations, so every variant is numerically inert.
+    """
+    r0, r1 = row_range
+    c0, c1 = column_range
+    rows = (r1 - r0) if padded_rows is None else padded_rows
+    columns = (c1 - c0) if padded_columns is None else padded_columns
+    if not (0 <= r0 < r1 <= full.shape[0] and 0 <= c0 < c1 <= full.shape[1]
+            and rows >= r1 - r0 and columns >= c1 - c0 and bases.shape == (full.shape[0],)):
+        raise ValueError("padded CSF expansion requires a covered rectangle inside the decoded scales")
+    expanded = torch.zeros((rows, columns), dtype=full.dtype)
+    expanded[:r1 - r0, :c1 - c0] = full[r0:r1, c0:c1]
+    if compact and columns > c1 - c0:
+        expanded[:r1 - r0, c1 - c0:] = bases[r0:r1, None].to(full.dtype)
+    return expanded
+
+
 def decode_csf_slab_scales(
     fixed: torch.Tensor, exceptions: torch.Tensor, *, rows: int, columns: int
 ) -> torch.Tensor:

@@ -58,7 +58,9 @@ def test_export_uses_the_configured_model(host, tmp_path, capsys):
     (["export", "qwen3.8-flash", "--gpus", "x"], 2, "--gpus expects indices"),
     (["export", "qwen3.8-flash", "--gpus", "9"], 2, "does not have"),
     (["export", "qwen3.8-flash", "--max-concurrency", "65"], 2, "1 through 64"),
-    (["export", "glm-5.3-flash", "--gpus", "0-2"], 4, "needs 1 or 2 or 4 GPUs; 3 selected; use --gpus 0-3"),
+    # Fork: GLM-5.3-Flash runs on three GPUs (glm53/shards.py WORLDS 1-4), so upstream's GLM "--gpus 0-2" rejection
+    # case would start a real export and download the checkpoint into the test's HOME. Qwen3.8 Flash keeps the check.
+    (["export", "qwen3.8-flash", "--gpus", "0-2"], 4, "needs 1 or 2 or 4 GPUs; 3 selected; use --gpus 0-3"),
     (["export", "glm-5.3-flash", "--mixed-prefill"], 2,
      "--mixed-prefill: glm-5.3-flash does not capture mixed prefill/decode graphs"),
 ])

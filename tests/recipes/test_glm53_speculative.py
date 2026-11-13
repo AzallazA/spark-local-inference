@@ -17,6 +17,8 @@ from ignition.recipes.glm53.batch import BatchInputs
 from ignition.recipes.glm53.dcp import ContextShards
 from ignition.recipes.glm53.speculative import PreparedRound
 from ignition.recipes.glm53.mtp import DraftMetadata
+from ignition.recipes.glm53.stack import DecoderScratch
+from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.glm53.state import DecoderMetadata
 from ignition.components.recurrent import DeltaMetadata
 
@@ -44,8 +46,8 @@ def test_shared_commit_without_previous_token_embeddings():
 
 
 @pytest.mark.parametrize("width,limits,positions,token_slots,state_indices", [
-    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254],
-     [[1, 0, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]]),
+    # Width one decodes each live row in place through a single state column.
+    (1, [1, 1], [255, 510], [10 * 256 + 255, 21 * 256 + 254], [[1], [2]]),
     (6, [6, 2], [255, 256, 257, 258, 259, 260, 510, 511, -1, -1, -1, -1],
      [10 * 256 + 255, *range(11 * 256, 11 * 256 + 5), 21 * 256 + 254, 21 * 256 + 255],
      # Verification records tokens against each request's live row only.
@@ -61,11 +63,12 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     inputs.request_state_rows.copy_(torch.tensor([[1, 8, 9, 10, 11, 12, 13, 14], [2, 15, 16, 17, 18, 19, 20, 21]]))
     op.owner = SimpleNamespace(inputs=inputs, requests=SimpleNamespace(capacity=2), shards=ContextShards())
     m = DecoderMetadata.allocate(2 * width, 2, 2, "cpu")
+    columns = len(state_indices[0])
     op.metadata = DecoderMetadata(m.token_ids, torch.zeros(2 * width, dtype=torch.int64),
-        DeltaMetadata.allocate(2, "cpu", verification_columns=8), m.indexed)
+        DeltaMetadata.allocate(2, "cpu", verification_columns=columns), m.indexed)
     op.active = torch.tensor([True, True])
     op.before = torch.tensor([255, 510])
-    op.offsets, op.columns, op.state_columns = torch.arange(2 * width), torch.arange(width), torch.arange(8)
+    op.offsets, op.columns, op.state_columns = torch.arange(2 * width), torch.arange(width), torch.arange(columns)
     op.candidates = torch.arange(2 * width).view(2, width)
     op.target_metadata(torch.tensor([0, 1]), torch.tensor(limits, dtype=torch.int32))
     assert op.metadata.recurrent.query_start_loc.tolist() == [0, limits[0], sum(limits)]
@@ -76,8 +79,12 @@ def test_verification_packs_unequal_lengths_and_retains_request_output_rows(
     assert op.metadata.recurrent.state_indices.tolist() == state_indices
 
 
-def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
-    metadata = DraftMetadata(3, 3, 2, "cpu")
+@pytest.mark.parametrize("reuse", [False, True])
+def test_draft_rows_exclude_exhausted_requests_and_restore_output_order(reuse):
+    scratch = DecoderScratch.allocate(3, 2, "prefill", "cpu", shard=TensorParallelShard(0, 2), sample_rows=1)
+    storage = scratch.attention_hc.normalized if reuse else None
+    metadata = DraftMetadata(3, 3, 2, "cpu", hidden=storage)
+    metadata.hidden.fill_(float("nan"))
     slots = torch.tensor([2, 0, 1])
     state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
     tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
@@ -89,11 +96,54 @@ def test_draft_rows_exclude_exhausted_requests_and_restore_output_order():
     assert metadata.indexed.token_slots.tolist() == [10 * 256 + 255, 21 * 256 + 254, -1]
     assert metadata.token_ids[:2].tolist() == [8, 9]
     assert metadata.hidden[metadata.output_indices][1:, 0].tolist() == [1, 2]
+    assert hidden[:, 0].tolist() == [0, 1, 2]
+    if reuse:
+        assert torch.equal(storage, metadata.hidden)
+        assert storage.data_ptr() == metadata.hidden.data_ptr()
     metadata.set(slots, torch.zeros(3, dtype=torch.int64), torch.full((3,), 512),
                  torch.tensor([7, 8, 9]), hidden, tables, capacity=1, state_rows=state_rows)
     assert metadata.num_tokens.item() == 0
+    assert not metadata.hidden.count_nonzero()
     assert metadata.indexed.positions.tolist() == [-1, -1, -1]
     assert metadata.indexed.token_slots.tolist() == [-1, -1, -1]
+
+
+def test_later_draft_passes_reuse_each_requests_first_selection():
+    op = PreparedRound.__new__(PreparedRound)
+    op.draft_metadata = DraftMetadata(3, 3, 2, "cpu")
+    index = SimpleNamespace(physical=torch.zeros((3, 2051), dtype=torch.int32),
+                            selected_lengths=torch.zeros(3, dtype=torch.int32))
+    op.draft = SimpleNamespace(attention=SimpleNamespace(scratch=SimpleNamespace(index=index)))
+    op.selection = (torch.zeros((3, 2051), dtype=torch.int32), torch.zeros(3, dtype=torch.int32))
+    slots, starts = torch.tensor([2, 0, 1]), torch.tensor([255, 510, 300])
+    state_rows = torch.arange(1, 4)[:, None].expand(3, 8)
+    tables = torch.tensor([[10, 11], [20, 21], [30, 31]])
+    hidden = torch.zeros((3, 4096), dtype=torch.bfloat16)
+    tokens = torch.tensor([7, 8, 9])
+    # The first pass packs requests one and two; request zero has no draft to propose.
+    op.draft_metadata.set(slots, torch.tensor([0, 1, 1]), starts, tokens, hidden, tables,
+                          capacity=1, state_rows=state_rows)
+    first = {1: torch.tensor([3, 5, 9]), 2: torch.tensor([4, 6, 8, 12])}
+    index.physical.fill_(-1)
+    for row, request in enumerate((1, 2)):
+        index.physical[row, :first[request].numel()] = first[request]
+        index.selected_lengths[row] = first[request].numel()
+    op.retain_selection()
+    # The second pass keeps only request two, which now occupies packed row zero.
+    op.draft_metadata.set(slots, torch.tensor([0, 0, 1]), starts + 1, tokens, hidden, tables,
+                          capacity=1, state_rows=state_rows)
+    index.physical.fill_(-2)
+    index.selected_lengths.fill_(-2)
+    op.reuse_selection()
+    assert index.selected_lengths.tolist() == [4, 0, 0]
+    assert index.physical[0, :4].tolist() == first[2].tolist()
+
+
+@pytest.mark.parametrize("hidden", [torch.empty((2, 4096)), torch.empty((1, 4096), dtype=torch.bfloat16),
+    torch.empty((4096, 2), dtype=torch.bfloat16).t(), torch.empty((2, 4096), device="meta", dtype=torch.bfloat16)])
+def test_draft_hidden_storage_rejects_incompatible_views(hidden):
+    with pytest.raises(ValueError, match="draft hidden storage"):
+        DraftMetadata(2, 1, 2, "cpu", hidden=hidden)
 
 
 @pytest.fixture(autouse=True)

@@ -7,14 +7,17 @@ import pytest
 
 from ignition.components.sampling import DeviceRequestState
 from ignition.recipes.glm53.pool import ContinuationPool, continuation_layout
+from ignition.recipes.glm53.shards import Shards
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 def test_continuation_pool_binds_strided_kda_and_index_state(world):
     pool = ContinuationPool.allocate(("linear_attention", "indexed_attention"), world, 6, 3, "cpu")
     delta, mla = pool.decoder.layers
-    assert delta.recurrent.shape == (6, 64 // world, 128, 128)
-    assert delta.convolution.shape == (6, 3 * (64 // world) * 128, 3)
+    heads = Shards.of(world).heads
+    assert heads == (24 if world == 3 else 64 // world)
+    assert delta.recurrent.shape == (6, heads, 128, 128)
+    assert delta.convolution.shape == (6, 3 * heads * 128, 3)
     assert mla.index.tail.shape == (6, 2, 4, 128)
     for value in (delta.recurrent, delta.convolution, mla.index.tail, pool.last_hidden, pool.consumed_tokens):
         assert value.untyped_storage().data_ptr() == pool.backing.data_ptr()
@@ -39,7 +42,7 @@ def test_continuation_pool_binds_strided_kda_and_index_state(world):
     assert not mla.cache.count_nonzero() and not mla.index.cache.count_nonzero()
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [2, 3, 4])
 def test_complete_model_continuation_budget(world):
     kinds = tuple("indexed_attention" if index % 4 == 3 else "linear_attention" for index in range(45))
     layout = continuation_layout(kinds, world)

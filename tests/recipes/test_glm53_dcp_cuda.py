@@ -21,7 +21,7 @@ def owner_local(t, world):
 def test_slots_lengths_merge_and_expansion_match_references():
     torch.manual_seed(0)
     device = torch.device("cuda")
-    for world in (1, 2, 4):
+    for world in (1, 2, 3, 4):
         for rank in range(world):
             shards = ContextShards.on(rank, world, device)
             # Slot mapping and local lengths.

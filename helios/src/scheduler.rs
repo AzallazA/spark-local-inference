@@ -15,7 +15,7 @@ mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
-pub use policy::{PolicyConfig, RequestAccounting};
+pub use policy::{PolicyConfig, PrefillTailMerge, RequestAccounting};
 use refresh::PlanOrigin;
 pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
@@ -181,6 +181,8 @@ pub struct RequestSpec {
     /// request decodes. When pages run out the scheduler may preempt such a request:
     /// it finishes through its terminal checkpoint and the runtime readmits its history.
     pub growable_output: bool,
+    /// The rendered prompt includes tool definitions (`PrefillTailMerge::ToolsOnly`).
+    pub tools: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +280,7 @@ pub struct LiveRequest {
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     growable_output: bool,
+    tools: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
     admission_order: u64,
@@ -564,6 +567,7 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    cleared_pages: Vec<PageId>,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
@@ -664,6 +668,8 @@ pub struct RequestScheduler {
     free_snapshots: BTreeSet<SnapshotId>,
     snapshot_pages: Vec<std::ops::Range<u32>>,
     page_snapshot_refs: Vec<u32>,
+    /// Released alias pages whose bytes are snapshot rows, not KV, until cleared.
+    page_holds_row_bytes: Vec<bool>,
     retired: Vec<RetiredRequest>,
     submissions: BTreeMap<Fence, Submission>,
     completed: Fence,
@@ -691,6 +697,8 @@ pub struct RequestScheduler {
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
     admissions: u64,
+    /// Rounds left before the TTFT guard forces the overdue request again.
+    ttft_interleave: u32,
 }
 
 fn validate_state_slot_extent(limits: &SchedulerLimits, rows: usize) -> Result<()> {
@@ -754,6 +762,7 @@ impl RequestScheduler {
             free_snapshots: (0..limits.snapshots).map(SnapshotId).collect(),
             snapshot_pages: Vec::new(),
             page_snapshot_refs: vec![0; limits.pages as usize],
+            page_holds_row_bytes: vec![false; limits.pages as usize],
             retired: Vec::new(),
             submissions: BTreeMap::new(),
             completed: Fence(0),
@@ -781,6 +790,7 @@ impl RequestScheduler {
             evictions: Vec::new(),
             evictions_lost: false,
             admissions: 0,
+            ttft_interleave: 0,
         })
     }
 
@@ -1100,6 +1110,13 @@ impl RequestScheduler {
         self.submissions
             .get(&fence)
             .map(|submission| &submission.step)
+            .ok_or_else(|| "unknown scheduled submission".into())
+    }
+    /// Pages whose snapshot-row bytes every rank clears before the submission's graph.
+    pub fn cleared_pages(&self, fence: Fence) -> Result<&[PageId]> {
+        self.submissions
+            .get(&fence)
+            .map(|submission| submission.cleared_pages.as_slice())
             .ok_or_else(|| "unknown scheduled submission".into())
     }
     pub fn cache(&self) -> &PrefixCheckpointCache {
@@ -1660,6 +1677,7 @@ impl RequestScheduler {
             vision_patches: VecDeque::new(),
             prefill_spans: Vec::new(),
             growable_output: spec.growable_output,
+            tools: spec.tools,
             preempted: false,
             admission_order: self.admissions,
         });
@@ -2218,19 +2236,26 @@ impl RequestScheduler {
                 _ => None,
             },
         };
+        let mut cleared_pages = Vec::new();
         for (handle, pages, next_consumed_ceiling) in needed {
             let request = self.request_mut(handle)?;
             let allocated: Vec<_> = (0..pages)
                 .map(|_| request.reserved_pages.pop().unwrap())
                 .collect();
-            request.private_pages.extend(allocated);
+            request.private_pages.extend_from_slice(&allocated);
             request.scheduled_consumed = next_consumed_ceiling;
             request.last_use = fence;
             request.pending += 1;
             if let Some(prefix) = request.prefix {
                 self.cache.mark_used(prefix, fence)?;
             }
+            for page in allocated {
+                if std::mem::take(&mut self.page_holds_row_bytes[page.0 as usize]) {
+                    cleared_pages.push(page);
+                }
+            }
         }
+        self.note_ttft_round(step);
         self.submitted = fence;
         self.refresh.commit(origin, fence, step);
         self.costs.record_attempt(key);
@@ -2245,6 +2270,7 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                cleared_pages,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,
@@ -2717,8 +2743,13 @@ impl RequestScheduler {
             ready_after: request.last_use,
         };
         let history = request.history.clone();
-        // Only the last selected message can be the prompt's direct parent.
-        let defer = matches!(capture.kind, BoundaryKind::Message)
+        // A close prompt checkpoint does not substitute for this message endpoint:
+        // a future request may reuse the message and then take another branch
+        // (upstream PR #227). With the fork switch `eager_message_offers` off, the
+        // pre-#227 deferral applies: only the last selected message can be the
+        // prompt's direct parent, and it is offered on exact reuse instead.
+        let defer = !self.policy.eager_message_offers
+            && matches!(capture.kind, BoundaryKind::Message)
             && request.message_boundaries.last() == Some(&(capture.consumed_tokens as usize))
             && request.prompt_tokens - (capture.consumed_tokens as usize)
                 < self.capabilities.page_tokens

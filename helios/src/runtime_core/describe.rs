@@ -323,7 +323,11 @@ fn rank_json(rank: usize, bundle: &wire::BundleIndex, options: InspectionOptions
             .allocations
             .iter()
             .filter(|a| Memory::try_from(a.memory) == Ok(memory))
-            .map(|a| a.nbytes)
+            .map(|a| match memory {
+                // TP3 merged expert banks (`mixed-<i>-<device bytes>`): only the device prefix is VRAM.
+                Memory::Device => super::mixed_device_bytes_named(&a.name, a.nbytes).unwrap_or(a.nbytes),
+                _ => a.nbytes,
+            })
             .sum()
     };
     let sized: Vec<Value> = bundle

@@ -12,6 +12,7 @@ import torch
 
 from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.glm53.model import create_model_tree
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.stack import DecoderScratch
 from ignition.recipes.glm53.state import DecoderMetadata, DecoderState
 
@@ -26,7 +27,7 @@ def scratch_tensors(scratch, prefix=""):
             yield from scratch_tensors(value, f"{name}.")
 
 
-@pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])
+@pytest.mark.parametrize("world,rank", [(2, 0), (3, 2), (4, 3)])
 def test_serial_graph_variants_share_storage_with_exact_shapes(world, rank):
     shard = TensorParallelShard(rank, world)
     base = DecoderScratch.allocate(64, 8, "decode", "cpu", shard=shard, sample_rows=4)
@@ -42,12 +43,13 @@ def test_serial_graph_variants_share_storage_with_exact_shapes(world, rank):
             assert tensor.shape == expected[name].shape, name
             assert tensor.stride() == expected[name].stride(), name
             assert tensor.dtype == expected[name].dtype, name
-            backing = base.kda.projected_input[:, -128:] if name == "kda.forget_input" and tokens == 1 else storage[name]
+            packed_forget = name == "kda.forget_input" and tokens == 1 and not base.kda.split
+            backing = base.kda.projected_input[:, -128:] if packed_forget else storage[name]
             assert tensor.data_ptr() == backing.data_ptr(), name
         assert view.mla.index.page_table.shape == (tokens if mode == "decode" else 1, 8)
         view.residual.fill_(tokens)
         assert torch.all(base.residual[:tokens] == tokens)
-        assert view.local_logits.shape == (rows, 154880 // world)
+        assert view.local_logits.shape == (rows, Shards.of(world).vocabulary)
         assert view.logits.shape == (rows, 154880)
 
 
@@ -59,7 +61,24 @@ def test_scratch_views_reject_unavailable_token_sample_and_request_capacity():
             base.rows(tokens, mode, sample_rows=rows)
 
 
-@pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])
+@pytest.mark.parametrize("world", [2, 3])
+def test_cp_prefill_query_value_alias_survives_layer_overlay(world):
+    base = DecoderScratch.allocate(65, 2, "prefill", "cpu", shard=TensorParallelShard(0, world),
+        sample_rows=1, context_ranks=world, overlay_layers=True)
+    for rows in (65, 16, 65):
+        view = base.rows(rows, "prefill", sample_rows=1).mla
+        view.query.fill_(float("nan"))
+        view.expanded.fill_(rows)
+        assert torch.all(view.query == rows)
+    for mode, ranks in (("prefill", 1), ("decode", 2)):
+        separate = DecoderScratch.allocate(2, 2, mode, "cpu", shard=TensorParallelShard(0, 2),
+            sample_rows=1, context_ranks=ranks).mla
+        separate.query.fill_(7)
+        separate.expanded.zero_()
+        assert torch.all(separate.query == 7)
+
+
+@pytest.mark.parametrize("world,rank", [(2, 0), (3, 1), (4, 3)])
 def test_canonical_layers_share_intermediates_and_own_distinct_state(world, rank):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
@@ -82,7 +101,7 @@ def test_canonical_layers_share_intermediates_and_own_distinct_state(world, rank
         assert layer.attention_output is scratch.attention_output and layer.mlp_output is scratch.mlp_output
         assert layer.attention is (scratch.mla if module.block_type == "indexed_attention" else scratch.kda)
         assert layer.mlp is (scratch.dense if index < 3 else scratch.moe)
-    assert scratch.local_logits.shape == (1, 154880 // world)
+    assert scratch.local_logits.shape == (1, Shards.of(world).vocabulary)
     assert scratch.logits.shape == (1, 154880)
     assert not metadata.recurrent.num_tokens.count_nonzero()
     assert not metadata.recurrent.num_seqs.count_nonzero()

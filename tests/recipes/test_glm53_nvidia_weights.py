@@ -15,6 +15,7 @@ from ignition.components.block_fp8 import BlockFP8Weight
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.weights import GroupedLinearWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.recipes.glm53.shards import Shards
 from ignition.recipes.glm53.weights import GlmWeightLoader, TEXT_PREFIX
 
 
@@ -35,21 +36,36 @@ def read(manifest, name, extent=None):
         return (source.get_tensor(name) if extent is None else source.get_slice(name)[extent]).clone()
 
 
+def padded(value, rows, columns, fill=0):
+    """`value` placed at the origin of a [rows, columns] block whose remainder holds `fill` (three-rank padding)."""
+    if value.shape == (rows, columns):
+        return value
+    target = torch.zeros((rows, columns), dtype=value.dtype)
+    if fill:
+        target.view(torch.uint8).fill_(fill)
+    target[:value.shape[0], :value.shape[1]] = value
+    return target
+
+
 def assert_projection(manifest, actual, names, rows=None, columns=None):
     rows = (None,) * len(names) if rows is None else rows
     weights, scales = [], []
     for name, row_range in zip(names, rows, strict=True):
-        r = slice(None) if row_range is None else slice(*row_range)
-        c = slice(None) if columns is None else slice(*columns)
-        weights.append(read(manifest, name + ".weight", (r, c)))
+        shape = manifest.tensors[name + ".weight"].shape
+        r0, r1 = (0, shape[0]) if row_range is None else row_range
+        c0, c1 = (0, shape[1]) if columns is None else columns
+        r, c = slice(r0, min(r1, shape[0])), slice(c0, min(c1, shape[1]))
+        weights.append(padded(read(manifest, name + ".weight", (r, c)), r1 - r0, c1 - c0))
         if not isinstance(actual, torch.Tensor):
             raw = read(manifest, name + ".weight_scale")
             block = 128 if isinstance(actual, BlockFP8Weight) else 32
             if block == 128:
                 raw = raw.reshape(raw.shape[0], -1)
-                r = slice(None) if row_range is None else slice(row_range[0] // 128, row_range[1] // 128)
-            c = slice(None) if columns is None else slice(columns[0] // block, columns[1] // block)
-            scales.append(raw[r, c])
+                r = slice(r0 // 128, min(r1, shape[0]) // 128)
+            c = slice(c0 // block, min(c1, shape[1]) // block)
+            # Zero block-FP8 scales and the neutral UE8M0 127 fill the padded rows and columns.
+            scales.append(padded(raw[r, c], (r1 - r0) // (128 if block == 128 else 1), (c1 - c0) // block,
+                                 fill=0 if block == 128 else 127))
     expected = torch.cat(weights)
     if isinstance(actual, torch.Tensor):
         assert actual.dtype == expected.dtype
@@ -68,9 +84,10 @@ cuda = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
 
 
 @cuda
-@pytest.mark.parametrize("world,rank", [(1, 0), (2, 1), (4, 3)])
+@pytest.mark.parametrize("world,rank", [(1, 0), (2, 1), (3, 0), (3, 1), (3, 2), (4, 3)])
 def test_nvidia_attention_and_mlp_partitions(manifest, world, rank):
     shard = TensorParallelShard(rank, world)
+    shards = Shards.of(world)
     kda_prefix = f"{TEXT_PREFIX}.layers.0.self_attn"
     mla_prefix = f"{TEXT_PREFIX}.layers.3.self_attn"
     dense_prefix = f"{TEXT_PREFIX}.layers.0.mlp"
@@ -78,14 +95,14 @@ def test_nvidia_attention_and_mlp_partitions(manifest, world, rank):
     with GlmWeightLoader(manifest, "cuda:0", shard=shard,
             prefixes=tuple(prefix + "." for prefix in (kda_prefix, mla_prefix, dense_prefix, shared_prefix))) as loader:
         kda, mla, dense = loader.load_attention(0), loader.load_attention(3), loader.load_mlp(0)
-        extent = shard.partition(2048, alignment=128)
+        extent = shard.padded_partition(2048, alignment=128)
         shared_up = loader.load_linear_group((shared_prefix + ".gate_proj", shared_prefix + ".up_proj"),
-                                             row_ranges=(extent, extent))
-        shared_down = loader.load_linear(shared_prefix + ".down_proj", columns=extent)
+                                             row_ranges=(extent, extent), pad=True)
+        shared_down = loader.load_linear(shared_prefix + ".down_proj", columns=extent, pad=True)
         assert loader._session.torch_copy_bytes == 0
-    channels, heads = shard.partition(8192), shard.partition(64)
+    channels, heads = shards.head_channels(rank, 128), shards.head_range(rank)
     assert isinstance(kda["input_proj"], GroupedLinearWeights)
-    assert kda["input_proj"].widths == (3 * 8192 // world, 64 // world + 128)
+    assert kda["input_proj"].widths == (3 * shards.kda_channels, shards.heads + 128)
     assert_projection(manifest, kda["input_proj"].parts[0],
                       tuple(kda_prefix + "." + name for name in ("q_proj", "k_proj", "v_proj")), (channels,) * 3)
     assert_projection(manifest, kda["input_proj"].parts[1],
@@ -100,11 +117,13 @@ def test_nvidia_attention_and_mlp_partitions(manifest, world, rank):
                       (mla_prefix + ".q_a_proj", mla_prefix + ".kv_a_proj_with_mqa"))
     assert_projection(manifest, mla["qkv_a_proj"].parts[1],
                       (mla_prefix + ".indexer.wk", mla_prefix + ".indexer.weights_proj"))
-    for name, size in (("q_b_proj", 16384), ("kv_b_proj", 32768)):
-        assert_projection(manifest, mla[name], (mla_prefix + "." + name,), (shard.partition(size),))
-    assert_projection(manifest, mla["o_proj"], (mla_prefix + ".o_proj",), columns=shard.partition(16384))
+    for name, size, alignment in (("q_b_proj", 16384, 256), ("kv_b_proj", 32768, 512)):
+        assert_projection(manifest, mla[name], (mla_prefix + "." + name,),
+                          (shards.head_channels(rank, size // 64),))
+    assert_projection(manifest, mla["o_proj"], (mla_prefix + ".o_proj",),
+                      columns=shards.head_channels(rank, 256))
     assert_projection(manifest, mla["indexer.wq_b"], (mla_prefix + ".indexer.wq_b",))
-    dense_extent = shard.partition(12288)
+    dense_extent = shard.padded_partition(12288, alignment=128)
     assert_projection(manifest, dense.gate_up, (dense_prefix + ".gate_proj", dense_prefix + ".up_proj"),
                       (dense_extent, dense_extent))
     assert_projection(manifest, dense.down, (dense_prefix + ".down_proj",), columns=dense_extent)

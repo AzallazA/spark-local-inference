@@ -55,11 +55,12 @@ class ModelConfig:
     vision: dict | None = None
 
     @classmethod
-    def load(cls, snapshot):
-        return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()))
+    def load(cls, snapshot, *, mini=False):
+        return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()), mini=mini)
 
     @classmethod
-    def from_dict(cls, config):
+    def from_dict(cls, config, *, mini=False):
+        """``mini`` (TP3Config.mini, test tooling): accept truncated real-weight views of 6..40 full-width layers."""
         if (config.get("model_type") != "deepseek_v41"
                 or config.get("architectures") != ["DeepseekV41ForCausalLM"]):
             raise ValueError("DeepSeek V4.1 requires DeepseekV41ForCausalLM")
@@ -75,6 +76,8 @@ class ModelConfig:
             "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
             "engram_head_dim": 256,
         }.items():
+            if name == "num_hidden_layers" and mini and 6 <= text.get(name, 0) <= 40:
+                continue  # TP3 test tooling: truncated real-weight views (make_mini.py) keep full-width layers
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
         if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]

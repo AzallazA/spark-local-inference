@@ -119,8 +119,12 @@ The shared native controller selects among the available counts. All ranks
 sample identical gathered distributions with identical device RNG state.
 History-copy proposals are not part of the GLM recipe.
 
-Target KDA layers retain one recurrent checkpoint per verification input.
-Commit selects the accepted checkpoint and convolution suffix. Indexed
+Rounds with drafts record each target KDA layer's per-token corrections without
+advancing the request's committed recurrent row. Commit replays the accepted
+records into that row and shifts the convolution history past the emitted
+tokens, so every round resumes from state column zero. Width one carries no
+drafts: its KDA layers decode the pending token in place through a one-column
+plan, and it performs no record replay or draft-tail restore. Indexed
 attention uses twelve-entry C4 tail rings so speculative writes preserve the
 preceding accepted tail. Prompt absorption and post-verification absorption
 write only the draft layer's latent KV and C4 state, using target feedback.
@@ -128,6 +132,15 @@ The draft cache contains `max(consumed_tokens - 1, 0)` pairs. Exact-prefix
 snapshots therefore preserve the draft partial page at that endpoint as well
 as target pages and recurrent state. Absorption, proposals, verification,
 sampling, and commit execute inside prepared CUDA graphs.
+
+The GLM checkpoints declare `index_share_for_mtp_iteration`. A round's first
+draft pass runs the MTP layer's C4 indexer. Later passes reuse each request's
+first-pass sparse selection and skip the indexer's projections, C4 writes,
+selection, and, with context parallelism, candidate exchange. They attend to
+records at or before the first pass's position, not to the records of the
+round's earlier drafts. Transformers has no GLM MTP layer and ignores the
+field; vLLM's GLM MTP proposer applies the same reuse without prefill
+context parallelism.
 
 ## DeepSeek DSpark proposals and continuation state
 

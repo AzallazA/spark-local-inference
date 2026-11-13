@@ -216,6 +216,13 @@ fn named_selection_only_filters_tools_and_none_restores_a_text_turn() {
         assert_eq!(none.rendered_prompt, empty.rendered_prompt);
         assert!(none.output.content.tools.is_empty());
         assert!(none.prompt.grammar.is_none());
+
+        // Only a prompt that renders tool definitions counts as a tool request for the
+        // scheduler's tools-only prefill tail merge.
+        assert!(named.prompt.tools && selected.prompt.tools, "{encoder:?}");
+        assert!(!none.prompt.tools && !empty.prompt.tools, "{encoder:?}");
+        let plain = fixture.prepare(json!({"messages":[{"role":"user","content":"Hi"}]})).unwrap();
+        assert!(!plain.prompt.tools, "{encoder:?}");
     }
 }
 

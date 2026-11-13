@@ -78,6 +78,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -226,6 +227,7 @@ fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -538,6 +540,7 @@ fn packing_follows_value_bindings_after_buffers_and_model_are_renamed() {
             host_stops: false,
             prompt_logprobs: false,
             growable_output: false,
+            tools: false,
         })
         .unwrap();
     let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
@@ -675,6 +678,7 @@ fn copy_staging_uses_physical_slots_stochastic_defaults_and_bonus_mask() {
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: false,
+                    tools: false,
                 })
                 .unwrap()
         })
@@ -912,6 +916,7 @@ fn mixed_native_uploads_pack_prompt_after_the_decode_extent_and_sample_only_elig
                     host_stops: false,
                     prompt_logprobs: false,
                     growable_output: false,
+                    tools: false,
                 })
                 .unwrap();
             admissions[h.slot as usize] = Some(Admission {
@@ -1119,6 +1124,7 @@ fn state_transfer_and_resume_upload_fixture() {
                 host_stops: false,
                 prompt_logprobs: false,
                 growable_output: false,
+                tools: false,
             })
             .unwrap();
         let mut admissions: [_; 4] = std::array::from_fn(|_| None);
@@ -1334,6 +1340,7 @@ fn grammar_packing_fixture() -> (
                 host_stops: false,
                 prompt_logprobs: false,
                 growable_output: false,
+                tools: false,
             })
             .unwrap();
         admissions.push(Some(Admission {
@@ -1567,6 +1574,7 @@ fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata()
             host_stops: false,
             prompt_logprobs: false,
             growable_output: true,
+            tools: false,
         })
         .unwrap();
     scheduler
@@ -1675,7 +1683,7 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
             }
             scheduler.measured_graph_durations(&manifest.graphs).unwrap();
             let handle = scheduler.admit(RequestSpec { message_boundaries: vec![], prompt: vec![7; 64], conditioning: vec![],
-                max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false }).unwrap();
+                max_new_tokens: 64, grammar_constrained: false, host_stops: false, prompt_logprobs: false, growable_output: false, tools: false }).unwrap();
             let mut admissions: [Option<Admission>; 4] = std::array::from_fn(|_| None);
             admissions[handle.slot as usize] = Some(Admission { handle, sampling: SamplingParameters::default(),
                 max_new_tokens: 64, prompt: vec![7; 64], data: PromptData {
@@ -1739,4 +1747,40 @@ fn committed_generation_cursors_require_feedback_while_unused_prompt_positions_d
             }
         }
     }
+}
+
+#[test]
+fn partial_last_pages_cover_a_context_the_page_size_does_not_divide() {
+    // Three-rank context-parallel GLM pages hold 768 positions (256 local records per rank), which do not
+    // divide a 2^20 context; the page tables round up and a full-context request ends on a partial page.
+    let mut config = config();
+    config.contract.cache.page_tokens = 768;
+    config.prepared_sequence_tokens = 8192;
+    config.limits.max_sequence_tokens = 8192;
+    config.limits.pages = 64;
+    config.limits.max_active = 1;
+    let numbered = |mut manifest: crate::execution::ExecutionManifest| {
+        manifest.graphs.retain(|graph| graph.batch_capacity == 1 && graph.kind != GraphKind::Speculative);
+        for (index, graph) in manifest.graphs.iter_mut().enumerate() {
+            graph.handle = index + 1;
+        }
+        manifest
+    };
+    let full = numbered(manifest(&config));
+    let names: std::collections::HashSet<_> = full.graphs.iter().map(|graph| graph.name.clone()).collect();
+    config.contract.graphs.retain(|graph| names.contains(&graph.graph));
+    catalog::validate(&config, &full).unwrap();
+    Inputs::new(&config, &full).unwrap();
+    config.fit_context();
+    assert_eq!(config.limits.max_sequence_tokens, 8192);
+    // A floored page table (10 columns, 7680 positions) cannot hold the prepared context's last 512 positions.
+    let mut floored = config.clone();
+    floored.prepared_sequence_tokens = 7680;
+    let error = Inputs::new(&config, &numbered(manifest(&floored))).err().unwrap().to_string();
+    assert!(error.contains("page-table view cannot cover"), "{error}");
+    // Fewer pages than the context still cap requests at whole pages.
+    config.limits.pages = 8;
+    config.fit_context();
+    assert_eq!(config.limits.max_sequence_tokens, 8 * 768);
+    catalog::validate(&config, &full).unwrap();
 }
